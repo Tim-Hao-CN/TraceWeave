@@ -213,6 +213,141 @@ class TestDispatchGetSimPaths:
 
 
 @pytest.mark.anyio
+class TestDispatchGetFormalPaths:
+    async def test_tool_contract_is_artifact_only(self):
+        tools = await server.list_tools()
+        tool = next(item for item in tools if item.name == "get_formal_paths")
+
+        assert tool.inputSchema["required"] == ["formal_root"]
+        assert tool.inputSchema["additionalProperties"] is False
+        assert tool.inputSchema["properties"]["formal_tool"]["enum"] == [
+            "auto",
+            "jaspergold",
+        ]
+        assert "counterexample" in tool.description
+        assert "classify" in tool.description
+
+    async def test_dispatch_returns_strict_discovery_result(self, tmp_path: Path):
+        project = tmp_path / "jg_run"
+        session = project / "sessionLogs" / "session_0"
+        session.mkdir(parents=True)
+        (project / "jg_console.log").write_text("placeholder\n")
+        (session / "jg_session_0.log").write_text("placeholder\n")
+        wave = project / "witness.vcd"
+        wave.write_text("$timescale 1ns $end\n")
+
+        result = await server._dispatch(
+            "get_formal_paths", {"formal_root": str(tmp_path)}
+        )
+
+        assert isinstance(result, server.schemas.FormalPathsResult)
+        assert result.detected_formal_tools == ["jaspergold"]
+        assert result.wave_files[0].path == str(wave.resolve())
+        assert server._formal_session_state["formal_root"] == str(tmp_path.resolve())
+        assert server._formal_result_cache is result
+        assert "trace_kind" not in type(result).model_fields
+
+    async def test_formal_discovery_does_not_satisfy_sim_prerequisite(
+        self, tmp_path: Path
+    ):
+        await server._dispatch(
+            "get_formal_paths", {"formal_root": str(tmp_path)}
+        )
+
+        blocked = await server._dispatch(
+            "parse_sim_log",
+            {"log_path": "/tmp/run.log", "simulator": "vcs"},
+        )
+
+        assert blocked.error_code == "missing_prerequisite"
+        assert blocked.missing_step == "get_sim_paths"
+
+    async def test_simulation_switch_preserves_formal_state(self, tmp_path: Path):
+        formal_root = tmp_path / "formal"
+        formal_root.mkdir()
+        await server._dispatch(
+            "get_formal_paths", {"formal_root": str(formal_root)}
+        )
+        formal_cache = server._formal_result_cache
+
+        first_sim = tmp_path / "sim_a"
+        second_sim = tmp_path / "sim_b"
+        first_sim.mkdir()
+        second_sim.mkdir()
+        await server._dispatch("get_sim_paths", {"verif_root": str(first_sim)})
+        await server._dispatch("get_sim_paths", {"verif_root": str(second_sim)})
+
+        assert server._formal_result_cache is formal_cache
+        assert server._formal_session_state["formal_root"] == str(
+            formal_root.resolve()
+        )
+
+    async def test_formal_switch_preserves_simulation_state(self, tmp_path: Path):
+        sim_root = tmp_path / "sim"
+        sim_root.mkdir()
+        await server._dispatch("get_sim_paths", {"verif_root": str(sim_root)})
+        sim_cache = server._result_cache["get_sim_paths"]
+        sim_state = dict(server._session_state["get_sim_paths"])
+
+        first_formal = tmp_path / "formal_a"
+        second_formal = tmp_path / "formal_b"
+        first_formal.mkdir()
+        second_formal.mkdir()
+        await server._dispatch(
+            "get_formal_paths", {"formal_root": str(first_formal)}
+        )
+        await server._dispatch(
+            "get_formal_paths", {"formal_root": str(second_formal)}
+        )
+
+        assert server._result_cache["get_sim_paths"] is sim_cache
+        assert server._session_state["get_sim_paths"] == sim_state
+        assert server._formal_session_state["formal_root"] == str(
+            second_formal.resolve()
+        )
+
+    async def test_reset_clears_both_discovery_domains(self, tmp_path: Path):
+        await server._dispatch("get_sim_paths", {"verif_root": str(tmp_path)})
+        await server._dispatch(
+            "get_formal_paths", {"formal_root": str(tmp_path)}
+        )
+
+        server.reset_session_state()
+
+        assert server._result_cache["get_sim_paths"] is None
+        assert server._session_state["get_sim_paths"] is None
+        assert server._formal_result_cache is None
+        assert server._formal_result_provenance is None
+        assert server._formal_session_state is None
+
+    async def test_formal_call_has_no_stale_simulation_case_in_telemetry(self):
+        _prefill_get_sim_paths_state(case_dir="/tmp/verif/work/stale_case")
+        seen = {}
+
+        def spy(tool, args, **kwargs):
+            seen.update(kwargs, tool=tool)
+
+        with (
+            patch.object(
+                server,
+                "_dispatch",
+                return_value={"formal_root": "/tmp/formal"},
+            ),
+            patch.object(server.usage_telemetry, "record_call", spy),
+        ):
+            await server.call_tool(
+                "get_formal_paths", {"formal_root": "/tmp/formal"}
+            )
+
+        assert seen["tool"] == "get_formal_paths"
+        assert seen["case"] is None
+
+    async def test_server_instructions_separate_formal_and_simulation(self):
+        assert "formal-run artifact discovery" in server.SERVER_INSTRUCTIONS
+        assert "Do not send\n  formal logs to parse_sim_log" in server.SERVER_INSTRUCTIONS
+
+
+@pytest.mark.anyio
 class TestVertexFunctionSchemaCompatibility:
     async def test_tool_input_schemas_avoid_union_types_and_misplaced_items(self):
         """Vertex models ``type`` as one enum and permits ``items`` on ARRAY only."""

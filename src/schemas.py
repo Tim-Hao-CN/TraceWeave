@@ -91,6 +91,73 @@ class SimPathsResult(SchemaModel):
     next_required_step: NextRequiredStep | None = None
 
 
+class FormalProjectEntry(SchemaModel):
+    path: str
+    detected_formal_tool: str | None = None
+    project_layout_state: Literal[
+        "session_present", "markers_only", "explicit_unverified"
+    ]
+    detection_evidence: list[str] = Field(default_factory=list)
+
+
+class FormalLogEntry(SchemaModel):
+    path: str
+    size: int
+    mtime: str
+    age_hours: float
+    role: Literal[
+        "console", "session", "command", "infrastructure", "unclassified"
+    ]
+    project_dir: str | None = None
+
+
+class FormalWaveEntry(SchemaModel):
+    path: str
+    size: int
+    mtime: str
+    age_hours: float
+    format: Literal["vcd", "fsdb"]
+
+
+class FormalRunEntry(SchemaModel):
+    name: str
+    dir: str
+    detected_formal_tool: str | None = None
+    has_wave: bool
+
+
+class FormalDiscoveryCoverage(SchemaModel):
+    status: Literal["complete", "truncated", "degraded"]
+    directories_examined: int
+    files_examined: int
+    entries_examined: int
+    max_depth: int
+    max_entries: int
+    max_projects: int
+    max_files_per_role: int
+    truncation_reasons: list[str] = Field(default_factory=list)
+    degradation_reasons: list[str] = Field(default_factory=list)
+    skipped_count: int = 0
+
+
+class FormalPathsResult(SchemaModel):
+    """Local formal artifacts without property or trace semantics."""
+
+    formal_root: str
+    requested_formal_tool: Literal["auto", "jaspergold"]
+    detected_formal_tools: list[str] = Field(default_factory=list)
+    discovery_mode: Literal[
+        "explicit", "formal_project_dir", "formal_root", "wave_only", "unknown"
+    ]
+    selected_project_dir: str | None = None
+    projects: list[FormalProjectEntry] = Field(default_factory=list)
+    formal_logs: list[FormalLogEntry] = Field(default_factory=list)
+    wave_files: list[FormalWaveEntry] = Field(default_factory=list)
+    available_runs: list[FormalRunEntry] = Field(default_factory=list)
+    coverage: FormalDiscoveryCoverage
+    hints: list[str] = Field(default_factory=list)
+
+
 class BuildTbHierarchyResult(SchemaModel):
     """Slim LLM-facing payload for build_tb_hierarchy.
 

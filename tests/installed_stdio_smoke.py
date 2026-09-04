@@ -51,7 +51,12 @@ async def main() -> None:
     package_version = version("traceweave-mcp")
     assert initialized.serverInfo.name == "traceweave"
     assert initialized.serverInfo.version == package_version
-    assert {"get_sim_paths", "parse_sim_log", "get_waveform_summary"} <= tool_names
+    assert {
+        "get_sim_paths",
+        "get_formal_paths",
+        "parse_sim_log",
+        "get_waveform_summary",
+    } <= tool_names
     print(
         f"TraceWeave {package_version}: MCP initialize/list_tools passed "
         f"with {len(tool_names)} tools"

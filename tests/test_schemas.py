@@ -7,6 +7,7 @@ from src.schemas import (
     BackendStatus,
     ErrorContextResult,
     ExplainDriverResult,
+    FormalPathsResult,
     GetSignalsByCycleResult,
     ParseSimLogResult,
     ProblemHints,
@@ -47,6 +48,32 @@ def test_sim_paths_result_rejects_extra_fields():
     }
     with pytest.raises(ValidationError):
         SimPathsResult.model_validate(data)
+
+
+def test_formal_paths_result_is_strict_and_semantics_free():
+    data = {
+        "formal_root": "/tmp/formal",
+        "requested_formal_tool": "auto",
+        "detected_formal_tools": [],
+        "discovery_mode": "unknown",
+        "coverage": {
+            "status": "complete",
+            "directories_examined": 1,
+            "files_examined": 0,
+            "entries_examined": 0,
+            "max_depth": 5,
+            "max_entries": 8192,
+            "max_projects": 128,
+            "max_files_per_role": 128,
+        },
+    }
+
+    result = FormalPathsResult.model_validate(data)
+
+    assert result.projects == []
+    assert "trace_kind" not in type(result).model_fields
+    with pytest.raises(ValidationError):
+        FormalPathsResult.model_validate({**data, "property_status": "cex"})
 
 
 def test_parse_sim_log_result_with_problem_hints():

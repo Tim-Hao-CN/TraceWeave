@@ -128,6 +128,7 @@ from src.handshake_suggest import suggest_handshakes, suggest_protocol_bundles
 from src.handshake_sweep import sweep_handshake_anomalies
 from src.window_verify import verify_window
 from src.txn_reconstruct import reconstruct_transactions
+from src.formal_path_discovery import discover_formal_paths
 from src.path_discovery import discover_sim_paths
 from src.problem_hints import compute_problem_hints, compute_xprop_priority_for_group
 from src.tb_hierarchy_builder import (
@@ -172,6 +173,12 @@ _result_provenance: dict[str, dict | None] = {
     "recommend_failure_debug_next_steps": None,
 }
 
+# Formal discovery is an independent artifact domain. It never participates in
+# simulation prerequisite gating or simulation downstream invalidation.
+_formal_session_state: dict | None = None
+_formal_result_cache: schemas.FormalPathsResult | None = None
+_formal_result_provenance: dict | None = None
+
 # In-process snapshots of parsed log failure events. These preserve the
 # baseline across common rerun flows where the simulator overwrites the same
 # run.log path before the LLM asks for an explicit diff.
@@ -181,7 +188,7 @@ _log_snapshot_history: dict[tuple[str, str], list[str]] = {}
 # Holds the full build_tb_hierarchy payload keyed by content-addressed handle.
 # The slim LLM-facing payload references this via `hierarchy_handle`; handle
 # tools resolve through this store. Lifetime is tied to build_tb_hierarchy's
-# cache entry — see _invalidate_downstream / _clear_result_state.
+# cache entry - see _invalidate_downstream / _clear_simulation_result_state.
 _handle_store = HandleStore()
 
 # Small process-session cache of parsed compile evidence.  It is populated
@@ -425,7 +432,7 @@ def _invalidate_hierarchy_state() -> None:
     _handle_store.invalidate()
 
 
-def _clear_result_state():
+def _clear_simulation_result_state():
     for key in _result_cache:
         _result_cache[key] = None
     for key in _result_provenance:
@@ -435,6 +442,14 @@ def _clear_result_state():
     _handle_store.invalidate()
     _compile_context_cache.clear()
     _cursor_store.clear()
+
+
+def _clear_formal_result_state() -> None:
+    global _formal_session_state, _formal_result_cache, _formal_result_provenance
+
+    _formal_session_state = None
+    _formal_result_cache = None
+    _formal_result_provenance = None
 
 
 def _session_identity(sim_result: schemas.SimPathsResult | dict | None) -> tuple | None:
@@ -1204,7 +1219,7 @@ def _update_session_state(tool_name: str, args: dict, result: dict):
         if previous_identity is not None and previous_identity != new_identity:
             _session_state["get_sim_paths"] = None
             _session_state["build_tb_hierarchy"] = None
-            _clear_result_state()
+            _clear_simulation_result_state()
         else:
             _invalidate_downstream(tool_name)
             if (
@@ -1249,11 +1264,20 @@ def _update_session_state(tool_name: str, args: dict, result: dict):
 def reset_session_state():
     _session_state["get_sim_paths"] = None
     _session_state["build_tb_hierarchy"] = None
-    _clear_result_state()
+    _clear_simulation_result_state()
+    _clear_formal_result_state()
 
 
 SERVER_INSTRUCTIONS = """
-Waveform debug workflow:
+Choose the workflow from the artifact type:
+
+- For JasperGold/formal-run artifact discovery, start with get_formal_paths.
+  Use the returned VCD/FSDB with the existing waveform tools. Do not send
+  formal logs to parse_sim_log, and do not infer property status, trace kind,
+  or reachability from a filename, waveform header, or pseudo-signal.
+- For VCS/Xcelium simulation debugging, follow the workflow below.
+
+Simulation waveform debug workflow:
 
 0. Call get_diagnostic_snapshot at session start before any other step.
    - Zero-cost: only reads cached results, never triggers sub-steps.
@@ -1261,7 +1285,7 @@ Waveform debug workflow:
    - Returns availability status for: sim_paths, hierarchy, log_analysis, recommended_next
    - Missing items include suggested_call with pre-filled arguments
 
-1. ALWAYS start with get_sim_paths to discover file paths and simulator type.
+1. For simulation debugging, start with get_sim_paths to discover file paths and simulator type.
    (Skip if step 0 confirmed sim_paths is already cached and up to date.)
    - Inspect discovery_mode first: root_dir, case_dir, or unknown.
    - If discovery_mode is unknown, do not guess deeper paths; follow returned hints.
@@ -5023,6 +5047,44 @@ async def list_tools():
             },
         ),
         Tool(
+            name="get_formal_paths",
+            description=(
+                "Discover local formal project directories, role-labelled logs, and exported "
+                "VCD/FSDB files under a bounded root. JasperGold is the first discovery provider. "
+                "This tool reports filesystem evidence only: it does not parse proof results or "
+                "classify a waveform as a counterexample, witness, SST trace, or reachable trace."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "formal_root": {
+                        "type": "string",
+                        "description": "Absolute local root containing formal run artifacts.",
+                    },
+                    "formal_tool": {
+                        "type": "string",
+                        "enum": ["auto", "jaspergold"],
+                        "default": "auto",
+                        "description": "Discovery provider to run; this is a filter, not proof of artifact origin.",
+                    },
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Optional project directory, absolute or relative to formal_root.",
+                    },
+                    "formal_log": {
+                        "type": "string",
+                        "description": "Optional formal log, absolute or relative to formal_root.",
+                    },
+                    "wave_file": {
+                        "type": "string",
+                        "description": "Optional VCD/FSDB file, absolute or relative to formal_root.",
+                    },
+                },
+                "required": ["formal_root"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
             name="parse_sim_log",
             description=(
                 "Parse a VCS or Xcelium simulation log and return grouped runtime failures by signature. "
@@ -6786,9 +6848,10 @@ async def call_tool(name: str, arguments: dict):
     finally:
         latency_ms = (time.perf_counter() - start) * 1000.0
         case = None
-        sim_state = _session_state.get("get_sim_paths")
-        if isinstance(sim_state, dict) and sim_state.get("case_dir"):
-            case = os.path.basename(str(sim_state["case_dir"]).rstrip("/"))
+        if name != "get_formal_paths":
+            sim_state = _session_state.get("get_sim_paths")
+            if isinstance(sim_state, dict) and sim_state.get("case_dir"):
+                case = os.path.basename(str(sim_state["case_dir"]).rstrip("/"))
         try:
             usage_telemetry.record_call(
                 name,
@@ -6824,6 +6887,18 @@ async def _dispatch(name: str, args: dict):
         _result_provenance["get_sim_paths"] = _build_result_provenance(
             name, args, validated
         )
+        return validated
+
+    elif name == "get_formal_paths":
+        result = discover_formal_paths(
+            args["formal_root"],
+            formal_tool=args.get("formal_tool", "auto"),
+            project_dir=args.get("project_dir"),
+            formal_log=args.get("formal_log"),
+            wave_file=args.get("wave_file"),
+        )
+        validated = schemas.FormalPathsResult.model_validate(result)
+        _cache_formal_discovery(validated)
         return validated
 
     elif name == "parse_sim_log":
@@ -8409,6 +8484,46 @@ def _build_result_provenance(
             "log_size": log_size,
         }
     return None
+
+
+def _formal_discovery_identity(
+    result: schemas.FormalPathsResult | None,
+) -> tuple | None:
+    if result is None:
+        return None
+    return (
+        os.path.realpath(result.formal_root),
+        result.requested_formal_tool,
+        os.path.realpath(result.selected_project_dir)
+        if result.selected_project_dir
+        else None,
+        tuple(project.path for project in result.projects),
+        tuple(log.path for log in result.formal_logs),
+        tuple(wave.path for wave in result.wave_files),
+    )
+
+
+def _cache_formal_discovery(result: schemas.FormalPathsResult) -> None:
+    global _formal_session_state, _formal_result_cache, _formal_result_provenance
+
+    previous_identity = _formal_discovery_identity(_formal_result_cache)
+    new_identity = _formal_discovery_identity(result)
+    if previous_identity is not None and previous_identity != new_identity:
+        _clear_formal_result_state()
+    _formal_session_state = {
+        "formal_root": result.formal_root,
+        "requested_formal_tool": result.requested_formal_tool,
+        "selected_project_dir": result.selected_project_dir,
+        "detected_formal_tools": list(result.detected_formal_tools),
+    }
+    _formal_result_cache = result
+    _formal_result_provenance = {
+        "formal_root": result.formal_root,
+        "selected_project_dir": result.selected_project_dir,
+        "project_dirs": [project.path for project in result.projects],
+        "formal_logs": [log.path for log in result.formal_logs],
+        "wave_files": [wave.path for wave in result.wave_files],
+    }
 
 
 def _can_suggest_parse_sim_log(anchor: dict | None) -> bool:
