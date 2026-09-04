@@ -34,6 +34,32 @@ DISCOVER_MAX_DEPTH_CASE = 1
 DISCOVER_MAX_DEPTH_ROOT = 2
 CASE_DIR_MAX_DEPTH = 3
 
+# Formal artifact discovery is deliberately independent from simulation path
+# discovery. These are hard server-side safety limits for one bounded walk;
+# they are returned in the public coverage receipt rather than exposed as
+# caller-controlled knobs.
+FORMAL_DISCOVERY_MAX_DEPTH = 5
+FORMAL_DISCOVERY_MAX_ENTRIES = 8192
+FORMAL_DISCOVERY_MAX_PROJECTS = 128
+FORMAL_DISCOVERY_MAX_FILES_PER_ROLE = 128
+
+JASPERGOLD_EXCLUDED_DIR_NAMES = (
+    ".git",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    "engine_cache",
+    "sessionlogs.bak",
+)
+JASPERGOLD_EXCLUDED_FILE_SUFFIXES = (
+    ".apdb",
+    ".bak",
+    ".ddk",
+    ".swo",
+    ".swp",
+    "~",
+)
+
 # Directory names that conventionally hold simulation build/run artifacts one
 # level below a verification root (e.g. makefile flows that set
 # WORK_DIR=$VERI_PATH/work). When get_sim_paths is pointed at a verification
