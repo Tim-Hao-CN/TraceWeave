@@ -469,6 +469,8 @@ class WaveformSummaryResult(SchemaModel):
     total_signals: int
     top_modules: list[str] | None = None
     sample_signals: list[str] | None = None
+    producer_hint: str | None = None
+    producer_evidence: str | None = None
 
 
 class SearchSignalsResult(SchemaModel):

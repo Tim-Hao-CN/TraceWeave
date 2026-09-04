@@ -8,6 +8,8 @@ import re
 from bisect import bisect_left, bisect_right
 from pathlib import Path
 
+from src.waveform_hints import annotate_signal_search_result, normalize_vcd_producer
+
 
 class VCDParser:
     def __init__(self, file_path: str):
@@ -23,6 +25,8 @@ class VCDParser:
         self._transitions: dict = {}        # symbol → [(time_ps, value)]
         self._end_time_ps     = 0
         self._top_modules: list = []
+        self._producer_hint: str | None = None
+        self._producer_evidence: str | None = None
 
     # ── Public API ────────────────────────────────────────────────
 
@@ -123,6 +127,8 @@ class VCDParser:
             "total_signals":          len(self._signals),
             "top_modules":            self._top_modules,
             "sample_signals":         list(self._path_to_sym.keys())[:20],
+            "producer_hint":           self._producer_hint,
+            "producer_evidence":       self._producer_evidence,
         }
 
     def search_signals(self, keyword: str, max_results: int = 100) -> dict:
@@ -145,11 +151,11 @@ class VCDParser:
         ]
         matched.sort(key=lambda item: (-_signal_rank(item["path"], kw), item["path"]))
         matched = matched[:max_results]
-        return {
+        return annotate_signal_search_result({
             "keyword":        keyword,
             "total_matched":  len(matched),
             "results":        matched,
-        }
+        })
 
     def get_signal_width(self, signal_path: str) -> int:
         self._ensure_parsed()
@@ -177,6 +183,12 @@ class VCDParser:
             raise FileNotFoundError(f"VCD file does not exist: {self.file_path}")
         with open(self.file_path, "r", errors="replace") as f:
             content = f.read()
+
+        version = re.search(r'\$version\s+(.*?)\s*\$end', content, re.DOTALL)
+        if version:
+            self._producer_hint = normalize_vcd_producer(version.group(1))
+            if self._producer_hint is not None:
+                self._producer_evidence = "vcd_version_header"
 
         # timescale
         ts = re.search(r'\$timescale\s+(.*?)\s*\$end', content, re.DOTALL)

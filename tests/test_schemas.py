@@ -137,9 +137,12 @@ def test_waveform_summary_json_roundtrip():
             "simulation_duration_ps": 200,
             "simulation_duration_ns": 0.2,
             "total_signals": 4,
+            "producer_hint": "jaspergold",
+            "producer_evidence": "vcd_version_header",
         }
     )
     assert json.loads(result.model_dump_json(exclude_none=True))["format"] == "VCD"
+    assert result.producer_hint == "jaspergold"
 
 
 def test_search_signals_batch_accepts_single_result_hint():

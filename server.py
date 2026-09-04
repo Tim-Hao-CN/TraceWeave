@@ -131,6 +131,7 @@ from src.txn_reconstruct import reconstruct_transactions
 from src.formal_path_discovery import discover_formal_paths
 from src.path_discovery import discover_sim_paths
 from src.problem_hints import compute_problem_hints, compute_xprop_priority_for_group
+from src.waveform_hints import annotate_signal_search_result, is_tool_pseudo_signal
 from src.tb_hierarchy_builder import (
     apply_npi_source_overlay,
     build_hierarchy,
@@ -4854,7 +4855,7 @@ def _detect_wave_clock(parser) -> tuple[str | None, int | None]:
                 if item.get("width", 0) == 1 and item.get("path"):
                     candidate_paths.add(item["path"])
 
-        scored: list[tuple[str, int, int]] = []
+        scored: list[tuple[str, int, int, bool]] = []
         for candidate in sorted(
             candidate_paths, key=lambda path: (path.count("."), len(path))
         ):
@@ -4865,7 +4866,14 @@ def _detect_wave_clock(parser) -> tuple[str | None, int | None]:
                 edge_times = _extract_edge_times(transitions, "posedge")
                 period = _compute_clock_period_ps(edge_times)
                 if period and period > 0:
-                    scored.append((candidate, period, len(edge_times)))
+                    scored.append(
+                        (
+                            candidate,
+                            period,
+                            len(edge_times),
+                            is_tool_pseudo_signal(candidate),
+                        )
+                    )
             except Exception as exc:
                 if detect_reason is None:
                     detect_reason = (
@@ -4875,8 +4883,16 @@ def _detect_wave_clock(parser) -> tuple[str | None, int | None]:
                 continue
 
         if scored:
-            scored.sort(key=lambda item: -item[2])
-            clock_path, period_ps, _ = scored[0]
+            scored.sort(
+                key=lambda item: (
+                    item[3],
+                    -item[2],
+                    item[0].count("."),
+                    len(item[0]),
+                    item[0],
+                )
+            )
+            clock_path, period_ps, _, _ = scored[0]
             detect_reason = None
     except Exception as exc:
         detect_reason = f"{type(exc).__name__}: {exc}"
@@ -6968,7 +6984,10 @@ async def _dispatch(name: str, args: dict):
                         f"keyword list has {len(keyword)} entries; "
                         f"max {SIGNAL_SEARCH_MAX_KEYWORDS} per call"
                     )
-                entries = [_search_one(str(kw)) for kw in keyword]
+                entries = [
+                    annotate_signal_search_result(_search_one(str(kw)))
+                    for kw in keyword
+                ]
                 return schemas.SearchSignalsBatchResult.model_validate(
                     {
                         "batch": entries,
@@ -6977,7 +6996,9 @@ async def _dispatch(name: str, args: dict):
                         "for tools such as get_signal_at_time.",
                     }
                 )
-            return schemas.SearchSignalsResult.model_validate(_search_one(keyword))
+            return schemas.SearchSignalsResult.model_validate(
+                annotate_signal_search_result(_search_one(keyword))
+            )
 
         return await _run_in_wave_thread(wave_path, _work)
 
