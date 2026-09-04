@@ -26,6 +26,12 @@
 
 TraceWeave turns local VCS/Xcelium simulation artifacts into a guided investigation. It discovers the active compile, simulation, and VCD/FSDB waveform inputs; builds the compiled hierarchy and an independent structural-risk view; normalizes failures; runs a whole-design runtime handshake sweep; and recommends the next evidence-gathering call.
 
+Formal workflows have a separate artifact-only entry point. `get_formal_paths`
+performs bounded local discovery through tool-specific providers (currently
+JasperGold) and returns project directories, role-labeled logs, and exported
+VCD/FSDB files. It deliberately does not classify traces or interpret property
+or proof status.
+
 For driver, load, structural-path, and X/Z-source questions, TraceWeave uses a provenance-preserving backend ladder: trusted Verdi NPI when a usable KDB is available, a bounded on-demand Slang Source Graph when NPI is unavailable or inconclusive, and Legacy Static as the final fallback. Results expose backend provenance, coverage, truncation, and fallback status rather than turning partial evidence into certainty.
 
 <p align="center">
@@ -1221,6 +1227,29 @@ Important workflow rules:
 - Prefer `failure_events[].time_ps` from `parse_sim_log` as the waveform time anchor.
 - If `fsdb_runtime.enabled == false`, prefer `.vcd` over `.fsdb`.
 
+### Formal Artifact Workflow
+
+Formal artifact inspection is independent of the simulation workflow:
+
+1. Call `get_formal_paths(formal_root, formal_tool="auto")`. Optional
+   `project_dir`, `formal_log`, and `wave_file` overrides are resolved strictly
+   inside `formal_root`.
+2. Read `coverage.status`. `truncated` or `degraded` describes an incomplete
+   filesystem scan, not formal proof coverage.
+3. Select a returned VCD/FSDB path and use the existing waveform tools. Direct
+   waveform calls remain valid without first calling `get_formal_paths`.
+4. Obtain property result, trace kind, assumptions, and initial-state or reset
+   semantics from the formal tool or client. TraceWeave does not infer them
+   from filenames, logs, headers, or signal values.
+
+The current discovery provider recognizes JasperGold layouts. VC Formal is a
+future provider until representative artifacts can validate its layout rules;
+it is not advertised as supported in this release. Any formal tool that emits
+standard VCD/FSDB can already use TraceWeave's waveform API by supplying the
+path directly. A new discovery provider is needed only for automatic layout
+discovery, and a new waveform backend only for a non-VCD/FSDB format. Reading
+an exported VCD and discovering local files requires no JasperGold license.
+
 ## Tool Quick Reference
 
 ### Session Overview
@@ -1230,6 +1259,7 @@ Important workflow rules:
 ### Paths and Hierarchy
 
 - `get_sim_paths`: Discover compile logs, sim logs, waveforms, simulator, and cases. Optional explicit `sim_log` / `wave_file` / `compile_log` overrides win over auto-discovery; omitted fields are still discovered (anchored at the `sim_log`/`wave_file` directory)
+- `get_formal_paths`: Bounded, tool-neutral discovery of local formal projects, role-labeled logs, and exported VCD/FSDB files. `formal_tool` accepts `auto` or `jaspergold`; optional explicit artifact paths must remain inside `formal_root`. The `coverage` receipt describes discovery completeness only, and the result intentionally contains no property status, trace kind, or reachability semantics
 - `build_tb_hierarchy`: Stream compile evidence and build the full testbench hierarchy server-side without retaining raw source bodies; return a slim payload (project, stats, depth-2 tree skeleton, interfaces, ambiguous_basenames, `build_metrics`, `hierarchy_handle`). For split VCS flows, pass ordered `supplementary_compile_logs` once; later connectivity calls keep using the primary `compile_log`. A configured resource guard returns `build_status="blocked"` and no handle. Full completed data is reachable via the handle tools below.
 - `scan_structural_risks`: Scan compiled RTL/TB sources for structural risk patterns in a lock-free cancellable worker; returns `eligible_file_count`, `files_scanned`, `coverage_status`, and `coverage_warnings` so zero or partial source coverage cannot be mistaken for a clean scan
 
@@ -1252,12 +1282,12 @@ All take the `hierarchy_handle` returned by `build_tb_hierarchy`. On a stale or 
 
 ### Waveform Analysis
 
-- `search_signals`: Resolve full hierarchical signal paths. `keyword` accepts a single string or a **list of keywords** (max 16) — pass a list to batch several lookups in one call (one result entry per keyword, in input order) instead of issuing consecutive single-keyword searches. Each result also carries `direction` (`input`/`output`/`inout`/`implicit`/`null`) and `var_type` (`wire`/`reg`/`integer`/`real`/`parameter`/…), so clients can filter ports/nets/variables in a chosen scope without a separate tool. **FSDB** populates both fields; **VCD** populates only `var_type` and returns `direction: null` (the VCD format does not encode port direction)
+- `search_signals`: Resolve full hierarchical signal paths. `keyword` accepts a single string or a **list of keywords** (max 16) — pass a list to batch several lookups in one call (one result entry per keyword, in input order) instead of issuing consecutive single-keyword searches. Each result also carries `direction` (`input`/`output`/`inout`/`implicit`/`null`) and `var_type` (`wire`/`reg`/`integer`/`real`/`parameter`/…), so clients can filter ports/nets/variables in a chosen scope without a separate tool. **FSDB** populates both fields; **VCD** populates only `var_type` and returns `direction: null` (the VCD format does not encode port direction). Exact known JasperGold pseudo-signals remain queryable and receive optional `is_tool_pseudo_signal` / `tool_pseudo_role` hints; similarly named RTL signals are not marked
 - `get_signal_at_time`: Query a signal value at a specific timestamp
 - `get_signal_transitions`: Retrieve transitions for a signal over the strict closed interval `[start_time_ps, end_time_ps]`; FSDB and VCD never mix an earlier timestamp into `transitions`. The last value-change strictly before the window is exposed separately as `predecessor`, which clocked samplers use to classify a transition at the first in-window timestamp. Returns at most `max_transitions` entries (default 1000, earliest in range kept); a clipped result sets `truncated: true` + a `hint`. When bounded native FSDB output is also truncated, `transition_count_is_lower_bound=true`; narrow the time range for complete data. Otherwise `transition_count` reports the total found, and the explicit return cap can be raised for bulk extraction
 - `get_signals_around_time`: Retrieve context around a failure timestamp. `transitions_in_window` is a strict closed-window list; `pre_window_transitions` contains only earlier value changes, capped by `extra_transitions` and ordered chronologically on both FSDB and VCD. Flags a `value_at_center` that is a **sub-cycle transient** (a combinational glitch at the clock edge that settles back within the same cycle — e.g. an interconnect mux re-settling to idle for ~1ns) via `transient_note` + per-signal `center_transient`/`center_settles_to`, so an edge-sampled glitch is not misread as the settled protocol value. `return_mode="values_only"` keeps the atomic multi-signal sample but strips the transition lists (each signal returns `value_at_center` + `window_transition_count` + any transient annotation) — the compact shape for comparing one time point across several traces. `extra_transitions=0` is honored strictly: zero pre-window history.
 - `get_signals_by_cycle`: Sample signals cycle-by-cycle on a clock edge
-- `get_waveform_summary`: Return waveform metadata. Includes a time-scale self-check: `scale_unit` (the scale read from the waveform header, e.g. `100fs`/`1ps`/`1ns`; `unknown` when unreadable) and `scale_fs_per_tick` — all timestamps in tool output are real picoseconds converted with this factor, never raw file ticks. When the scale is unreadable the summary carries a `scale_warning` and every time-based query on that waveform is refused instead of silently assuming a 1ps scale
+- `get_waveform_summary`: Return waveform metadata. Includes a time-scale self-check: `scale_unit` (the scale read from the waveform header, e.g. `100fs`/`1ps`/`1ns`; `unknown` when unreadable) and `scale_fs_per_tick` — all timestamps in tool output are real picoseconds converted with this factor, never raw file ticks. When the scale is unreadable the summary carries a `scale_warning` and every time-based query on that waveform is refused instead of silently assuming a 1ps scale. A recognized JasperGold VCD `$version` header adds the normalized `producer_hint="jaspergold"` and fixed `producer_evidence="vcd_version_header"`; raw version text is not returned, and the hint has no trace semantics
 
 ### Cursors and Verification Primitives
 

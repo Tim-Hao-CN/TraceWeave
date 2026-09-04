@@ -12,11 +12,14 @@ analysis, waveform backends, and extended debug capabilities.
 MCP interface and workflow gate
   server.py
   - tool registry and schema
-  - session state / prerequisite checks
+  - isolated simulation/formal discovery state / prerequisite checks
   - diagnostic snapshot and result caching
 
+Artifact discovery
+  src/path_discovery.py          # VCS/Xcelium simulation artifacts
+  src/formal_path_discovery.py   # bounded provider boundary; JasperGold first
+
 Core log and failure analysis
-  src/path_discovery.py
   src/compile_log_parser.py
   src/log_parser.py
   src/analyzer.py
@@ -44,6 +47,7 @@ Waveform backends
   src/fsdb_signal_index.py
   src/cycle_query.py
   src/waveform_batch.py           # FSDB+VCD batch reader (time-window)
+  src/waveform_hints.py           # producer and exact tool pseudo-signal hints
   src/cancellation.py             # cooperative cancel checkpoints for worker-thread scans
   src/operation_metrics.py        # privacy-safe lock/discovery/cancel timings
 
@@ -80,7 +84,11 @@ Verification
 
 - `server.py` is both the composition root and the workflow gate; tool ordering,
   prerequisite enforcement, session-compatible cache reuse, and in-process
-  parsed-log snapshots for same-path simulation reruns live there.
+  parsed-log snapshots for same-path simulation reruns live there. Simulation
+  and formal discovery use separate state, cache, and provenance identities:
+  changing one domain does not invalidate the other, and `get_formal_paths`
+  never satisfies a simulation prerequisite. Direct waveform calls remain
+  independent of both discovery entry points.
 - Sibling-file rerun hints are conservative and bounded: `src/log_parser.py`
   samples only fixed-size head/tail windows, rejects compile/elaboration/build
   names and compiler-only content, and ranks evidence-backed simulation logs by
@@ -543,6 +551,33 @@ Verification
   multi-signal reader with FSDB and VCD implementations sharing the same
   shape. The FSDB path uses `ffrCreateTimeBasedVCTrvsHdl` for a single
   chronological walk; the VCD path is pure Python.
+
+## Formal Artifact Discovery
+
+`get_formal_paths` is a tool-neutral, artifact-only API backed by
+`src/formal_path_discovery.py`. One bounded deterministic filesystem walk owns
+canonical root containment, symlink deduplication, explicit override
+validation, common VCD/FSDB collection, fixed output caps, and a discovery
+coverage receipt. Providers classify only objective layout evidence. The first
+provider recognizes JasperGold project markers and log roles; adding VC Formal
+or another tool means adding and validating another provider rather than
+forking the public API.
+
+The result deliberately omits property status, trace kind, reachability,
+assumption, and reset semantics. `coverage.status` describes only whether the
+filesystem enumeration was complete. Formal-tool databases, backup sessions,
+and engine caches are excluded and never opened. This keeps proof semantics in
+the formal tool or MCP client, where the producing command and property context
+are available.
+
+Exported VCD/FSDB files reuse the existing waveform backends. A recognized
+JasperGold VCD `$version` produces only a normalized `producer_hint`; exact
+`:jasper_formal_clock` and `:jasper_formal_reset` search rows receive optional
+role hints. These are provenance/navigation facts, not semantic
+classification. Automatic clock detection prefers a viable real RTL clock,
+while callers may explicitly sample the pseudo-clock. Tools that already emit
+standard VCD/FSDB need no provider for direct waveform use; unsupported file
+formats require a separate waveform backend.
 
 ## Handle-based Hierarchy Access
 

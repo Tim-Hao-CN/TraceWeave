@@ -26,6 +26,10 @@
 
 TraceWeave 将本地 VCS/Xcelium 仿真产物组织成一条有引导的调查路径：自动发现本次运行实际使用的编译日志、仿真日志和 VCD/FSDB 波形；构建已编译设计的层次结构和独立的结构风险视图；归一化失败事件；执行全设计运行期握手扫描；并推荐下一步可直接调用的证据采集动作。
 
+Formal 工作流使用独立的纯产物入口。`get_formal_paths` 通过工具 provider
+在本地做有界发现（当前为 JasperGold），返回工程目录、按角色标注的日志及导出的
+VCD/FSDB。它不会对 trace 分类，也不会解释 property 或 proof 状态。
+
 面对 driver、load、结构路径和 X/Z 源头问题，TraceWeave 按保留证据来源的后端阶梯执行：有可用 KDB 时优先使用可信 Verdi NPI；NPI 不可用或结论不充分时使用按需、有界的 Slang Source Graph；最后才回退 Legacy Static。结果显式报告 backend provenance、coverage、truncation 和 fallback 状态，不把局部证据包装成确定结论。
 
 <p align="center">
@@ -1057,6 +1061,26 @@ partial/inconclusive coverage 下的正结果仍是 partial；只有 complete co
 - 优先使用 `parse_sim_log` 返回的 `failure_events[].time_ps` 作为波形时间锚点。
 - 当 `fsdb_runtime.enabled == false` 时,优先选择 `.vcd` 而非 `.fsdb`。
 
+### Formal 产物工作流
+
+Formal 产物检查与仿真工作流相互独立:
+
+1. 调用 `get_formal_paths(formal_root, formal_tool="auto")`。可选的
+   `project_dir`、`formal_log`、`wave_file` override 只能在
+   `formal_root` 内严格解析。
+2. 检查 `coverage.status`。`truncated` 或 `degraded` 表示文件系统扫描不完整，
+   不是 formal proof coverage。
+3. 选择返回的 VCD/FSDB，继续使用现有波形工具。已有明确波形路径时无需先调用
+   `get_formal_paths`。
+4. property 结果、trace 类型、assumption、初始状态或 reset 语义仍由 formal 工具
+   或客户端提供。TraceWeave 不从文件名、日志、header 或信号值推断这些语义。
+
+当前 discovery provider 只识别 JasperGold 布局。VC Formal 在获得代表性真实产物、
+能够验证布局规则之前仍是后续 provider，本版本不宣称支持。任何能导出标准
+VCD/FSDB 的 formal 工具，现在都可直接把路径交给 TraceWeave 的波形 API；只有需要
+自动发现目录布局时才要新增 discovery provider，只有非 VCD/FSDB 格式才要新增波形
+backend。发现本地文件和读取已导出的 VCD 不需要 JasperGold license。
+
 ## 工具速查
 
 ### 会话概览
@@ -1066,6 +1090,7 @@ partial/inconclusive coverage 下的正结果仍是 partial；只有 complete co
 ### 路径与层次结构
 
 - `get_sim_paths`:发现编译日志、仿真日志、波形、仿真器、case。可选的显式 `sim_log` / `wave_file` / `compile_log` 覆盖优先于自动发现,省略的字段仍会被发现(以 `sim_log`/`wave_file` 所在目录为锚点)
+- `get_formal_paths`:有界、工具中立地发现本地 formal 工程、按角色标注的日志及导出的 VCD/FSDB。`formal_tool` 接受 `auto` 或 `jaspergold`;可选的显式产物路径必须位于 `formal_root` 内。`coverage` 只描述发现完整性，结果刻意不含 property 状态、trace 类型或 reachability 语义
 - `build_tb_hierarchy`:流式读取编译证据并在服务端构建完整 testbench 层次结构，不保留源码正文；返回精简载荷(project、stats、深度 2 的 tree skeleton、interfaces、ambiguous_basenames、`build_metrics`、`hierarchy_handle`)。split VCS 流程可在这里一次性传入有序的 `supplementary_compile_logs`;后续 connectivity 查询仍使用 primary `compile_log`。配置的资源 guard 被触发时返回 `build_status="blocked"` 且没有 handle；成功构建的完整数据通过下方 handle 工具按需获取。
 - `scan_structural_risks`:在无 waveform lock、可协作取消的 worker 中扫描编译过的 RTL/TB 源码结构风险;返回 `eligible_file_count`、`files_scanned`、`coverage_status` 与 `coverage_warnings`,避免把零覆盖或部分覆盖误读为“扫描干净”
 
@@ -1088,12 +1113,12 @@ partial/inconclusive coverage 下的正结果仍是 partial；只有 complete co
 
 ### 波形分析
 
-- `search_signals`:解析完整层次化信号路径。`keyword` 接受单个字符串或**关键词列表**(最多 16 个)——传列表可把多次查找合并成一次调用(每个关键词一个结果条目,按输入顺序),不必连续发起多次单关键词搜索。每条结果还附带 `direction`(`input`/`output`/`inout`/`implicit`/`null`)与 `var_type`(`wire`/`reg`/`integer`/`real`/`parameter`/…),客户端无需额外工具就能在指定 scope 内过滤端口/线网/变量。**FSDB** 两个字段都会填;**VCD** 只填 `var_type`,`direction` 返回 `null`(VCD 格式不编码端口方向)
+- `search_signals`:解析完整层次化信号路径。`keyword` 接受单个字符串或**关键词列表**(最多 16 个)——传列表可把多次查找合并成一次调用(每个关键词一个结果条目,按输入顺序),不必连续发起多次单关键词搜索。每条结果还附带 `direction`(`input`/`output`/`inout`/`implicit`/`null`)与 `var_type`(`wire`/`reg`/`integer`/`real`/`parameter`/…),客户端无需额外工具就能在指定 scope 内过滤端口/线网/变量。**FSDB** 两个字段都会填;**VCD** 只填 `var_type`,`direction` 返回 `null`(VCD 格式不编码端口方向)。精确匹配的已知 JasperGold 伪信号仍可查询，并带可选的 `is_tool_pseudo_signal` / `tool_pseudo_role` 提示；相似命名的 RTL 信号不会被标记
 - `get_signal_at_time`:查询信号在指定时间点的值
 - `get_signal_transitions`:取出严格闭区间 `[start_time_ps,end_time_ps]` 内的信号跳变;FSDB 与 VCD 都不会把更早的时间戳混入 `transitions`。窗口起点前最后一次值变化通过独立的 `predecessor` 字段返回,供按时钟采样的内部逻辑识别窗口首个跳变方向。单次最多返回 `max_transitions` 条(默认 1000,保留区间内最早的);被截断时置 `truncated: true` 并附 `hint`。若有界的 native FSDB 输出也发生截断,会设置 `transition_count_is_lower_bound=true`,此时应收窄时间区间以取得完整数据;否则 `transition_count` 是区间内总数,显式返回上限可按需调大
 - `get_signals_around_time`:取出失败时间点附近的上下文。`transitions_in_window` 是严格闭区间列表;`pre_window_transitions` 只包含更早的值变化,按 `extra_transitions` 截断,且 FSDB/VCD 均按时间正序返回。若某个 `value_at_center` 是**亚周期瞬变**(时钟边沿的组合毛刺、同一周期内又 settle 回去——如互连 mux 在每个边沿 ~1ns 重置成 idle),会通过 `transient_note` + 逐信号的 `center_transient`/`center_settles_to` 标注出来,避免把边沿采到的毛刺当成稳定的协议值。`return_mode="values_only"` 保留多信号原子采样但剥离转换列表(每个信号只返回 `value_at_center` + `window_transition_count` + 瞬变标注)——适合跨多条 trace 比较同一时刻的紧凑模式。`extra_transitions=0` 严格生效:不返回任何窗口前历史。
 - `get_signals_by_cycle`:按时钟沿逐周期采样信号
-- `get_waveform_summary`:返回波形元数据。内含时间刻度自检字段:`scale_unit`(从波形文件头读出的刻度,如 `100fs`/`1ps`/`1ns`;读不到时为 `unknown`)与 `scale_fs_per_tick`——所有工具输出的时间戳都是按该系数换算后的真实皮秒,绝不是文件内部的 tick 计数。刻度读不到时 summary 附带 `scale_warning`,且该波形上所有时间型查询都会明确报错,绝不静默假设 1ps 刻度
+- `get_waveform_summary`:返回波形元数据。内含时间刻度自检字段:`scale_unit`(从波形文件头读出的刻度,如 `100fs`/`1ps`/`1ns`;读不到时为 `unknown`)与 `scale_fs_per_tick`——所有工具输出的时间戳都是按该系数换算后的真实皮秒,绝不是文件内部的 tick 计数。刻度读不到时 summary 附带 `scale_warning`,且该波形上所有时间型查询都会明确报错,绝不静默假设 1ps 刻度。识别到 JasperGold VCD `$version` header 时，会增加归一化的 `producer_hint="jaspergold"` 与固定的 `producer_evidence="vcd_version_header"`;不会返回原始版本文本，且该提示不带 trace 语义
 
 ### 游标与验证原语
 
