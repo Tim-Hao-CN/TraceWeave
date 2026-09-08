@@ -19,6 +19,8 @@ docs/*
 !docs/workflow.md
 .vscode/
 .idea/
+.evidence/
+/TraceWeave/
 *.swp
 *.swo
 *~
