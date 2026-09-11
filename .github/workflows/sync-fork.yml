@@ -1,0 +1,53 @@
+name: Sync fork with upstream
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-fork-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository != 'gokeshenzhen/TraceWeave'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          # The default GITHUB_TOKEN is blocked from pushing changes under
+          # .github/workflows/, which upstream edits from time to time. Set the
+          # SYNC_TOKEN secret to a fine-grained PAT with Contents + Workflows
+          # read/write so the whole job authenticates as the PAT.
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Merge upstream main
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SYNC_TOKEN:-}" ]; then
+            echo "::warning::SYNC_TOKEN is not set. Falling back to GITHUB_TOKEN, which cannot push changes under .github/workflows/; set the SYNC_TOKEN secret to keep syncing."
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/gokeshenzhen/TraceWeave.git
+          git fetch upstream --prune
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date with upstream/main."
+            exit 0
+          fi
+
+          git merge --no-edit upstream/main
+          git push origin main
