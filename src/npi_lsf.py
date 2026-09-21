@@ -69,6 +69,11 @@ class FindDriverWorkerRequest(_ConnectivityWorkerRequestBase):
     recursive: bool = False
 
 
+class DynamicStepWorkerRequest(_ConnectivityWorkerRequestBase):
+    operation: Literal["dynamic_step"] = "dynamic_step"
+    signal_path: str = Field(min_length=1, max_length=16_384)
+
+
 class FindLoadsWorkerRequest(_ConnectivityWorkerRequestBase):
     operation: Literal["find_loads"] = "find_loads"
     signal_path: str = Field(min_length=1, max_length=16_384)
@@ -96,6 +101,7 @@ class BuildKdbWorkerRequest(_WorkerRequestBase):
 
 NpiWorkerRequest = Annotated[
     FindDriverWorkerRequest
+    | DynamicStepWorkerRequest
     | FindLoadsWorkerRequest
     | FindPathWorkerRequest
     | BuildKdbWorkerRequest,
@@ -454,6 +460,23 @@ class LsfConnectivityBackend:
     name = "verdi_npi"
     uses_external_worker = True
 
+    def bind_compile_context(self, compile_result: dict) -> None:
+        self._bound_compile_result = compile_result
+
+    def get_dynamic_step(self, signal_path: str, compile_log: str, *,
+                         top_hint: str | None = None, simulator: str = "auto", **_kwargs) -> dict:
+        from .dynamic_evidence import unsupported_step
+        target, reason = self._resolve_target(compile_log, simulator, top_hint)
+        if target is None:
+            return unsupported_step(signal_path, self.name, reason)
+        outcome = self._transport.execute(DynamicStepWorkerRequest(
+            kdb_path=target[0], top=target[1], signal_path=signal_path))
+        result = dict(outcome.result) if outcome.result is not None else unsupported_step(
+            signal_path, self.name, outcome.fallback_reason or "npi_lsf_worker_failed")
+        self._last_kdb_status = _attach_execution_receipt(result, self.execution_mode, outcome,
+                                                        kdb_path=target[0])
+        return result
+
     def __init__(
         self,
         config: NpiExecutionConfig,
@@ -633,7 +656,9 @@ class LsfConnectivityBackend:
         if not self._config.valid:
             return None, "npi_lsf_config_invalid"
         try:
-            compile_result = parse_compile_log(compile_log, simulator)
+            compile_result = getattr(self, "_bound_compile_result", None)
+            if compile_result is None:
+                compile_result = parse_compile_log(compile_log, simulator)
             status = probe_verdi_backend(
                 compile_result,
                 compile_log_path=compile_log,
@@ -762,7 +787,10 @@ def execute_worker_request(
     try:
         if not backend._ensure_loaded(request.kdb_path, request.top):
             return WorkerUnavailable()
-        if isinstance(request, FindDriverWorkerRequest):
+        if isinstance(request, DynamicStepWorkerRequest):
+            from .npi_dynamic import query_step
+            result = query_step(backend, request.signal_path)
+        elif isinstance(request, FindDriverWorkerRequest):
             result = backend._npi_find_driver(
                 request.signal_path,
                 "",
@@ -813,6 +841,11 @@ def _validate_operation_result(
                 phase = validated_build.phase or "worker"
                 payload["reason"] = f"KDB build failed during {phase}."
             return payload
+        if isinstance(request, DynamicStepWorkerRequest):
+            from .dynamic_evidence import validate_step
+            if result.get("backend") != "verdi_npi":
+                return None
+            return validate_step(result)
         if isinstance(request, FindDriverWorkerRequest):
             validated = schemas.ExplainDriverResult.model_validate(result)
             if validated.backend != "verdi_npi":

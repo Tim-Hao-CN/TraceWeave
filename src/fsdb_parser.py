@@ -17,6 +17,7 @@ from config import (
     SIGNAL_SEARCH_MAX_RESULTS,
 )
 from . import operation_metrics
+from .clock_edge_cache import ClockCacheToken, discard_clock_edges
 
 # Wrapper shared object lives next to this file.
 _WRAPPER_SO = os.path.join(os.path.dirname(__file__), "..", "libfsdb_wrapper.so")
@@ -72,7 +73,7 @@ def _load_wrapper():
     if not os.path.exists(so_path):
         raise RuntimeError(
             f"libfsdb_wrapper.so not found: {so_path}\n"
-            "Run `bash build_wrapper.sh` from the TraceWeave repo root."
+            "Run `bash scripts/build_wrapper.sh` from the TraceWeave repo root."
         )
     runtime_info = get_fsdb_runtime_info()
     if not runtime_info["enabled"]:
@@ -209,7 +210,7 @@ def _setup(lib):
     except AttributeError:
         raise RuntimeError(
             "libfsdb_wrapper.so is outdated: missing fsdb_get_scale_info "
-            "(FSDB time-scale support). Rebuild it with `bash build_wrapper.sh` "
+            "(FSDB time-scale support). Rebuild it with `bash scripts/build_wrapper.sh` "
             "and reconnect the MCP server."
         )
 
@@ -235,6 +236,7 @@ def _transition_group_limit() -> int:
 class FSDBParser:
     def __init__(self, file_path: str):
         self.file_path = file_path
+        self._clock_cache_token = ClockCacheToken()
         self._lib    = None
         self._handle = None
         self._buf    = None
@@ -269,6 +271,7 @@ class FSDBParser:
         )
 
     def close(self):
+        discard_clock_edges(self)
         if self._handle and self._lib:
             if getattr(self, "_transition_group_active", False):
                 profile = _NativeTransitionGroupProfileV1()
@@ -292,7 +295,7 @@ class FSDBParser:
         self._open()
         # Use the shared 64 MB buffer (not a fixed 1024-byte one): a wide bus
         # such as 1024-bit AXI wdata renders to >1023 chars and would otherwise
-        # be silently truncated by strncpy on the C++ side.
+        # be silently truncated by a smaller native output capacity.
         buf = self._get_buf()
         rc  = self._lib.fsdb_get_value_at_time(
             self._handle, signal_path.encode(),
@@ -304,6 +307,11 @@ class FSDBParser:
             )
         if rc == -4:
             raise self._scale_unknown_error()
+        if rc == -6:
+            # Do not let a failed native view restoration poison later reads.
+            # A future call will open a fresh handle; close also drops indexes.
+            self.close()
+            raise RuntimeError("FSDB point-read cleanup failed; reader closed for recovery")
         if rc < 0:
             raise RuntimeError(f"fsdb_get_value_at_time failed, rc={rc}")
         return {
@@ -555,10 +563,15 @@ class FSDBParser:
                     pass
             results.append(item)
         results.sort(key=lambda item: (-_signal_rank(item["path"], keyword.lower()), item["path"]))
+        # Older wrappers stop writing when their output buffer fills. Even
+        # without an explicit native truncation flag, a nearly full buffer is
+        # insufficient evidence of a complete search.
+        native_truncated = len(buf.value) >= _BUF_SIZE - 512
         results = results[:max_results]
         return {
             "keyword":       keyword,
             "total_matched": count,
+            "truncated": native_truncated or count > len(results),
             "results":       results,
             "hint": "Use the full path from the path field as the signal_path argument for tools such as get_signal_at_time.",
         }

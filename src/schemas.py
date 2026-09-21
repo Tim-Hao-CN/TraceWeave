@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Literal
+import config as _config
 
 from pydantic import BaseModel, ConfigDict, Field, model_serializer
 
@@ -310,7 +311,49 @@ class StructuralRisk(SchemaModel):
     evidence: list[str] = Field(default_factory=list)
 
 
+class StructuralPropagationReceipt(SchemaModel):
+    status: Literal["not_run", "complete", "partial"] = "not_run"
+    gaps: list[str] = Field(default_factory=list)
+    inventory_complete: bool = False
+    instances: int = 0
+    signal_count: int = 0
+    signal_bits: int = 0
+    driver_count: int = 0
+    driver_bits: int = 0
+    ast_nodes: int = 0
+    work_steps: int = 0
+    boundary_count: int = 0
+    unknown_bits: int = 0
+    conflict_bits: int = 0
+    note: str | None = None
+
+
+class SemanticScanResult(SchemaModel):
+    status: Literal["not_run", "complete", "partial", "unavailable"] = "not_run"
+    scope: str | None = None
+    categories_checked: list[str] = Field(default_factory=list)
+    gaps: list[str] = Field(default_factory=list)
+    total_facts: int = 0
+    counts: dict[str, int] = Field(default_factory=dict)
+    facts: list[dict[str, Any]] = Field(default_factory=list)
+    instance_bindings: list[dict[str, str]] = Field(default_factory=list)
+    instances_visited: int = 0
+    template_count: int = 0
+    ast_nodes_visited: int = 0
+    blocking_diagnostics: int = 0
+    cache_disposition: str | None = None
+    query_artifact_status: str = "not_requested"
+    propagation: StructuralPropagationReceipt = Field(default_factory=StructuralPropagationReceipt)
+    metrics: dict[str, int | float] = Field(default_factory=dict)
+    note: str | None = None
+    error_type: str | None = None
+    output_truncated: bool = False
+
+
 class ScanStructuralRisksResult(TruncatableResult):
+    analysis_mode: Literal["fast", "auto", "deep"] = "auto"
+    lexical_coverage_status: Literal["complete", "zero_coverage", "degraded"] = "complete"
+    semantic: SemanticScanResult = Field(default_factory=SemanticScanResult)
     scan_scope: str = "scope1"
     eligible_file_count: int = 0
     files_scanned: int = 0
@@ -476,6 +519,7 @@ class WaveformSummaryResult(SchemaModel):
 class SearchSignalsResult(SchemaModel):
     keyword: str
     total_matched: int
+    truncated: bool = False
     results: list[dict[str, Any]] = Field(default_factory=list)
     hint: str | None = None
 
@@ -1390,6 +1434,28 @@ class CursorDeleteResult(SchemaModel):
     deleted: bool
 
 
+class DivergenceContext(SchemaModel):
+    compile_log: str = Field(min_length=1)
+    simulator: Literal["auto", "vcs", "xcelium"] = "auto"
+    supplementary_compile_logs: list[str] = Field(default_factory=list, max_length=16)
+    top_hint: str | None = None
+    hierarchy_handle: str | None = None
+    snapshot_sha256: str | None = None
+    source_snapshot_sha256: str | None = None
+    compile_log_identity_sha256: str | None = None
+
+
+class DivergenceNextAction(SchemaModel):
+    side: Literal["a", "b", "both"]
+    tool: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    reason: str
+    status: Literal["ready", "needs_context", "needs_prerequisite"]
+    missing_fields: list[str] = Field(default_factory=list)
+    prerequisite_calls: list[dict[str, Any]] = Field(default_factory=list)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+
 class DiffFirstDivergenceResult(SchemaModel):
     diverged: bool
     wave_path_a: str
@@ -1406,6 +1472,16 @@ class DiffFirstDivergenceResult(SchemaModel):
     missing_a: bool = False
     missing_b: bool = False
     note: str | None = None
+    comparison_status: Literal["different", "equal", "inconclusive"] = "inconclusive"
+    coverage_status: Literal["complete", "partial", "none"] = "none"
+    earliest_difference_proven: bool = False
+    coverage_gaps: list[dict[str, Any]] = Field(default_factory=list)
+    next_actions: list[DivergenceNextAction] = Field(default_factory=list)
+    requested_start_ps: int | None = None
+    requested_end_ps: int | None = None
+    width_a: int | None = None
+    width_b: int | None = None
+    excluded_intervals: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class PeriodResult(SchemaModel):
@@ -1572,11 +1648,19 @@ class HandshakeBundle(SchemaModel):
     needs: list[str] = Field(default_factory=list)
 
 
+class SignalDiscoveryCoverage(SchemaModel):
+    status: Literal["complete", "partial"] = "complete"
+    signal_limit: int = 65_536
+    signals_returned: int = 0
+    reasons: list[str] = Field(default_factory=list)
+
+
 class SuggestHandshakesResult(SchemaModel):
     wave_path: str
     scope: str | None = None
     candidate_count: int = 0
     candidates: list[HandshakeBundle] = Field(default_factory=list)
+    discovery: SignalDiscoveryCoverage = Field(default_factory=SignalDiscoveryCoverage)
     reason: str | None = None
 
 
@@ -1612,6 +1696,7 @@ class SuggestProtocolBundlesResult(SchemaModel):
     scope: str | None = None
     candidate_count: int = 0
     candidates: list[ProtocolBundle] = Field(default_factory=list)
+    discovery: SignalDiscoveryCoverage = Field(default_factory=SignalDiscoveryCoverage)
     reason: str | None = None
     # Copy-paste-ready inspect_handshake relay for the discovered candidates.
     # Discovery only LOCATES interfaces; the analysis step is inspect_handshake.
@@ -1633,6 +1718,7 @@ class SweptInterface(SchemaModel):
     ready: str
     payload: list[str] = Field(default_factory=list)
     confidence: str | None = None
+    discovery_needs: list[str] = Field(default_factory=list)
     coverage: HandshakeCoverage = Field(default_factory=HandshakeCoverage)
     # flags are factual observations, never verdicts
     flags: list[str] = Field(default_factory=list)
@@ -1697,6 +1783,7 @@ class HandshakeSweepResult(SchemaModel):
     flagged_count: int = 0
     transition_truncated_count: int = 0
     truncated: bool = False
+    discovery: dict[str, SignalDiscoveryCoverage] = Field(default_factory=dict)
     # Coverage facts for interpreting flagged_count. In particular,
     # zero_coverage means no protocol interfaces were checked, so flagged_count=0
     # is not evidence of a clean protocol run.
@@ -1871,3 +1958,58 @@ class DiffValueDistributionResult(SchemaModel):
     bit_diff: list[DistBitDiff] = Field(default_factory=list)
     discriminative_bits: list[int] = Field(default_factory=list)
     note: str | None = None
+
+
+# Explicit dual-context divergence tracing; no mutable current-session defaults.
+class DivergenceSide(DivergenceContext):
+    wave_path: str = Field(min_length=1)
+    signal_path: str = Field(min_length=1)
+
+
+class DivergencePair(SchemaModel):
+    a: str = Field(min_length=1)
+    b: str = Field(min_length=1)
+
+
+class DivergenceLimits(SchemaModel):
+    max_depth: int = Field(default=_config.DIVERGENCE_DEFAULT_DEPTH, ge=0, le=_config.DIVERGENCE_MAX_DEPTH)
+    max_nodes: int = Field(default=_config.DIVERGENCE_DEFAULT_NODES, ge=1, le=_config.DIVERGENCE_MAX_NODES)
+    max_branches: int = Field(default=_config.DIVERGENCE_DEFAULT_BRANCHES, ge=1, le=_config.DIVERGENCE_MAX_BRANCHES)
+    timeout_sec: float = Field(default=_config.DIVERGENCE_DEFAULT_TIMEOUT, gt=0, le=_config.DIVERGENCE_MAX_TIMEOUT)
+
+
+class DivergenceComparison(SchemaModel):
+    mode: Literal["event", "clock"] = "event"
+    clock_a: str | None = None
+    clock_b: str | None = None
+    edge: Literal["posedge", "negedge"] = "posedge"
+    sample_offset_ps: int = Field(default=0, ge=0)
+
+
+class TraceDivergenceInput(SchemaModel):
+    side_a: DivergenceSide
+    side_b: DivergenceSide
+    start_time_ps: int | str = 0
+    end_time_ps: int | str = -1
+    reference_side: Literal["unspecified", "a", "b"] = "unspecified"
+    comparison: DivergenceComparison = Field(default_factory=DivergenceComparison)
+    signal_pairs: list[DivergencePair] = Field(default_factory=list, max_length=1024)
+    scope_pairs: list[DivergencePair] = Field(default_factory=list, max_length=128)
+    limits: DivergenceLimits = Field(default_factory=DivergenceLimits)
+    cursor_name: str | None = None
+    cursor_note: str | None = None
+
+
+class TraceDivergenceResult(SchemaModel):
+    status: Literal["complete", "partial", "blocked", "no_difference", "inconclusive"]
+    reference_side: Literal["unspecified", "a", "b"] = "unspecified"
+    comparison: dict[str, Any] = Field(default_factory=dict)
+    contexts: dict[str, Any] = Field(default_factory=dict)
+    nodes: list[dict[str, Any]] = Field(default_factory=list)
+    edges: list[dict[str, Any]] = Field(default_factory=list)
+    findings: list[dict[str, Any]] = Field(default_factory=list)
+    frontier: list[dict[str, Any]] = Field(default_factory=list)
+    coverage: dict[str, Any] = Field(default_factory=dict)
+    next_actions: list[DivergenceNextAction] = Field(default_factory=list)
+    cursor: CursorRefSchema | None = None
+    operation_metrics: dict[str, int | float] = Field(default_factory=dict)

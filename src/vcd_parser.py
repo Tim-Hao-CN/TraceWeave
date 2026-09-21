@@ -6,14 +6,19 @@ The public API matches FSDBParser.
 
 import re
 from bisect import bisect_left, bisect_right
+from operator import itemgetter
 from pathlib import Path
 
 from src.waveform_hints import annotate_signal_search_result, normalize_vcd_producer
+from src.clock_edge_cache import ClockCacheToken
+
+_transition_time = itemgetter(0)
 
 
 class VCDParser:
     def __init__(self, file_path: str):
         self.file_path = file_path
+        self._clock_cache_token = ClockCacheToken()
         self._parsed          = False
         # fs per VCD time unit. Integer fs (not integer ps) so a sub-ps
         # $timescale like 100fs stays exact instead of truncating to 0 and
@@ -22,6 +27,7 @@ class VCDParser:
         self._timescale_raw   = None        # raw $timescale text, e.g. "100fs"
         self._signals: dict   = {}          # symbol → {path, width}
         self._path_to_sym: dict = {}        # full_path → symbol
+        self._range_aliases: set[str] = set()  # exact ranges hidden from search when a base alias exists
         self._transitions: dict = {}        # symbol → [(time_ps, value)]
         self._end_time_ps     = 0
         self._top_modules: list = []
@@ -47,11 +53,10 @@ class VCDParser:
         self._ensure_parsed()
         sym   = self._resolve(signal_path)
         trans = self._transitions.get(sym, [])
-        times = [t for t, _ in trans]
         if end_ps == -1:
             end_ps = self._end_time_ps
-        lo = bisect_left(times, start_ps)
-        hi = bisect_right(times, end_ps)
+        lo = bisect_left(trans, start_ps, key=_transition_time)
+        hi = bisect_right(trans, end_ps, key=_transition_time)
         filtered = trans[lo:hi]
         predecessor = trans[lo - 1] if lo > 0 else None
         return {
@@ -83,13 +88,15 @@ class VCDParser:
             try:
                 sym   = self._resolve(path)
                 trans = self._transitions.get(sym, [])
-                filtered = [(t, v) for t, v in trans if start_ps <= t <= end_ps]
+                lo = bisect_left(trans, start_ps, key=_transition_time)
+                hi = bisect_right(trans, end_ps, key=_transition_time)
+                filtered = trans[lo:hi]
                 # extra_transitions=0 must mean ZERO pre-window history: a bare
                 # [-extra_transitions:] slice is the full list when extra is 0
                 # ([-0:] == [0:]), which leaked the entire pre-window history.
                 # The FSDB wrapper already guards `extra_transitions > 0`.
                 if extra_transitions > 0:
-                    pre_window = [(t, v) for t, v in trans if t < start_ps][-extra_transitions:]
+                    pre_window = trans[max(0, lo - extra_transitions):lo]
                 else:
                     pre_window = []
                 result[path] = {
@@ -147,13 +154,15 @@ class VCDParser:
              "direction": None,
              "var_type": self._signals[s].get("var_type") or None}
             for p, s in self._path_to_sym.items()
-            if kw in p.lower()
+            if kw in p.lower() and (p not in self._range_aliases or "[" in kw)
         ]
         matched.sort(key=lambda item: (-_signal_rank(item["path"], kw), item["path"]))
+        total_matched = len(matched)
         matched = matched[:max_results]
         return annotate_signal_search_result({
             "keyword":        keyword,
-            "total_matched":  len(matched),
+            "total_matched":  total_matched,
+            "truncated": total_matched > len(matched),
             "results":        matched,
         })
 
@@ -199,6 +208,7 @@ class VCDParser:
         scope_stack   = []
         current_ps    = 0
         tokens        = content.split()
+        ranged_declarations: dict[str, set[str]] = {}
         i = 0
         while i < len(tokens):
             tok = tokens[i]
@@ -213,18 +223,27 @@ class VCDParser:
                     scope_stack.pop()
                 i += 2
             elif tok == "$var":
-                # $var <var_type> <size> <id> <reference> $end
+                # $var <var_type> <size> <id> <reference> [index/range] $end
                 # var_type is the language-level type (wire/reg/integer/real/parameter/...).
                 # VCD has no port direction, so direction stays None at higher layers.
                 var_type = tokens[i + 1] if i + 1 < len(tokens) else ""
                 width  = int(tokens[i + 2]) if tokens[i + 2].isdigit() else 1
                 symbol = tokens[i + 3]
                 name   = tokens[i + 4]
-                full   = ".".join(scope_stack + [name])
+                end = tokens.index("$end", i + 5)
+                selection = "".join(tokens[i + 5:end])
+                if selection and not re.fullmatch(r"\[-?\d+(?::-?\d+)?\]", selection):
+                    raise ValueError("Unsupported VCD declaration selection")
+                base = ".".join(scope_stack + [name])
+                full = base + selection
+                if full in self._path_to_sym and self._path_to_sym[full] != symbol:
+                    raise ValueError(f"Conflicting VCD declarations for '{full}'")
+                if selection:
+                    ranged_declarations.setdefault(base, set()).add(full)
                 self._signals[symbol]     = {"path": full, "width": width, "var_type": var_type}
                 self._path_to_sym[full]   = symbol
-                self._transitions[symbol] = []
-                i += 6
+                self._transitions.setdefault(symbol, [])
+                i = end + 1
             elif tok.startswith("#"):
                 try:
                     # ceil to ps, matching the FSDB wrapper's convention: a
@@ -253,15 +272,28 @@ class VCDParser:
             else:
                 i += 1
 
+        # Preserve the traditional bare-name access for one dumped vector.
+        # A separately dumped bit is never a scalar alias of the whole bus;
+        # multiple slices also cannot supply one unambiguous whole-bus value.
+        for base, paths in ranged_declarations.items():
+            if len(paths) == 1 and base not in self._path_to_sym:
+                full = next(iter(paths))
+                if ":" in full[len(base):]:
+                    self._path_to_sym[base] = self._path_to_sym[full]
+                    self._range_aliases.add(full)
+
 
 # ── Utility ────────────────────────────────────────────────────────
 
 def _value_at(transitions: list, time_ps: int):
-    """Return the value at time_ps using binary search over transitions."""
+    """Search existing records in O(log N), without copying their timestamps.
+
+    Search only the time key: rounded sub-ps events and multiple changes in
+    one tick may have equal timestamps and must retain their file order.
+    """
     if not transitions:
         return None
-    times = [t for t, _ in transitions]
-    idx = bisect_right(times, time_ps) - 1
+    idx = bisect_right(transitions, time_ps, key=_transition_time) - 1
     if idx < 0:
         return None
     return transitions[idx][1]

@@ -82,6 +82,53 @@ Verification
 
 ## Notes
 
+- VCD point and window reads bisect the existing ordered transition records;
+  separately dumped bits retain their declared indices (`valid[0]`, `valid[1]`)
+  and disjoint slices retain their ranges. A unique vector range remains
+  accessible by its traditional base name as well as its exact declared range;
+  multiple bit/slice declarations never silently overwrite that base name.
+  Symbol aliases continue sharing the same transition records. Point/window reads
+  do not rebuild a timestamp list or scan the preceding history. Equal
+  timestamps keep file order, including rounded sub-ps events. Query work is
+  O(log N + returned events) with no persistent duplicate time index; the first
+  full-file parse and its memory cost are unchanged. Reproduce reader timings
+  with `scripts/benchmark_waveform_reads.py`: generate a deterministic VCD using
+  `--generate --wave /tmp/activity.vcd --steps 1000000`, then run the same command
+  without `--generate` (optionally `--workload point`, `window`, `around`, or
+  `cycle`). `--source-root` selects another checkout for before/after comparison.
+  The script checks returned values and reports first-load versus repeated-read
+  timing and Linux RSS; it excludes MCP transport, conversion and disk-cold I/O.
+- FSDB point output retains the shared 64 MiB capacity for wide values, but
+  copies only the actual value plus its NUL terminator. Unused capacity is not
+  zero-filled on each read; the allocation and native signal-loading costs are
+  unchanged. Native callers still receive a bounded, terminated prefix when
+  their buffer is smaller than the value, and nonpositive capacity is rejected.
+- Repeated `get_signals_by_cycle` calls reuse a complete compact clock-edge
+  vector and its global median period. `src/clock_edge_cache.py` retains one
+  clock/edge per parser, with an 8 MiB entry limit, 32 MiB process array budget
+  and 64-entry LRU cap. Parser replacement, FSDB close and owner collection
+  discard indexes; incomplete native prefixes and oversized indexes bypass
+  caching. Cache hits still observe cancellation. The cache bookkeeping lock
+  never covers waveform I/O and does not replace the process-global FFR lock.
+  Initial full-clock reads and their temporary memory are unchanged; only
+  repeated reads avoid that work. Absolute cycle numbers, total edge counts,
+  global period and public result schemas remain unchanged.
+- Standalone FSDB point reads temporarily restrict FFR loading to the queried
+  time. FFR loads whole flush sessions, so a single-session file gains little
+  from this restriction. `fsdb_point_read.h` saves the current bounds before
+  changing them, releases the traversal and load, then restores those bounds
+  on success, failure and exceptions. Missing bounds or unsupported windows
+  use the previous loading path; an empty partial read retries the original
+  view once. Cleanup failure closes the Python reader before any later query.
+  Active transition groups keep their existing load/view; point reads reuse
+  group members and reject nonmembers without disturbing the group. Range and
+  around-time reads keep their existing predecessor/history behavior. Native
+  calls still run under the global FSDB lock and cancellation is observed after
+  the native call returns. For a reproducible multi-session fixture, generate
+  the benchmark VCD, convert using local Verdi `vcd2fsdb` with
+  `FSDB_ENV_WRITER_MEM_LIMIT=4`, and point `TW_POINT_READ_FSDB` at the result when
+  running `tests/test_fsdb_point_window.py`. `--wrapper` on the benchmark selects
+  a separately compiled baseline library for A/B measurement.
 - `server.py` is both the composition root and the workflow gate; tool ordering,
   prerequisite enforcement, session-compatible cache reuse, and in-process
   parsed-log snapshots for same-path simulation reruns live there. Simulation
@@ -162,7 +209,11 @@ Verification
   triggers a whole-result Legacy Static recomputation. The Source Graph runtime
   is created lazily once per server process, keeps a bounded in-memory scoped
   IR cache, admits at most one cold build per process, and executes its optional
-  frontend in an isolated one-shot worker. An opt-in, default-disabled semantic
+  frontend in an isolated one-shot worker. Projection excludes uninstantiated
+  generate branches from both instance and assignment facts, independently for
+  each parameter specialization. Indexed instance-array elements retain their
+  elaborated leaf names. Projector version changes invalidate earlier artifacts.
+  An opt-in, default-disabled semantic
   session can instead retain one exact, bounded Slang compilation/root in that
   isolated child and project several narrow scoped IR artifacts without a
   second parse/elaboration. The broader proved context is part of artifact
@@ -351,6 +402,24 @@ Verification
   result build/serialization cost, and process RSS start/peak/end. All fields
   are numeric or fixed-label aggregates; paths, scopes, signal names, values,
   and search keywords are never recorded.
+- Handshake discovery enumerates at most 65,536 signal descriptors per search,
+  applying the requested scope before that limit. It reports independent
+  `discovery` coverage; search failures or truncation make a sweep incomplete
+  even when its interface cap was not reached. `discovered_count` is then a
+  lower bound. Narrowing scope can recover interfaces that a global prefix
+  missed; raising `max_interfaces` alone cannot repair discovery truncation.
+  Valid/ready bit channels pair by identical index and carry an explicit payload
+  mapping need. Named channels never borrow another channel's payload, and an
+  ambiguous nearest clock is left unresolved. These are naming-based proposals,
+  with each inspected row retaining its actual check coverage.
+  The September 18 large SoC replay (18,641 lexical hierarchy nodes, 75,578
+  VCD IDs, fresh MCP server, NPI disabled, 64-interface cap) discovered at least
+  7,421 interfaces versus 297 in the original evaluation. It explicitly reported
+  partial discovery at the signal cap. The previously missed deep stage yielded
+  two interfaces in 94 ms; both had zero payload-hold violations. The whole
+  first sweep took 4.21 s, including VCD loading, versus the earlier 7.16 s;
+  process-tree peak RSS was 791 MiB versus about 711 MiB. These are individual
+  case measurements, not full-coverage or general speed/memory guarantees.
 - A full `sweep_handshakes` does not independently reread and re-extract the
   same clock for every interface. `handshake_sweep` groups discovered bundles
   by clock and creates one private `EdgeSamplingSession` per group;
@@ -442,6 +511,116 @@ Verification
   the event loop and checks cooperative cancellation between files and within
   its long Python loops. `scripts/benchmark_structural_scan.py` reports
   privacy-safe timing/RSS/I/O aggregates and a full-result equivalence hash.
+- `design_identity.py` and `structural_scan_runtime.py` cache the complete
+  lexical scan before MCP output trimming. Ordered compile context, exact raw
+  content, categories and rule version form the key; digest records are reused
+  only after full stat validation (including ctime/inode) and byte hashing;
+  even coarsened mount timestamps cannot hide same-size content edits. Resolved literal
+  includes and earlier search candidates are checked again before publication
+  and reuse. Missing scanned inputs disable caching. Lexical identity covers
+  the exact texts consumed by regex rules; unresolved macro/library includes
+  separately prohibit treating it as a complete semantic identity.
+  The default process-local LRU retains at most eight results / 32 MiB of JSON
+  and 16 MiB of digest/include facts, never persistent source bodies. A warm hit
+  skips source preload and all rules. Exact concurrent callers share one build;
+  one cancellation preserves it, final-waiter cancellation stops it. Results
+  computed across a source change are degraded and never published. Set
+  `TRACEWEAVE_STRUCTURAL_SCAN_CACHE=0` to bypass this optimization.
+  An already joined source lease survives identity capture and transfers into
+  the rule build on a miss, even if hierarchy finishes first. Cache hits and
+  coalesced callers release unused leases. The source-index A/B benchmark
+  disables result caching and uses `fast` so it measures source sharing;
+  result-cache byte validation is measured by the separate cache benchmark.
+  `scripts/benchmark_structural_cache.py` compares full internal result hashes.
+  On the local OpenTitan 1,117-source workload (September 18, sequential calls
+  in one fresh process), uncached/cold calls took 4.26/5.99 s; three warm hits
+  took 1.03/1.06/1.01 s with zero rule executions and identical full results.
+  The stored result occupied 739,443 bytes; cumulative process peak RSS was
+  400 MiB. This is a single-process sample with warm filesystem pages; the cold
+  identity cost is real and the cache does not accelerate an isolated first scan.
+- `structural_semantics.py` scans elaborated active instance bindings and
+  specialization templates directly, without a ConnectivityIR build. It reports
+  input/open-port facts, constant regions of input concatenations and continuous
+  assignments, and named/literal constant comparisons. Statement source and
+  enclosing consumer context remain evidence, not defect verdicts. Sequential
+  reset/initial values are not treated as permanent ties. Definition buffer
+  identity plus all value parameters form template identity; type parameters
+  and external hierarchical dependencies conservatively retain separate
+  instance templates. The isolated worker has time/RSS and instance/fact/AST/bit
+  bounds. `fast` stays lexical; default `auto` reuses a compatible completed
+  semantic result or explicitly reports `not_run`. `deep` requests construction.
+  `analysis_mode` is a per-invocation MCP argument, defaulting to `auto`; no
+  environment setting selects this mode. `deep` permits a cold frontend build
+  but still reuses an exact completed result. `semantic_scope` limits basic
+  fact extraction, not necessarily frontend parsing/elaboration. Reuse requires
+  matching identity, scope, categories and budgets; the category list replaces
+  the default selection rather than extending it. See [Structural Scan Invocation](#structural-scan-invocation)
+  for JSON examples. The lexical scan still runs on a semantic miss.
+  Lexical and semantic coverage are independent; output trimming preserves
+  counts and marks `output_truncated`, while computation limits mark partial
+  analysis and prevent publishing a completed cache entry.
+  `scripts/benchmark_semantic_scan.py` exercises real dispatch. The 18,642 active
+  instance SoC case produced 14,475 structural facts in 10.17 s (worker peak
+  344 MiB), with no instance/fact/AST cap reached at the default budgets. Coverage
+  remained partial for runtime exclusions and incomplete include identity;
+  the following `auto` call took 8 ms and honestly reported a semantic miss.
+  This normal-design inventory includes legitimate constants and is not a bug
+  count. A 301-instance repeated-wrapper regression also checks that three
+  definition templates suffice when specialization/context actually match.
+- Scoped semantic scans can publish compact query IR from the **same** Slang
+  frontend build. This requires an existing current hierarchy, an explicit
+  `semantic_scope`, an exact reusable query identity, identical ordered
+  compile manifests/frontend arguments, and at most 64 projected instances.
+  Projection is still charged to the worker time/RSS budget and capped at
+  16 MiB serialized IR. The normal Source Graph loader validates fingerprints,
+  schema, scope and capabilities before admission to its existing bounded LRU.
+  No full-design IR or retained frontend process is introduced. Deep scan and
+  query frontend launches share process-wide cold-build admission; cancellation
+  or timeout while waiting cannot release another operation's admission.
+  The `semantic.query_artifact_status` receipt distinguishes publication,
+  reuse, incompatibility and bypass. An `auto` scoped scan may consume positive
+  constant input mappings from a matching query artifact without constructing
+  a frontend; it always reports partial coverage and
+  `query_artifact_port_bindings_only`, rather than claiming the other semantic
+  checks ran. Its current primary-log manifest must also match, so a hierarchy
+  enriched by supplemental compile logs cannot silently change scan context.
+  `TRACEWEAVE_STRUCTURAL_ARTIFACT_SHARING=0` disables this optimization. No
+  incomplete-key handoff is promoted to a reusable entry; new scopes can still
+  require construction. NPI retains priority and uses its own KDB. Scan facts
+  may guide NPI queries, but are never labeled as NPI facts or converted to KDB.
+- `structural_propagation.py` adds explicitly requested `propagated_constant`
+  and `constant_control` categories. It inventories writers before solving a
+  finite work queue for input/output bindings, continuous assignments, integral
+  conversions, static selections/concatenations, basic arithmetic, Boolean and
+  bitwise operations, comparisons and conditional expressions. Actual X/Z,
+  insufficient evidence and conflicting writers are distinct states. Partial
+  vectors produce constant regions, never a whole-vector tie claim. Sequential
+  and initial values remain unknown boundaries. Unsupported global write
+  effects, force/release, interface/primitive/alias constructs and ambiguous
+  net-port reverse drive prevent propagation facts; ordinary unsupported
+  expressions remain unknown and mark partial coverage. Procedural assignment
+  targets are boundaries, including `always_comb` in this initial pass.
+  The writer inventory covers all elaborated tops even for a scoped output:
+  an unvisited sibling can write a hierarchical target. A budget interruption
+  during inventory or solving emits no propagation prefix. After convergence,
+  a fact/output limit can retain a positively proved prefix with partial or
+  display-truncated coverage respectively. The default additional limits are
+  100,000 bit-weighted work steps and 262,144 signal bits, with configurable hard
+  maxima of 1,000,000 and 1,048,576. Instance/AST/fact limits and isolated worker
+  time/RSS guards still apply. `semantic.propagation` reports inventory status,
+  work, bits, unknown/conflict counts, boundaries and gaps. A complete traversal
+  does not imply every signal is constant or every design behavior is covered.
+  Tests compare 768 four-state operator cases with Slang's independent
+  constant evaluator, plus multilevel, signed/ascending-bit, multiple-writer,
+  external hierarchical write, sequential, cancellation and budget controls.
+  `scripts/benchmark_structural_propagation.py` completed a generated 18,001
+  instance / five-wrapper-level case in 9.92 s with 39,000 facts and 248 MiB
+  worker peak RSS (one fresh process, 50,000 fact / 1,000,000 work-step limits).
+  This controlled combinational case is not the real SoC. On the 18,642
+  instance OpenTitan/PicoRV32 composition, `benchmark_semantic_scan.py
+  --propagation` took 10.20 s / 349 MiB and retained 14,475 basic facts, but
+  propagation explicitly stopped at unmodeled call write effects. It did not
+  prove full-SoC propagation coverage or publish a completed semantic cache hit.
 - `src/connectivity_backend.py` defines a `ConnectivityBackend` protocol with
   `find_driver`, `find_loads`, and `find_path` methods. `select_backend()`
   returns local `VerdiNpiBackend` when a Verdi KDB is available, or
@@ -1099,3 +1278,326 @@ call lazily creates `$TRACEWEAVE_CACHE_DIR/telemetry/` and appends to
 `usage.jsonl`. Existing records remain readable, including older records with
 no Source Graph diagnostics, which are excluded from Source Graph hit-rate
 denominators. Telemetry is local-only; nothing is sent anywhere.
+
+
+### Divergence evidence and backtrace
+
+`src/divergence_compare.py` owns cursor-free, coverage-aware event comparison;
+`src/divergence_clock.py` adds explicitly aligned clock sampling. The server
+registers the final cursor after wave work and context validation.
+`src/divergence_context.py` freezes each side's exact hierarchy, ordered logs,
+source snapshot and top. Ready driver relays carry those identities into the
+normal public route instead of changing the mutable current session.
+
+`src/dynamic_evidence.py` defines a bounded typed expression contract.
+`src/npi_dynamic.py` obtains cell/port, mux polarity and edge facts from NPI and
+expands generated nets to declared signals/constants. `src/slang_dynamic.py`
+projects typed AST guards, priority and timing into Connectivity IR 1.3;
+`src/source_graph_dynamic.py` binds statements and positive port paths to one
+prepared artifact. Old IR versions are cache misses, not implicit dynamic proof.
+The LSF `dynamic_step` request calls the same NPI core. NPI's active-design
+identity is process-wide; fixed elaboration maps distinguish KDB changes while
+transient native lock files do not invalidate an unchanged design.
+
+`src/dynamic_observe.py` separates output observation, triggering edge and strict
+predecessor samples; it does not infer simulation scheduling order from integer
+picoseconds. `src/divergence_trace.py` pairs active dependencies and stores each
+node/edge once. Keys include side design identity, selection, time and phase.
+`src/divergence_routing.py` reuses normal backend selection, isolated Source Graph
+preparation/single-flight/cache and the exact artifact scope guard. Changes of
+backend or artifact discard the graph and restart the original pair with the same
+`src/divergence_budget.py` time/work budget. Compile and wave identities are checked
+again before return. Wave access uses existing locks; backend work stays outside
+them. Metrics contain numeric aggregates only. Static/unsupported semantics and
+incomplete positive Source Graph coverage remain explicit frontiers.
+
+## Structural Scan Invocation
+
+`scan_structural_risks` selects its mode per invocation, not through an
+MCP client environment variable. Omitting `analysis_mode` is equivalent to:
+
+```json
+{"compile_log": "/path/to/build.log", "analysis_mode": "auto"}
+```
+
+To allow a semantic build when no compatible result is available:
+
+```json
+{
+  "compile_log": "/path/to/build.log",
+  "analysis_mode": "deep",
+  "semantic_scope": "tb.dut.u_block",
+  "semantic_timeout_sec": 15,
+  "semantic_max_rss_mib": 512
+}
+```
+
+`fast` runs or reuses lexical rules only. `auto` also reuses compatible semantic
+results; on a semantic miss it reports `semantic.status="not_run"` while the
+lexical scan still runs or reuses its cache. `deep` permits a cold semantic
+build but still reuses compatible completed results. Scope limits basic fact
+extraction, not necessarily frontend parsing or elaboration. Time, memory and
+coverage limits still apply; these modes do not require a full-design
+ConnectivityIR build.
+
+## Client Configuration Reference
+
+The [README](../README.md#client-setup) covers the quick setup. The following
+examples retain the detailed EDA environment and LSF configuration options.
+
+### Generic MCP Client
+
+Any MCP client that supports stdio transport can connect to this server. The minimum configuration is:
+
+- Portable PyPI installation: command `traceweave-mcp`, args `[]`
+- Repository-local full EDA installation: command `<TRACEWEAVE_HOME>/.venv/bin/python` after running `scripts/install.sh`, args `["<TRACEWEAVE_HOME>/server.py"]`
+- EDA env: keep the site-provided Verdi/NPI, VCS/Xcelium, license, and optional LSF variables available to the repository-local MCP process
+
+If the client supports server instructions, it can follow the built-in workflow directly. Otherwise, use the [debug workflow](workflow.md).
+
+### Claude Code
+
+Environment inheritance depends on how the MCP client itself is launched and on
+that client's environment policy. In one tested terminal-launched `tcsh`/LSF
+setup, Claude Code passed the shell-configured LSF, Verdi, and license variables
+to TraceWeave, and remote NPI driver/load/path queries worked without a separate
+MCP environment list. An IDE/GUI launch or another client setup may not inherit
+the same environment. For a deterministic Claude Code setup, list every variable
+the server needs — tool roots plus the `dlopen` chain (`LD_LIBRARY_PATH` is the
+one most often missed; missing runtime libraries can prevent NPI from loading,
+so inspect `backend_status` when a query falls back).
+
+Add this to `~/.claude.json`:
+
+```json
+{
+  "mcpServers": {
+    "TraceWeave": {
+      "command": "<TRACEWEAVE_HOME>/.venv/bin/python",
+      "args": ["<TRACEWEAVE_HOME>/server.py"],
+      "env": {
+        "VERDI_HOME": "<verdi-install>",
+        "NOVAS_HOME": "<verdi-install>",
+        "VCS_HOME": "<vcs-install>",
+        "XLM_ROOT": "<xcelium-install>",
+        "CDS_INST_DIR": "<xcelium-install>",
+        "SNPSLMD_LICENSE_FILE": "xxxx@s-license.example.com",
+        "LM_LICENSE_FILE": "xxxx@s-license-server.example.com",
+        "CDS_LICENSE_FILE": "xxxx@c-license.example.com",
+        "LD_LIBRARY_PATH": "<library-path>",
+        "PATH": "<path>"
+      }
+    }
+  }
+}
+```
+
+Verify the connection:
+
+```bash
+claude mcp list
+# Should show TraceWeave (connected)
+```
+
+### Codex
+
+Codex supports two ways to provide environment variables to the TraceWeave MCP
+server:
+
+- Put fixed values in `[mcp_servers.TraceWeave.env]`. This suits stable tool and
+  license locations, or a Codex process that is not launched from a configured
+  terminal.
+- Use `env_vars` to allow and forward variables already inherited by the Codex
+  process. This suits EDA environments managed by `.bashrc`, `.tcshrc`, or a
+  site setup script.
+
+Choose one source for each variable; do not configure the same name in both
+`env` and `env_vars`. This matches the official
+[Codex MCP configuration](https://developers.openai.com/codex/mcp/). The example
+below uses fixed values in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.TraceWeave]
+command = "<TRACEWEAVE_HOME>/.venv/bin/python"
+args = ["<TRACEWEAVE_HOME>/server.py"]
+cwd = "<TRACEWEAVE_HOME>"
+
+[mcp_servers.TraceWeave.env]
+VERDI_HOME = "<verdi-install>"
+NOVAS_HOME = "<verdi-install>"
+VCS_HOME = "<vcs-install>"
+XLM_ROOT = "<xcelium-install>"
+CDS_INST_DIR = "<xcelium-install>"
+SNPSLMD_LICENSE_FILE = "xxxx@s-license.example.com"
+LM_LICENSE_FILE = "xxxx@s-license-server.example.com"
+CDS_LICENSE_FILE = "xxxx@c-license.example.com"
+LD_LIBRARY_PATH = "<library-path>"
+PATH = "<path>"
+```
+
+If a site setup script manages these values, do not copy its expanded values
+into `env`. Launch Codex from the configured terminal and use the inherited
+environment pattern in the LSF-only section below instead.
+
+Verify the connection:
+
+```bash
+codex mcp list
+# Should show TraceWeave with Status: enabled
+```
+
+### LSF-only NPI licenses
+
+Some EDA sites grant Verdi/NPI licenses only to scheduled compute nodes. NPI
+execution remains local by default; opt in to LSF at the **TraceWeave MCP
+server process** with:
+
+```bash
+export TRACEWEAVE_NPI_EXECUTION=lsf
+export TRACEWEAVE_NPI_LSF_QUEUE="digital"
+```
+
+Here `digital` is only an example; replace it with the user's licensed team
+queue. TraceWeave reads only the namespaced `TRACEWEAVE_NPI_LSF_QUEUE`; it does
+not create, overwrite, or interpret a site's generic `LSF_QUEUE`. If the site
+already exports `LSF_QUEUE`, the user may map that existing value instead:
+
+```bash
+export TRACEWEAVE_NPI_LSF_QUEUE="$LSF_QUEUE"
+```
+
+For `tcsh`:
+
+```tcsh
+setenv TRACEWEAVE_NPI_EXECUTION lsf
+setenv TRACEWEAVE_NPI_LSF_QUEUE "digital"
+```
+
+Or, only when `LSF_QUEUE` already exists:
+
+```tcsh
+setenv TRACEWEAVE_NPI_LSF_QUEUE "$LSF_QUEUE"
+```
+
+Putting these values in `.bashrc` / `.tcshrc` works only when the MCP client
+passes that shell environment to the TraceWeave server. In the tested
+terminal-launched setup, Claude Code did so and completed LSF-hosted NPI
+driver/load/path queries. Codex required the needed site variables to be named
+in `env_vars`; without them, the NPI attempt failed.
+
+The following Codex configuration is for an EDA environment already established
+by the parent shell. It is an alternative to the fixed-value EDA block in the
+Codex section above. The list reflects one tested LSF/EGO site; add or remove
+names to match the site's setup, and do not repeat any name under `env`:
+
+```toml
+[mcp_servers.TraceWeave]
+command = "<TRACEWEAVE_HOME>/.venv/bin/python"
+args = ["<TRACEWEAVE_HOME>/server.py"]
+cwd = "<TRACEWEAVE_HOME>"
+env_vars = [
+  "TRACEWEAVE_NPI_LSF_QUEUE",
+
+  "LSF_ENVDIR",
+  "LSF_BINDIR",
+  "LSF_SERVERDIR",
+  "LSF_LIBDIR",
+  "PATH",
+
+  "EGO_TOP",
+  "EGO_BINDIR",
+  "EGO_CONFDIR",
+  "EGO_ESRVDIR",
+  "EGO_LIBDIR",
+  "EGO_LOCAL_CONFDIR",
+  "EGO_SERVERDIR",
+
+  "VERDI_HOME",
+  "LD_LIBRARY_PATH",
+
+  "LM_LICENSE_FILE",
+  "SNPSLMD_LICENSE_FILE",
+]
+
+[mcp_servers.TraceWeave.env]
+TRACEWEAVE_NPI_EXECUTION = "lsf"
+```
+
+Values under `[mcp_servers.TraceWeave.env]` are copied literally by Codex, so do not write
+`TRACEWEAVE_NPI_LSF_QUEUE = "$LSF_QUEUE"` there. `env_vars` is the supported
+way to forward the value that the user's shell already expanded. If the Codex
+parent does not inherit the shell environment, omit the queue from `env_vars`
+and put a fixed `TRACEWEAVE_NPI_LSF_QUEUE = "digital"` directly under
+`[mcp_servers.TraceWeave.env]` instead. If some EDA values are intentionally
+fixed under `env`, omit those same names from `env_vars`.
+
+In the tested terminal-launched Claude Code setup, no extra MCP environment map
+was needed when the shell already exported both namespaced values and the full
+site environment. For a deterministic setup, or when the client does not inherit
+that shell, merge the following fixed values into the existing TraceWeave
+server's `"env"` object (replace `digital` with the user's queue):
+
+```json
+{
+  "TRACEWEAVE_NPI_EXECUTION": "lsf",
+  "TRACEWEAVE_NPI_LSF_QUEUE": "digital"
+}
+```
+
+JSON values are literal too; do not put `"$LSF_QUEUE"` in this static map.
+
+With this mode enabled, explicit connectivity operations
+(`explain_signal_driver`, `find_signal_loads`, `trace_signal_path`,
+`trace_x_source`) and every `build_kdb` cache miss or forced rebuild submit a
+short `bsub -K` worker. Exact KDB cache hits, log parsing, waveform reads,
+structural scans, KDB detection, and Static analysis remain local because they
+do not invoke a licensed Verdi executable. Connectivity-worker failure or
+timeout falls through to the local Source Graph and then to Legacy Static if
+that bounded graph is unavailable or inconclusive. A KDB-build worker failure
+does **not** fall back to local `vericom`/`elabcom`; `build_kdb` returns a fixed
+failure receipt instead. Static still has no
+path API, so a final path fallback is explicitly unsupported. Routing is visible through fixed
+`backend_status.execution_mode` / `scheduler_status` / `worker_status` /
+`fallback_reason` labels; queue, host, command, and license details are not
+returned.
+
+After restarting or reconnecting the MCP server, ask the AI agent to run one
+explicit connectivity operation and report `backend_status`. A successful LSF
+NPI call has `execution_mode="lsf"`, `scheduler_status="completed"`,
+`worker_status="completed"`, and `actual_backend="verdi_npi"`. Otherwise inspect
+`fallback_reason`; a Static fallback is not an exact NPI result.
+
+For an Xcelium KDB cache miss, `build_kdb` exposes the same top-level
+`execution_mode` / `scheduler_status` / `worker_status` / `fallback_reason`
+labels. A successful remote build reports `execution_mode="lsf"` and both
+statuses as `"completed"`; a cache hit reports both statuses as
+`"not_started"` because no license-bearing process ran.
+
+An error-marked KDB may still complete the worker successfully. In that case
+`actual_backend="verdi_npi"` is paired with `kdb_degraded=true`; read the NPI
+attempt's `coverage_status="partial"` and the `kdb_error_count` /
+`kdb_error_log` diagnostics rather than treating scheduler completion alone as
+proof of complete elaboration.
+
+Optional settings:
+
+```bash
+export TRACEWEAVE_NPI_LSF_TIMEOUT=120
+export TRACEWEAVE_NPI_LSF_KDB_TIMEOUT=1260
+export TRACEWEAVE_NPI_LSF_BSUB=/path/to/bsub
+export TRACEWEAVE_NPI_LSF_BKILL=/path/to/bkill
+export TRACEWEAVE_NPI_LSF_PYTHON=/path/to/python3.11
+export TRACEWEAVE_NPI_LSF_STAGING_DIR=/shared/private/traceweave-npi
+export TRACEWEAVE_NPI_LSF_EXTRA_ARGS_JSON='["-R", "select[...]"]'
+```
+
+The compile log, every source/include input, TraceWeave checkout/installation,
+staging directory, and `TRACEWEAVE_CACHE_DIR` (including the generated KDB)
+must be visible at the same absolute paths on the submission and compute nodes.
+After a remote success the parent verifies that the returned KDB path is
+visible; otherwise it reports `npi_lsf_artifact_unavailable`. The staging
+directory defaults under TraceWeave's cache root; set it explicitly when that
+cache is not on a shared filesystem. `TRACEWEAVE_NPI_LSF_TIMEOUT` controls
+short connectivity jobs; `TRACEWEAVE_NPI_LSF_KDB_TIMEOUT` separately bounds
+queue wait plus both KDB phases (default 1260 seconds). Scheduler options are
+JSON argv, not shell text, and are limited to scheduler option/value pairs.

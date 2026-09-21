@@ -69,6 +69,7 @@ from config import (
 import src.cancellation as cancellation
 import src.operation_metrics as operation_metrics
 from src.cancellation import OperationCancelled
+from src.clock_edge_cache import discard_clock_edges
 from src.log_parser import SimLogParser, diff_failure_events, get_error_context
 from src.vcd_parser import VCDParser
 from src.fsdb_parser import FSDBParser
@@ -85,6 +86,7 @@ from src.compile_source_runtime import (
     compile_source_index_key,
 )
 from src.cursor_store import CursorStore
+from src.divergence_context import resolve_context as resolve_divergence_context, driver_action, log_identity
 import src.usage_telemetry as usage_telemetry
 from src.hierarchy_handles import (
     HandleStore,
@@ -107,7 +109,7 @@ from src.source_graph_contract import (
     compute_source_graph_build_key,
     compute_source_graph_query_key,
 )
-from src.source_graph_production import get_source_graph_runtime
+from src.source_graph_production import get_source_graph_runtime, source_graph_runtime_created
 from src.source_graph_runtime import PrepareStatus
 from src.source_graph_x_trace import (
     SourceGraphTraceConnectivityBackend,
@@ -139,6 +141,10 @@ from src.tb_hierarchy_builder import (
 )
 from src.verdi_backend import probe_verdi_backend
 from src.structural_scanner import ALL_CATEGORIES, scan_structural_risks
+from src.structural_scan_runtime import StructuralScanRuntime
+from src.design_identity import DesignIdentity, DesignIdentityReader
+from src.structural_semantic_runtime import SemanticScanRuntime, validate_semantic_options
+from src.structural_semantics import SEMANTIC_CATEGORIES
 from src.x_trace import inspect_upstream_values, trace_x_source
 from src.cycle_query import (
     _compute_clock_period_ps,
@@ -198,6 +204,9 @@ _handle_store = HandleStore()
 _COMPILE_CONTEXT_CACHE_MAX = 4
 _compile_context_cache: dict[str, dict] = {}
 _compile_source_index_runtime = CompileSourceIndexRuntime()
+_structural_scan_runtime = StructuralScanRuntime()
+_design_identity_reader = DesignIdentityReader()
+_semantic_scan_runtime = SemanticScanRuntime()
 
 # Named time anchors for the auto-debug v2 workflow (decision 5). Lifetime
 # is process-scoped — same semantics as _handle_store: no persistence,
@@ -789,6 +798,10 @@ async def _resolve_connectivity_hierarchy_context(
     simulator: str,
 ) -> tuple[dict | None, str, dict | None, str | None]:
     """Prefer a full hierarchy, then optionally prove a bounded one."""
+
+    bound = args.get("_bound_context")
+    if bound is not None:
+        return bound.hierarchy, bound.snapshot, None, None
 
     hierarchy_result, snapshot = _resolve_hierarchy_context(
         args["compile_log"], simulator
@@ -1397,15 +1410,15 @@ Simulation waveform debug workflow:
 app = Server("traceweave", version=__version__, instructions=SERVER_INSTRUCTIONS)
 
 # Global parser cache.
-_fsdb_index_cache: dict[str, tuple[tuple[int, int], FSDBSignalIndex]] = {}
+_fsdb_index_cache: dict[str, tuple[tuple[int, ...], FSDBSignalIndex]] = {}
 _parser_cache: dict[
-    str, tuple[tuple[int, int], object]
-] = {}  # wave_path → ((mtime_ns, size), parser)
+    str, tuple[tuple[int, ...], object]
+] = {}  # wave_path → (stat identity, parser)
 
 
-def _get_wave_signature(wave_path: str) -> tuple[int, int]:
+def _get_wave_signature(wave_path: str) -> tuple[int, ...]:
     stat = os.stat(wave_path)
-    return stat.st_mtime_ns, stat.st_size
+    return stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size
 
 
 def _dispose_cached_object(obj: object):
@@ -1683,6 +1696,38 @@ async def _call_connectivity_backend(backend, fn: Callable):
     if getattr(backend, "uses_external_worker", False):
         return await _run_in_cancellable_thread(fn)
     return fn()
+
+
+async def _structural_query_context(compile_log, simulator, scope, mode, config):
+    """Prepare only a bounded artifact identity against an existing hierarchy.
+
+    Parallel default scanning never waits for or builds a hierarchy. Sharing
+    cannot turn a lexical identity or an incomplete query key into semantic
+    scope proof. Only explicit scoped semantic work is eligible.
+    """
+    if (not scope or mode == "fast" or not config.valid or not config.enabled
+            or os.environ.get("TRACEWEAVE_STRUCTURAL_ARTIFACT_SHARING", "1") == "0"
+            or (mode == "auto" and not source_graph_runtime_created())):
+        return None, None
+    hierarchy, snapshot = _resolve_hierarchy_context(compile_log, simulator)
+    if hierarchy is None:
+        return None, None
+    try:
+        plan = await _run_in_cancellable_thread(lambda: build_source_graph_plan(
+            compile_log=compile_log, compile_result=hierarchy["compile_result"],
+            hierarchy_result=hierarchy, hierarchy_snapshot_sha256=snapshot,
+            operation=QueryOperation.DRIVER, signal_path=scope + ".__structural_scan_anchor__",
+            top_hint=None, max_hops=10, frontend_version=config.frontend_version,
+            runtime_plusarg_allowlist=config.runtime_plusarg_allowlist,
+            max_instances=64, allow_adjacent=False,
+        ))
+        request = plan.request
+        if (request is None or not compute_source_graph_build_key(request).cross_request_reusable
+                or len(request.artifact_identity.scope.projection_instance_paths) > 64):
+            return None, None
+        return request, get_source_graph_runtime(config)
+    except (OSError, ValueError, KeyError, RuntimeError):
+        return None, None
 
 
 _NPI_FALLBACK_REASONS = {
@@ -2722,8 +2767,10 @@ async def _route_public_connectivity(
         select_backend,
     )
 
+    bound = args.get("_bound_context")
     backend_status = await _run_in_cancellable_thread(
-        lambda: _safe_probe_backend(args["compile_log"], simulator)
+        lambda: (probe_verdi_backend(bound.compile_result, compile_log_path=args["compile_log"])
+                 if bound is not None else _safe_probe_backend(args["compile_log"], simulator))
     )
     deferred = DeferredConnectivityFallbackBackend()
     npi_selection_reason: str | None = None
@@ -2735,6 +2782,8 @@ async def _route_public_connectivity(
         npi_backend = deferred
         npi_selection_reason = "npi_backend_initialization_failed"
     npi_selected = getattr(npi_backend, "name", None) == "verdi_npi"
+    if bound is not None and hasattr(npi_backend, "bind_compile_context"):
+        npi_backend.bind_compile_context(bound.compile_result)
     selected_backend = "verdi_npi" if npi_selected else "source_graph"
     attempts: list[dict] = []
     npi_execution: dict | None = None
@@ -3399,6 +3448,8 @@ async def _route_public_connectivity(
     source_graph_receipt["fallback_used"] = True
     final_reason = source_graph_reason
     static_backend = StaticConnectivityBackend()
+    if bound is not None:
+        static_backend.bind_compile_context(bound.compile_result)
     static_result = await _call_public_connectivity_operation(
         static_backend,
         operation=operation,
@@ -4785,6 +4836,7 @@ def _get_parser(wave_path: str):
     if cached is not None and cached[0] == signature:
         return cached[1]
     if cached is not None:
+        discard_clock_edges(cached[1])
         _dispose_cached_object(cached[1])
     ext = wave_path.lower().rsplit(".", 1)[-1]
     if ext == "vcd":
@@ -5511,10 +5563,13 @@ async def list_tools():
         Tool(
             name="scan_structural_risks",
             description=(
-                "Run a Scope 1 regex-based structural risk scan on RTL/TB source files from the compile file list. "
+                "Scan compiled RTL/TB sources for structural risks. fast runs lexical rules; auto (default) "
+                "also reuses compatible semantic facts without a cold frontend build; deep explicitly requests "
+                "a bounded, license-free semantic pass for ties, open inputs and constant comparisons. "
                 "This is a heuristic detector: it reports suspicious patterns, not confirmed root causes. "
                 "Always read coverage_status: only complete with total_risks=0 supports a clean-scan observation; "
-                "zero_coverage scanned no supported sources, and degraded covers only part of the source set."
+                "zero_coverage scanned no supported sources, and degraded covers only part of the source set. "
+                "Read lexical_coverage_status and semantic.status separately; not_run is not a semantic pass."
             ),
             inputSchema={
                 "type": "object",
@@ -5538,6 +5593,16 @@ async def list_tools():
                         "items": {"type": "string", "enum": ALL_CATEGORIES},
                         "description": "Optional list of risk categories to scan. If omitted, all categories are scanned.",
                     },
+                    "analysis_mode": {"type": "string", "enum": ["fast", "auto", "deep"], "default": "auto"},
+                    "semantic_categories": {"type": "array", "minItems": 1, "items": {"type": "string", "enum": list(SEMANTIC_CATEGORIES)}, "description": "Defaults to constant_connection, open_input, constant_comparison. Request propagated_constant and/or constant_control explicitly for bounded cross-hierarchy analysis."},
+                    "semantic_scope": {"type": "string", "description": "Exact elaborated instance path and its descendants; omitted scans all elaborated tops."},
+                    "semantic_timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 120, "default": 15},
+                    "semantic_max_rss_mib": {"type": "integer", "minimum": 64, "maximum": 4096, "default": 512},
+                    "semantic_max_instances": {"type": "integer", "minimum": 1, "maximum": 100000, "default": 25000},
+                    "semantic_max_facts": {"type": "integer", "minimum": 1, "maximum": 50000, "default": 20000},
+                    "semantic_max_ast_nodes": {"type": "integer", "minimum": 1, "maximum": 5000000, "default": 1000000},
+                    "semantic_max_propagation_steps": {"type": "integer", "minimum": 1, "maximum": 1000000, "default": 100000},
+                    "semantic_max_propagation_bits": {"type": "integer", "minimum": 1, "maximum": 1048576, "default": 262144},
                 },
                 "required": ["compile_log"],
             },
@@ -5717,6 +5782,7 @@ async def list_tools():
                     "signal_path": {"type": "string"},
                     "wave_path": {"type": "string"},
                     "compile_log": {"type": "string"},
+                    "compile_context": schemas.DivergenceContext.model_json_schema(),
                     **_bounded_bootstrap_input_properties(),
                     "simulator": {
                         "type": "string",
@@ -6113,7 +6179,9 @@ async def list_tools():
         Tool(
             name="diff_first_divergence",
             description=(
-                "Find the first time two signals hold unequal values. Works across "
+                "Find the first observed known-value difference, with explicit coverage "
+                "and earliest_difference_proven. X/Z, missing values, truncation and time "
+                "precision gaps never prove equality. Works across "
                 "two waveforms (passing run vs failing run) or within one waveform "
                 "between two signals (expected vs actual). Auto-registers a cursor at "
                 "the divergence time so downstream calls can reference it by name. "
@@ -6138,6 +6206,8 @@ async def list_tools():
                         "type": "string",
                         "description": "Full hierarchical signal path in wave_path_b.",
                     },
+                    "context_a": schemas.DivergenceContext.model_json_schema(),
+                    "context_b": schemas.DivergenceContext.model_json_schema(),
                     "start_time_ps": {
                         **_integer_or_string_schema(),
                         "description": "Start of comparison window. Default 0."
@@ -6161,6 +6231,19 @@ async def list_tools():
                 },
                 "required": ["wave_path_a", "signal_a", "wave_path_b", "signal_b"],
             },
+        ),
+        Tool(
+            name="trace_divergence",
+            description=(
+                "Verify a waveform difference and backtrace its active data/control dependencies "
+                "on both sides within explicit time/work limits. Uses the normal trusted NPI, "
+                "Source Graph, Static route. Each side requires its exact compile context and "
+                "a current build_tb_hierarchy result. Explicit signal/scope mappings are required "
+                "across different designs. Reports evidence, candidates and honest frontiers; "
+                "does not claim a unique root cause or rerun simulation. Clock mode requires "
+                "aligned clock_a/clock_b edges. History never extends before start_time_ps."
+            ),
+            inputSchema=schemas.TraceDivergenceInput.model_json_schema(),
         ),
         Tool(
             name="period",
@@ -6885,7 +6968,27 @@ async def call_tool(name: str, arguments: dict):
 
 
 async def _dispatch(name: str, args: dict):
-    block = _check_prerequisites(name, args)
+    # An exact action is independent of the mutable most-recent session gate.
+    bound = None
+    if name == "explain_signal_driver" and args.get("compile_context") is not None:
+        bound, reason = await _run_in_cancellable_thread(
+            lambda: resolve_divergence_context(args["compile_context"], _handle_store)
+        )
+        if bound is None:
+            return schemas.PrerequisiteBlockResult.model_validate({
+                "ok": False, "error_code": reason, "missing_step": "build_tb_hierarchy",
+                "required_before": name, "reason": reason,
+                "suggested_call": {"tool": "build_tb_hierarchy", "arguments": {
+                    k: v for k, v in args["compile_context"].items()
+                    if k in {"compile_log", "simulator", "supplementary_compile_logs"}}},
+            })
+        if not _same_realpath(args["compile_log"], bound.context["compile_log"]):
+            raise ValueError("compile_context does not match compile_log")
+        if args.get("top_hint") not in (None, bound.context.get("top_hint")):
+            raise ValueError("compile_context does not match top_hint")
+        args = {**args, "_bound_context": bound, "simulator": bound.context["simulator"],
+                "top_hint": bound.context.get("top_hint")}
+    block = None if bound is not None else _check_prerequisites(name, args)
     if block is not None:
         return schemas.PrerequisiteBlockResult.model_validate(block)
 
@@ -7166,6 +7269,8 @@ async def _dispatch(name: str, args: dict):
         simulator = _resolve_session_simulator(args)
         compile_log = args["compile_log"]
         supplementary_compile_logs = _validated_supplementary_compile_logs(args)
+        compile_logs_identity = log_identity({"compile_log":compile_log,
+                                              "supplementary_compile_logs":supplementary_compile_logs})
         hierarchy_config = get_hierarchy_execution_config()
         if not hierarchy_config.valid:
             return _blocked_hierarchy_result(
@@ -7402,6 +7507,10 @@ async def _dispatch(name: str, args: dict):
             ),
         }
         full_result["_hierarchy_snapshot_sha256"] = hierarchy_snapshot_sha256
+        if compile_logs_identity != log_identity({"compile_log":compile_log,
+                                                  "supplementary_compile_logs":supplementary_compile_logs}):
+            return _blocked_hierarchy_result(code="compile_context_changed", stage="compile_log_parse")
+        full_result["_compile_log_identity_sha256"] = compile_logs_identity
         _update_session_state(name, resolved_args, full_result)
         scan_call = None
         if _get_compatible_scan_cache(compile_log, context_simulator) is None:
@@ -7448,6 +7557,7 @@ async def _dispatch(name: str, args: dict):
         return validated
 
     elif name == "scan_structural_risks":
+        analysis_mode, semantic_options = validate_semantic_options(args)
         simulator = _resolve_session_simulator(args)
         resolved_args = {**args, "simulator": simulator}
         compile_result, context_simulator = await _run_in_cancellable_thread(
@@ -7473,45 +7583,115 @@ async def _dispatch(name: str, args: dict):
             compile_snapshot_sha256=compile_snapshot_sha256,
             compile_result=compile_result,
         )
-        lease = None
-        source_index_disposition = (
-            source_index_config.error_code
-            or ("disabled" if not source_index_config.enabled else None)
-        )
+        identity_lease = None
         if source_index_config.valid and source_index_config.enabled:
-            lease = await _compile_source_index_runtime.acquire(
-                key=source_index_key,
-                paths=source_index_paths,
+            identity_lease = await _compile_source_index_runtime.acquire(
+                key=source_index_key, paths=source_index_paths,
                 max_bytes=source_index_config.max_bytes,
-                max_files=source_index_config.max_files,
+                max_files=source_index_config.max_files, create_if_missing=False,
             )
-            assert lease is not None
         try:
-            result = await _run_in_cancellable_thread(
-                lambda: scan_structural_risks(
-                    compile_log=args["compile_log"],
-                    simulator=simulator,
-                    scan_scope=args.get("scan_scope", "scope1"),
-                    categories=args.get("categories"),
-                    compile_result=compile_result,
-                    source_loader=(
-                        lease.index.read_text if lease is not None else None
-                    ),
+            if os.environ.get("TRACEWEAVE_STRUCTURAL_SCAN_CACHE", "1") != "0" or analysis_mode == "deep":
+                identity = await _run_in_cancellable_thread(
+                    lambda: _design_identity_reader.capture(
+                        args["compile_log"], compile_result,
+                        **({"reader": identity_lease.index.read} if identity_lease else {}),
+                    )
                 )
+            else:
+                identity = DesignIdentity("disabled", (), (), ("cache_disabled",))
+        except BaseException:
+            if identity_lease is not None:
+                await identity_lease.release()
+            raise
+
+        async def build_scan():
+            nonlocal identity_lease
+            # Transfer the active preload lease into the shared rule build.
+            # Releasing after identity capture would clear its source bodies
+            # when hierarchy has finished, forcing a second preload on a miss.
+            lease, identity_lease = identity_lease, None
+            source_index_disposition = (
+                source_index_config.error_code
+                or ("disabled" if not source_index_config.enabled else None)
             )
-            result["scan_metrics"] = {
-                **(
-                    lease.index.metrics_snapshot() if lease is not None else {}
-                ),
-                "compile_source_index_disposition": (
-                    lease.disposition
-                    if lease is not None
-                    else source_index_disposition
-                ),
-            }
+            if lease is None and source_index_config.valid and source_index_config.enabled:
+                lease = await _compile_source_index_runtime.acquire(
+                    key=source_index_key,
+                    paths=source_index_paths,
+                    max_bytes=source_index_config.max_bytes,
+                    max_files=source_index_config.max_files,
+                )
+                assert lease is not None
+            try:
+                result = await _run_in_cancellable_thread(
+                    lambda: scan_structural_risks(
+                        compile_log=args["compile_log"],
+                        simulator=simulator,
+                        scan_scope=args.get("scan_scope", "scope1"),
+                        categories=args.get("categories"),
+                        compile_result=compile_result,
+                        source_loader=(
+                            lease.index.read_text if lease is not None else None
+                        ),
+                    )
+                )
+                result["scan_metrics"] = {
+                    **(
+                        lease.index.metrics_snapshot() if lease is not None else {}
+                    ),
+                    "compile_source_index_disposition": (
+                        lease.disposition
+                        if lease is not None
+                        else source_index_disposition
+                    ),
+                }
+            finally:
+                if lease is not None:
+                    await lease.release()
+            return result
+
+        try:
+            result, cache_disposition = await _structural_scan_runtime.run(
+                identity,
+                {"scan_scope": args.get("scan_scope", "scope1"),
+                 "categories": args.get("categories"), "simulator": simulator},
+                build_scan,
+            )
         finally:
-            if lease is not None:
-                await lease.release()
+            # Cache hits/coalesced callers never transfer their lease. Clear
+            # ownership before yielding so a late shared build cannot take an
+            # already released index after its original caller was cancelled.
+            unused_lease, identity_lease = identity_lease, None
+            if unused_lease is not None:
+                await unused_lease.release()
+        if cache_disposition == "hit_memory":
+            result["scan_metrics"] = {
+                "compile_source_index_disposition": "not_requested_result_cache_hit",
+            }
+        result.setdefault("scan_metrics", {}).update({
+            "result_cache_disposition": cache_disposition,
+            "rule_execution_count": int(cache_disposition not in {"hit_memory", "coalesced"}),
+            **_structural_scan_runtime.metrics(),
+        })
+        result["analysis_mode"] = analysis_mode
+        result["lexical_coverage_status"] = result.get("coverage_status", "complete")
+        semantic_config = get_source_graph_execution_config()
+        query_request, query_runtime = await _structural_query_context(
+            args["compile_log"], simulator, semantic_options["scope"], analysis_mode, semantic_config,
+        )
+        result["semantic"] = await _semantic_scan_runtime.scan(
+            identity=identity, mode=analysis_mode, options=semantic_options,
+            compile_log=args["compile_log"], compile_result=compile_result,
+            config=semantic_config, run_thread=_run_in_cancellable_thread,
+            query_request=query_request, query_runtime=query_runtime,
+        )
+        if analysis_mode == "deep" and result["semantic"]["status"] != "complete":
+            if result["coverage_status"] != "zero_coverage":
+                result["coverage_status"] = "degraded"
+            result.setdefault("coverage_warnings", []).append(
+                "Requested semantic checks are incomplete; inspect semantic.status and semantic.gaps."
+            )
         validated = _enforce_output_budget(
             schemas.ScanStructuralRisksResult.model_validate(result),
             [
@@ -7670,6 +7850,8 @@ async def _dispatch(name: str, args: dict):
             simulator=simulator,
         )
         result["backend_status"] = backend_status
+        if bound is not None and not await _run_in_cancellable_thread(bound.current):
+            raise ValueError("compile_context_changed")
         return schemas.ExplainDriverResult.model_validate(result)
 
     elif name == "find_signal_loads":
@@ -7756,7 +7938,15 @@ async def _dispatch(name: str, args: dict):
             }
         )
 
+    elif name == "trace_divergence":
+        from src.divergence_trace import trace_divergence
+        return await trace_divergence(sys.modules[__name__], args)
+
     elif name == "diff_first_divergence":
+
+        contexts = {side: (schemas.DivergenceContext.model_validate(args[f"context_{side}"]).model_dump(exclude_none=True)
+                           if args.get(f"context_{side}") is not None else None)
+                    for side in ("a", "b")}
 
         def _work():
             result = diff_first_divergence(
@@ -7767,15 +7957,29 @@ async def _dispatch(name: str, args: dict):
                 signal_b=args["signal_b"],
                 start_ps=_resolve_time(args.get("start_time_ps", 0)),
                 end_ps=_resolve_time(args.get("end_time_ps", -1), allow_sentinel=True),
-                cursor_store=_cursor_store,
+                cursor_store=None,
                 cursor_name=args.get("cursor_name"),
                 cursor_note=args.get("cursor_note"),
             )
-            return schemas.DiffFirstDivergenceResult.model_validate(result)
+            return result
 
-        return await _run_in_wave_thread(
+        result = await _run_in_wave_thread(
             [args["wave_path_a"], args["wave_path_b"]], _work
         )
+        if result["diverged"]:
+            for side, ctx in contexts.items():
+                resolved, reason = (await _run_in_cancellable_thread(
+                    lambda ctx=ctx: resolve_divergence_context(ctx, _handle_store)
+                )) if ctx is not None else (None, "context_missing")
+                result["next_actions"].append(driver_action(result=result, side=side, context=ctx,
+                                                            bound=resolved, reason=reason))
+            from src.verify_condition import _attach_cursor
+            _attach_cursor(result, _cursor_store, result["first_divergence_time_ps"],
+                           result["value_a"], result["value_b"], args["wave_path_a"], args["signal_a"],
+                           args["wave_path_b"], args["signal_b"], args.get("cursor_name"), args.get("cursor_note"))
+            for action in result["next_actions"]:
+                action["evidence"]["cursor_name"] = result["cursor"]["name"]
+        return schemas.DiffFirstDivergenceResult.model_validate(result)
 
     elif name == "period":
 
@@ -8149,6 +8353,8 @@ def _extract_structural_scan_summary(result: schemas.ScanStructuralRisksResult) 
         "files_scanned": result.files_scanned,
         "coverage_status": result.coverage_status,
         "coverage_warnings": result.coverage_warnings,
+        "semantic_status": result.semantic.status,
+        "semantic_fact_count": result.semantic.total_facts,
         "total_risks": result.total_risks,
         "high_risk_count": sum(1 for risk in result.risks if risk.risk_level == "high"),
     }
@@ -9274,6 +9480,20 @@ def _truncate_risk_payload(
     return payload
 
 
+def _trim_semantic_scan(model: schemas.SemanticScanResult, limit: int) -> dict:
+    payload = model.model_dump(exclude_none=True)
+    facts = payload["facts"][:limit]
+    template_ids = {f.get("template") for f in facts if f.get("template")}
+    bindings = [b for b in payload["instance_bindings"] if b["template"] in template_ids][:limit]
+    payload["output_truncated"] = (
+        payload["output_truncated"] or len(facts) < len(payload["facts"])
+        or len(bindings) < len(payload["instance_bindings"])
+    )
+    payload["facts"] = facts
+    payload["instance_bindings"] = bindings
+    return payload
+
+
 def _shrink_scan_structural_risks_stage1(
     model: schemas.TruncatableResult,
 ) -> schemas.TruncatableResult:
@@ -9285,7 +9505,8 @@ def _shrink_scan_structural_risks_stage1(
     return schemas.ScanStructuralRisksResult.model_validate(
         {
             **model.model_dump(exclude_none=True),
-            "detail_hint": "Re-run scan_structural_risks with narrower categories if you need the full risk list.",
+            "detail_hint": "Re-run with narrower categories or semantic_scope for complete displayed facts.",
+            "semantic": _trim_semantic_scan(model.semantic, 10),
             "risks": risks,
             "total_risks": model.total_risks,
             "skipped_files": [],
@@ -9305,6 +9526,7 @@ def _shrink_scan_structural_risks_stage2(
         {
             **model.model_dump(exclude_none=True),
             "detail_hint": "Response truncated. Re-run scan_structural_risks with narrower categories.",
+            "semantic": _trim_semantic_scan(model.semantic, 3),
             "risks": risks,
             "categories_scanned": model.categories_scanned[:3],
             "skipped_files": [],
@@ -9321,6 +9543,7 @@ def _shrink_scan_structural_risks_terminal(
             **model.model_dump(exclude_none=True),
             "detail_level": "summary",
             "detail_hint": "Response truncated to fit budget. Re-run scan_structural_risks with one category.",
+            "semantic": _trim_semantic_scan(model.semantic, 0),
             "risks": [],
             "categories_scanned": model.categories_scanned[:3],
             "skipped_files": [],

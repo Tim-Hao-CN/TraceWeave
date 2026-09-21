@@ -33,6 +33,7 @@ from config import NPI_ALLOW_DEGRADED_KDB
 from .cancellation import OperationCancelled, check_cancelled
 from .compile_log_parser import parse_compile_log
 from .connectivity_backend import StaticConnectivityBackend
+from .kdb_identity import kdb_identity
 from .connectivity_limits import (
     DEFAULT_DRIVER_OUTPUT_LIMIT,
     DEFAULT_LOAD_OUTPUT_LIMIT,
@@ -63,6 +64,7 @@ _LOG = logging.getLogger(__name__)
 # unit tests that swap in a mock npisys do not leak init-state into
 # subsequent integration tests with the real native module.
 _NPI_INITIALIZED_IDS: set[int] = set()
+_NPI_ACTIVE_DESIGNS: dict[int, tuple] = {}
 _BANNER_SILENCER_INSTALLED = False
 _NPI_FAN_IN_CALLBACK_LOCK = threading.Lock()
 
@@ -335,6 +337,29 @@ class VerdiNpiBackend:
 
     # ── public API matching ConnectivityBackend ────────────────────────
 
+    def bind_compile_context(self, compile_result: dict) -> None:
+        """Bind one immutable caller-validated compile context to this instance."""
+        self._bound_compile_result = compile_result
+
+    def get_dynamic_step(self, signal_path: str, compile_log: str, *,
+                         top_hint: str | None = None, simulator: str = "auto", **_kwargs) -> dict:
+        from .dynamic_evidence import unsupported_step
+        from .npi_dynamic import query_step
+        try:
+            compile_result = getattr(self, "_bound_compile_result", None)
+            if compile_result is None:
+                compile_result = parse_compile_log(compile_log, simulator)
+            kdb = self._kdb_path_from(compile_result, compile_log)
+            top = top_hint or self._top_from(compile_result)
+            if not kdb or not top or not self._ensure_loaded(kdb, top):
+                return unsupported_step(signal_path, self.name, "npi_load_failed")
+            with _silence_native_stdio():
+                return query_step(self, signal_path)
+        except OperationCancelled:
+            raise
+        except Exception:
+            return unsupported_step(signal_path, self.name, "npi_dynamic_query_failed")
+
     def find_driver(
         self,
         signal_path: str,
@@ -348,7 +373,9 @@ class VerdiNpiBackend:
     ) -> dict[str, Any]:
         self._last_query_kdb_status = None
         try:
-            compile_result = parse_compile_log(compile_log, simulator)
+            compile_result = getattr(self, "_bound_compile_result", None)
+            if compile_result is None:
+                compile_result = parse_compile_log(compile_log, simulator)
             kdb_path = self._kdb_path_from(compile_result, compile_log)
             top = top_hint or self._top_from(compile_result)
             if not kdb_path or not top:
@@ -965,7 +992,10 @@ class VerdiNpiBackend:
     # ── lifecycle ─────────────────────────────────────────────────────
 
     def _ensure_loaded(self, kdb_path: str, top: str) -> bool:
-        if self._state == "ready" and self._loaded_kdb == kdb_path and self._loaded_top == top:
+        identity = kdb_identity(kdb_path)
+        if (self._state == "ready" and self._loaded_kdb == kdb_path and self._loaded_top == top
+                and self._npi_modules is not None
+                and _NPI_ACTIVE_DESIGNS.get(id(self._npi_modules[0])) == (kdb_path, top, identity)):
             return True
         if self._state == "failed":
             return False
@@ -998,6 +1028,7 @@ class VerdiNpiBackend:
                 old_degraded = self._loaded_degraded
                 old_error_count = self._degraded_error_count
                 old_error_log = self._degraded_error_log
+                _NPI_ACTIVE_DESIGNS.pop(npisys_id, None)
                 rc = npisys.load_design([
                     "traceweave_npi",
                     "-simflow", "-dbdir", dbdir,
@@ -1024,6 +1055,7 @@ class VerdiNpiBackend:
                             and self._netlist_usable(netlist, old_top)
                         )
                         if restored:
+                            _NPI_ACTIVE_DESIGNS[npisys_id] = (old_kdb, old_top, kdb_identity(old_kdb))
                             self._state = old_state
                             self._loaded_kdb = old_kdb
                             self._loaded_top = old_top
@@ -1031,9 +1063,11 @@ class VerdiNpiBackend:
                             self._degraded_error_count = old_error_count
                             self._degraded_error_log = old_error_log
                         else:
+                            _NPI_ACTIVE_DESIGNS.pop(npisys_id, None)
                             self._clear_loaded_state(failed=True)
                     return False
             self._state = "ready"
+            _NPI_ACTIVE_DESIGNS[npisys_id] = (kdb_path, top, identity)
             self._loaded_kdb = kdb_path
             self._loaded_top = top
             self._loaded_degraded = degraded

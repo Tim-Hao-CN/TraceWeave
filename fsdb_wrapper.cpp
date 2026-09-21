@@ -3,11 +3,7 @@
  * C++ wrapper for Verdi ffrAPI → exposes C interface for Python ctypes
  *
  * Build:
- *   g++ -shared -fPIC -o libfsdb_wrapper.so fsdb_wrapper.cpp \
- *       -I$VERDI_HOME/share/FsdbReader \
- *       -L$VERDI_HOME/share/FsdbReader/linux64 \
- *       -lnffr -lnsys -lz \
- *       -Wl,-rpath,$VERDI_HOME/share/FsdbReader/linux64
+ *   bash scripts/build_wrapper.sh
  */
 
 #ifdef NOVAS_FSDB
@@ -15,6 +11,7 @@
 #endif
 
 #include "ffrAPI.h"
+#include "fsdb_point_read.h"
 #include <chrono>
 #include <ctype.h>
 #include <stdio.h>
@@ -416,7 +413,8 @@ fsdb_search_signals(void *handle, const char *keyword,
 }
 
 /* ── 获取信号在指定时刻的值（time_ps = ps 精度）─────────────────────
- * 返回 0 成功，-1 失败
+ * 返回 0 成功，-1 参数错误，-2 信号不存在，-3 读取失败，-4 刻度未知，
+ * -5 信号不在当前 group，-6 清理失败（调用方必须关闭该 handle 后再查询）
  * out_val 写入字符串如 "01xz" 或 "1" 等
  * ---------------------------------------------------------------- */
 int
@@ -424,7 +422,7 @@ fsdb_get_value_at_time(void *handle, const char *signal_path,
                        unsigned long long time_ps,
                        char *out_val, int val_buf_size)
 {
-    if (!handle || !signal_path || !out_val) return -1;
+    if (!handle || !signal_path || !out_val || val_buf_size <= 0) return -1;
     FsdbCtx *ctx = (FsdbCtx*)handle;
     if (ctx->scale_fs == 0) return FSDB_ERR_SCALE_UNKNOWN;
 
@@ -435,34 +433,46 @@ fsdb_get_value_at_time(void *handle, const char *signal_path,
     uint_T        bpb    = it->second.bytes_per_bit;
     uint_T        bsize  = it->second.bit_size;
 
-    /* 加载该信号的 VC */
-    ctx->obj->ffrAddToSignalList(idcode);
-    ctx->obj->ffrLoadSignals();
-
-    ffrVCTrvsHdl hdl = ctx->obj->ffrCreateVCTraverseHandle(idcode);
-    if (!hdl) {
-        ctx->obj->ffrUnloadSignals();
-        return -3;
-    }
-
+    const bool resident = ctx->transition_group_active;
+    if (resident && ctx->transition_group_ids.count(idcode) == 0) return -5;
     fsdbTag64 tag = _ToTag(ctx, time_ps);
-
     std::string result = "x";
-
-    if (hdl->ffrHasIncoreVC()) {
-        /* 跳到最近的时间点（向前对齐） */
-        if (FSDB_RC_SUCCESS == hdl->ffrGotoXTag((void*)&tag)) {
-            byte_T *vc_ptr = NULL;
-            if (FSDB_RC_SUCCESS == hdl->ffrGetVC(&vc_ptr) && vc_ptr)
-                result = _VCToStr(vc_ptr, bsize, bpb);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        FsdbPointRead<ffrObject, ffrVCTrvsHdl> read(ctx->obj);
+        bool found = false;
+        int rc = 0;
+        try {
+            rc = read.Open(idcode, tag, resident, attempt == 0);
+            if (rc == 0) {
+                ffrVCTrvsHdl hdl = read.Handle();
+                if (hdl->ffrHasIncoreVC() &&
+                    FSDB_RC_SUCCESS == hdl->ffrGotoXTag((void*)&tag)) {
+                    byte_T *vc_ptr = NULL;
+                    if (FSDB_RC_SUCCESS == hdl->ffrGetVC(&vc_ptr) && vc_ptr) {
+                        result = _VCToStr(vc_ptr, bsize, bpb);
+                        found = true;
+                    }
+                }
+            }
+        } catch (...) {
+            // No C++ exception may cross the ctypes boundary. The guard still
+            // releases the traversal/load and restores the previous view.
+            rc = -3;
         }
+        if (!read.Finish()) return -6;
+        if (rc != 0) return rc;
+        if (found || !read.Narrowed()) break;
+        // An empty/unsupported partial read cannot prove there is no prior
+        // value. Retry once with the original view before returning legacy x.
     }
 
-    hdl->ffrFree();
-    ctx->obj->ffrUnloadSignals();
-
-    strncpy(out_val, result.c_str(), val_buf_size - 1);
-    out_val[val_buf_size - 1] = '\0';
+    /* ctypes consumes a NUL-terminated string. strncpy would pad the entire
+     * remaining capacity (normally 64 MiB) even for a one-bit value. Keep the
+     * capacity for wide values, but touch only the result and its terminator. */
+    size_t bytes = result.size();
+    if (bytes >= (size_t)val_buf_size) bytes = (size_t)val_buf_size - 1;
+    memcpy(out_val, result.data(), bytes);
+    out_val[bytes] = '\0';
     return 0;
 }
 
