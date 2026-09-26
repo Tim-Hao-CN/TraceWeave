@@ -130,6 +130,9 @@ from src.handshake_suggest import suggest_handshakes, suggest_protocol_bundles
 from src.handshake_sweep import sweep_handshake_anomalies
 from src.window_verify import verify_window
 from src.txn_reconstruct import reconstruct_transactions
+from src.tlul import inspect_tlul
+from src.waveform_selection import prepare_selections, attach_selections
+from src.packed_layout import packed_field_selections
 from src.formal_path_discovery import discover_formal_paths
 from src.path_discovery import discover_sim_paths
 from src.problem_hints import compute_problem_hints, compute_xprop_priority_for_group
@@ -154,6 +157,8 @@ from src.cycle_query import (
 )
 from pydantic import BaseModel
 import src.schemas as schemas
+from src.evidence_output import serialize_compact_result
+from src.mcp_validation import recover_tool_input_errors
 
 
 # Session state and workflow prerequisite gating.
@@ -1256,9 +1261,6 @@ def _update_session_state(tool_name: str, args: dict, result: dict):
             "simulator": result.get("simulator"),
             "compile_log": compile_log,
         }
-        # Anchor a telemetry session to the discovered case identity: a new case
-        # opens a new logical session; re-discovering the same case keeps it.
-        usage_telemetry.note_session(new_identity)
     elif tool_name == "build_tb_hierarchy":
         _invalidate_downstream(tool_name)
         _session_state["build_tb_hierarchy"] = {
@@ -4177,6 +4179,15 @@ async def _run_trace_x_attempt(
 async def _handle_trace_x_source(args: dict, simulator: str):
     """Route X-trace through NPI -> one Source Graph artifact -> Static."""
 
+    mode = args.get("mode", "snapshot")
+    if mode == "history":
+        from src.x_history import trace_x_history
+        return await trace_x_history(sys.modules[__name__], {**args, "simulator": simulator})
+    if mode != "snapshot":
+        raise ValueError("trace_x_source mode must be snapshot or history")
+    if any(k in args for k in ("history_start_ps", "signal_bits", "phase", "max_nodes", "max_events", "max_read_bytes", "timeout_sec", "compile_context")):
+        raise ValueError("history parameters require mode=history")
+
     from src.connectivity_backend import (  # noqa: PLC0415
         DeferredConnectivityFallbackBackend,
         StaticConnectivityBackend,
@@ -4896,6 +4907,8 @@ def _detect_wave_clock(parser) -> tuple[str | None, int | None]:
         for keyword in ("clk", "clock"):
             try:
                 search = parser.search_signals(keyword, max_results=20)
+            except OperationCancelled:
+                raise
             except Exception as exc:
                 if detect_reason is None:
                     detect_reason = (
@@ -4926,6 +4939,8 @@ def _detect_wave_clock(parser) -> tuple[str | None, int | None]:
                             is_tool_pseudo_signal(candidate),
                         )
                     )
+            except OperationCancelled:
+                raise
             except Exception as exc:
                 if detect_reason is None:
                     detect_reason = (
@@ -4946,6 +4961,8 @@ def _detect_wave_clock(parser) -> tuple[str | None, int | None]:
             )
             clock_path, period_ps, _, _ = scored[0]
             detect_reason = None
+    except OperationCancelled:
+        raise
     except Exception as exc:
         detect_reason = f"{type(exc).__name__}: {exc}"
 
@@ -4999,7 +5016,10 @@ def _validate_signals_around_time_args(
 
     sim_end_ps = 0
     try:
-        sim_end_ps = int(parser.get_summary().get("simulation_duration_ps") or 0)
+        header = getattr(parser, "get_header", None) or parser.get_summary
+        sim_end_ps = int(header().get("simulation_duration_ps") or 0)
+    except OperationCancelled:
+        raise
     except Exception:
         pass
 
@@ -5044,6 +5064,80 @@ def _integer_or_string_schema() -> dict:
     return {"anyOf": [{"type": "integer"}, {"type": "string"}]}
 
 
+def _signal_selection_schema() -> dict:
+    return {"$ref": "#/$defs/WaveformSignalInput"}
+
+
+def _signal_selection_definitions() -> dict:
+    """Keep reusable inputs once per tool, including nested recursive types."""
+    expression = schemas.WaveformExpression.model_json_schema()
+    definitions = expression.pop("$defs", {})
+    definitions["WaveformExpression"] = expression
+    definitions["WaveformSignalInput"] = {
+        "description": "A signal path string, a fixed bit selection, or an explicit {expr,...} object. "
+                       "Use bindings for exact dump paths and types for SV semantics; wave_bits explicitly opts into unsigned vectors.",
+        "anyOf": [{"type": "string"}, {"$ref": "#/$defs/WaveformSelection"},
+                  {"$ref": "#/$defs/WaveformExpression"}]
+    }
+    return definitions
+
+
+async def _resolve_packed_fields(args):
+    """Semantic work stays outside the wave lock; dump validation stays inside."""
+    def blocked(reason):
+        return schemas.PackedFieldsResult(status="mapping_required", reasons=[reason])
+    fields = args["fields"]
+    if not isinstance(fields, list) or not 1 <= len(fields) <= 128 or not all(isinstance(f, str) and f for f in fields):
+        raise ValueError("fields must contain 1..128 names")
+    simulator = _resolve_session_simulator(args)
+    hierarchy, snapshot = _resolve_hierarchy_context(args["compile_log"], simulator)
+    if hierarchy is None:
+        return blocked("current_hierarchy_required")
+    config = get_source_graph_execution_config()
+    if not config.enabled or not config.valid:
+        return blocked("semantic_runtime_unavailable")
+    # Use the established identity/scope adapter, without an NPI driver query
+    # or a guessed layout from names, widths, or port-binding-only artifacts.
+    from src.source_graph_adapter import build_source_graph_plan as exact_plan
+    def plan_now():
+        return exact_plan(compile_log=args["compile_log"], compile_result=hierarchy["compile_result"],
+                          hierarchy_result=hierarchy, hierarchy_snapshot_sha256=snapshot,
+                          operation=QueryOperation.DRIVER, signal_path=args["source_signal"],
+                          top_hint=args.get("top_hint"), max_hops=0,
+                          frontend_version=config.frontend_version,
+                          runtime_plusarg_allowlist=config.runtime_plusarg_allowlist)
+    plan = await _run_in_cancellable_thread(plan_now)
+    if plan.status is AdapterStatus.BLOCKED:
+        return blocked(plan.receipt.blocker.code)
+    if not compute_source_graph_build_key(plan.request).cross_request_reusable:
+        return blocked("compile_identity_incomplete")
+    outcome = await get_source_graph_runtime(config).prepare(plan.request, timeout_seconds=config.timeout_sec)
+    if outcome.status is PrepareStatus.CANCELLED:
+        raise asyncio.CancelledError
+    if outcome.status is not PrepareStatus.READY:
+        return blocked("semantic_" + outcome.status.value)
+    # Revalidate current compile bytes after the worker/cache lookup as well.
+    current = await _run_in_cancellable_thread(plan_now)
+    if current.request != plan.request:
+        return blocked("compile_identity_changed")
+    try:
+        result = await _run_in_cancellable_thread(lambda: packed_field_selections(
+            outcome.entry, args["source_signal"], args["signal_path"], fields))
+    except (ValueError, KeyError) as exc:
+        return blocked(str(exc))
+    def validate_dump():
+        parser = _get_parser(args["wave_path"])
+        declaration = parser.get_signal_declaration(args["signal_path"])
+        if declaration["declared_range"] != result["evidence"]["declared_range"]:
+            raise ValueError("dump_and_type_range_mismatch")
+        prepare_selections(parser, result["fields"])
+    try:
+        await _run_in_wave_thread(args["wave_path"], validate_dump)
+    except (KeyError, ValueError) as exc:
+        return blocked(str(exc))
+    return schemas.PackedFieldsResult.model_validate(result)
+
+
 def _bounded_bootstrap_input_properties() -> dict:
     return {
         "supplementary_compile_logs": {
@@ -5071,6 +5165,17 @@ def _bounded_bootstrap_input_properties() -> dict:
 # Time inputs accept a TimeSpec: an integer (ps), a cursor reference
 # "@<name>", or a unit literal like "12.34ns". See src/timespec.py.
 _TIMESPEC_HINT = " Accepts an integer (ps), a cursor reference like '@div_3a7c', or a unit literal like '12.34ns'."
+
+_SIGNAL_READBACK_HINT = (
+    "Select full paths from results; matches are candidates, not a read list. "
+    "At a known time, use get_signal_at_time for one selected signal, or "
+    'get_signals_around_time(return_mode="values_only", window_ps=0, '
+    "extra_transitions=0) for several. For clock-aligned sequences use "
+    "get_signals_by_cycle with an explicit clock and sampling offset; check "
+    "returned times/counts and read any missing initial state by timestamp. "
+    "For glitches or asynchronous changes use get_signal_transitions or a full "
+    "time window. Choose signals, times and clock from the task, not match counts."
+)
 
 
 @app.list_tools()
@@ -5307,7 +5412,7 @@ async def list_tools():
         ),
         Tool(
             name="get_signal_at_time",
-            description="Query a signal value in a waveform file at a specific time in ps. FSDB support depends on fsdb_runtime.enabled.",
+            description="Read a signal or evaluate an SV expression at one time. Pass formulas as {expr,bindings,types} or explicitly use typing=wave_bits. FSDB support depends on fsdb_runtime.enabled.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -5327,7 +5432,7 @@ async def list_tools():
         Tool(
             name="get_signal_transitions",
             description=(
-                "Return transitions for a signal over the strict closed time range "
+                "Return signal or SV expression transitions over the strict closed time range "
                 "[start_time_ps, end_time_ps] (capped at "
                 f"{TRANSITIONS_MAX_RETURNED} by default; truncated=true + hint mark a clipped "
                 "result, transition_count is always the total found). FSDB support depends "
@@ -5364,7 +5469,7 @@ async def list_tools():
         Tool(
             name="get_signals_around_time",
             description=(
-                "Return values and transitions for multiple signals in a NARROW window "
+                "Return values and transitions for signals or SV expressions in a NARROW window "
                 "around a target timestamp (typically the failure time). Designed for "
                 "local causal-chain inspection; NOT for bulk trace extraction. For "
                 "round-by-round or multi-cycle sampling use get_signals_by_cycle.\n"
@@ -5456,8 +5561,14 @@ async def list_tools():
         Tool(
             name="get_signals_by_cycle",
             description=(
-                "Return cycle-by-cycle sampled values for multiple signals aligned to a clock edge. "
-                "Useful for state machines, pipelines, and round-by-round algorithm checks."
+                "Sample signals or SV expressions each cycle; dynamic indices are re-evaluated at every sample. "
+                "Useful for state machines, pipelines, and round-by-round algorithm checks. "
+                "Choose start_cycle OR start_time_ps. With end_time_ps, num_cycles limits the window's returned cycles. "
+                f"At most {MAX_CYCLES_PER_QUERY} cycles; check capped and continue with the next start_cycle. "
+                "sample_phase=before reads strictly before each edge; omit sample_offset_ps or set 0. "
+                "Default after samples edge+1ps; sample_offset_ps must be >=0. "
+                "Check returned sample times and counts: an initially high clock is not a "
+                "rising edge, so read any required initial state separately by timestamp."
             ),
             inputSchema={
                 "type": "object",
@@ -5489,8 +5600,7 @@ async def list_tools():
                     },
                     "num_cycles": {
                         "type": "integer",
-                        "description": f"Number of cycles to sample. Default: 16. The server caps a single query at {MAX_CYCLES_PER_QUERY} cycles. Mutually exclusive with end_time_ps.",
-                        "default": 16,
+                        "description": f"Maximum cycles to return. Default: 16 without end_time_ps; otherwise all window edges, capped at {MAX_CYCLES_PER_QUERY}.",
                         "minimum": 0,
                     },
                     "start_time_ps": {
@@ -5500,13 +5610,17 @@ async def list_tools():
                     },
                     "end_time_ps": {
                         **_integer_or_string_schema(),
-                        "description": "Alternative count axis: window end; num_cycles is derived as the count of clock edges in [start, end_time_ps] (inclusive). Mutually exclusive with num_cycles."
+                        "description": "Inclusive window end. Optional num_cycles limits returned edges; capped=true means the whole window was not returned."
                         + _TIMESPEC_HINT,
+                    },
+                    "sample_phase": {
+                        "type": "string",
+                        "enum": ["after", "before"],
+                        "description": "after (default): edge plus offset. before: last value strictly before the physical edge, excluding all same-timestamp updates.",
                     },
                     "sample_offset_ps": {
                         "type": "integer",
-                        "description": "Sampling offset relative to the clock edge in ps. Default: 1, to capture post-delta register values.",
-                        "default": 1,
+                        "description": "Offset in ps: after defaults to 1; before requires 0 or omission. Negative offsets are unsupported; use sample_phase=before for accepted inputs.",
                         "minimum": 0,
                     },
                 },
@@ -5516,7 +5630,9 @@ async def list_tools():
         ),
         Tool(
             name="get_waveform_summary",
-            description="Return basic waveform metadata such as format, duration, and top modules. FSDB support depends on fsdb_runtime.enabled.",
+            description=("Return waveform format, duration, scale, top modules and a bounded signal sample. "
+                         "For FSDB, read metadata_query_mode, sample_signals_order and top_modules_complete; "
+                         "a sample never proves full-design coverage. FSDB support depends on fsdb_runtime.enabled."),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -5912,6 +6028,10 @@ async def list_tools():
             name="build_kdb",
             description=(
                 "Auto-build a Verdi KDB from a parsed compile log using vericom + elabcom. "
+                "Preserves recorded compilation-unit order and parent include context, with "
+                "bounded log-anchored path recovery for nested filelists when project variables "
+                "are absent or stale. Does not execute project setup scripts; incomplete replay "
+                "returns a precheck failure. "
                 "Use this when the simulator is Xcelium (xrun) and the NPI backend reports no KDB, "
                 "or to force-refresh a stale cached KDB. Output is cached under TRACEWEAVE_CACHE_DIR "
                 "(default ~/.cache/traceweave/kdb/<hash>/); cache hits reuse the previous KDB without "
@@ -5947,6 +6067,7 @@ async def list_tools():
         Tool(
             name="trace_x_source",
             description=(
+                "Start from a real signal path; supported RTL expressions are extracted internally. "
                 "When a signal shows X/Z at a target time, trace its propagation "
                 "chain through upstream driver logic. Uses the selected connectivity "
                 "route (trusted local/LSF NPI, bounded Source Graph, then Static). "
@@ -5959,7 +6080,15 @@ async def list_tools():
                 "trace_restarted reports a whole-trace retry. Source Graph chain nodes preserve "
                 "claim_semantics, so an exact positive edge can be used without implying global "
                 "coverage or exclusive drive. NPI testbench-driven/cross-check evidence is "
-                "preserved on the node."
+                "preserved on the node. Default mode=snapshot keeps the same-time chain. "
+                "mode=history requires history_start_ps and returns history.nodes/edges/frontier: "
+                "observed X/Z intervals, supported register sampling/hold and combinational evidence. "
+                "Same-edge data predecessors may extend a labelled candidate path while retaining "
+                "the scheduling gap; ambiguous controls or clocks still stop expansion. "
+                "Typed NPI async boundaries expose control assertions and clock observations "
+                "without inferring the reset/set assignment value or a causal relation. "
+                "Missing history, ambiguous scheduling, CDC or unsupported asynchronous controls "
+                "remain boundaries; observed dump onset is never asserted to be the true first origin."
             ),
             inputSchema={
                 "type": "object",
@@ -5981,8 +6110,19 @@ async def list_tools():
                         "description": f"Maximum trace depth. Default: {DEFAULT_X_TRACE_MAX_DEPTH}",
                         "default": DEFAULT_X_TRACE_MAX_DEPTH,
                     },
+                    "mode": {"type": "string", "enum": ["snapshot", "history"], "default": "snapshot"},
+                    "history_start_ps": {**_integer_or_string_schema(), "description": "Required explicit history window start in history mode." + _TIMESPEC_HINT},
+                    "signal_bits": {"type": "array", "items": {"type": "integer"}, "minItems": 1, "maxItems": 4096, "description": "History-only ordered selection in declared coordinates. signal_path remains the exact dump declaration."},
+                    "phase": {"type": "string", "enum": ["before", "after"], "default": "after", "description": "History observation phase; before excludes events exactly at time_ps."},
+                    "max_nodes": {"type": "integer", "minimum": 1, "maximum": 1024, "default": 128},
+                    "max_events": {"type": "integer", "minimum": 1, "maximum": 262144, "default": 65536},
+                    "max_read_bytes": {"type": "integer", "minimum": 1024, "maximum": 134217728, "default": 33554432, "description": "Cumulative estimated decoded event byte budget in history mode."},
+                    "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 120, "default": 30},
+                    "compile_context": schemas.DivergenceContext.model_json_schema(),
                 },
                 "required": ["wave_path", "signal_path", "time_ps", "compile_log"],
+                "allOf": [{"if": {"properties": {"mode": {"const": "history"}}, "required": ["mode"]},
+                           "then": {"required": ["history_start_ps"]}}],
             },
         ),
         # ── Hierarchy handle tools (phase 4) ────────────────────────────
@@ -6179,12 +6319,15 @@ async def list_tools():
         Tool(
             name="diff_first_divergence",
             description=(
-                "Find the first observed known-value difference, with explicit coverage "
+                "Compare signals or independently bound SV expressions for the first observed known-value difference, with explicit coverage "
                 "and earliest_difference_proven. X/Z, missing values, truncation and time "
                 "precision gaps never prove equality. Works across "
                 "two waveforms (passing run vs failing run) or within one waveform "
                 "between two signals (expected vs actual). Auto-registers a cursor at "
                 "the divergence time so downstream calls can reference it by name. "
+                "Reports actual event-page capability and read volume in reading. "
+                "When present, first_divergence_time_fs is exact; the integer-ps cursor "
+                "rounds up and may observe a later value. "
                 "Reads existing waveforms only — does NOT rerun simulation."
             ),
             inputSchema={
@@ -6235,6 +6378,7 @@ async def list_tools():
         Tool(
             name="trace_divergence",
             description=(
+                "Use real signal paths as roots; supported RTL expressions are extracted internally. "
                 "Verify a waveform difference and backtrace its active data/control dependencies "
                 "on both sides within explicit time/work limits. Uses the normal trusted NPI, "
                 "Source Graph, Static route. Each side requires its exact compile context and "
@@ -6242,13 +6386,15 @@ async def list_tools():
                 "across different designs. Reports evidence, candidates and honest frontiers; "
                 "does not claim a unique root cause or rerun simulation. Clock mode requires "
                 "aligned clock_a/clock_b edges. History never extends before start_time_ps."
+                " Observations are reused only within this request and graph artifact; "
+                "a sub-ps event difference remains a sampling frontier for dynamic tracing."
             ),
             inputSchema=schemas.TraceDivergenceInput.model_json_schema(),
         ),
         Tool(
             name="period",
             description=(
-                "Estimate a signal's dominant period inside a window and flag the "
+                "Estimate a 1-bit signal or SV expression's dominant period inside a window and flag the "
                 "first beat that deviates from it. Use for rhythm/throughput "
                 "questions an LLM cannot eyeball from a transition dump: stalled "
                 "clocks, dropped burst beats, backpressure bubbles, irregular "
@@ -6311,7 +6457,10 @@ async def list_tools():
                 "hand-assemble {clock, valid, ready, payload} signal paths. Covers AXI "
                 "*valid/*ready, generic valid/ready, and req/ack. It does NOT synthesise "
                 "an AHB 'valid' (there is no literal valid signal — it is htrans != IDLE); "
-                "use suggest_protocol_bundles for AHB/APB. Reads existing waveforms only."
+                "use suggest_protocol_bundles for AHB/APB. Port _i/_o suffixes retain "
+                "actual paths and directions; ambiguous clocks/payload require explicit "
+                "mapping. Req/ack candidates require confirmation of valid-hold semantics. "
+                "Read discovery for bounded enumeration coverage. Reads existing waveforms only."
             ),
             inputSchema={
                 "type": "object",
@@ -6378,7 +6527,8 @@ async def list_tools():
         Tool(
             name="sweep_handshakes",
             description=(
-                "Whole-design handshake anomaly sweep: discover EVERY valid/ready "
+                "Samples strictly before each selected physical clock edge (sampling_phase=before). "
+                "Bounded handshake anomaly sweep: discover valid/ready "
                 "interface and every AHB interface, then inspect each over the window in "
                 "one call, returning a comparative fact table (per-interface stalls, "
                 "deadlock signature ended_in_stall, x-while-valid, payload-hold, "
@@ -6389,6 +6539,10 @@ async def list_tools():
                 "round-trips into one. Always interpret flagged_count together with "
                 "coverage_status: zero_coverage means no protocol interfaces were "
                 "checked and is NOT a pass; truncated/degraded means partial coverage. "
+                "Read discovery for enumeration budgets, exact scope totals or lower bounds; "
+                "increasing max_interfaces cannot repair incomplete discovery. Both families "
+                "share one request metadata snapshot. Idle-ready stays a count, without "
+                "a flag or ranking weight. Req/ack names need explicit valid-hold semantics. "
                 "Workflow follow-ups relay only parameter-changing retries: an unscoped "
                 "zero-coverage result is not blindly replayed, but remains inconclusive. "
                 "FSDB native transition-buffer truncation is propagated per row and "
@@ -6440,12 +6594,12 @@ async def list_tools():
         Tool(
             name="verify_window",
             description=(
-                "Evaluate a temporal predicate over a clock window and return a precise "
+                "Check signal conditions or SV expression predicates over a clock window and return a precise "
                 "verdict (holds) plus a concrete witness/counterexample (cycle + sampled "
                 "values). You state the predicate; the tool checks it against the waveform "
-                "over thousands of cycles you cannot read yourself. Templates, not a DSL: "
-                "a term is {signal, op, value} (op: eq/ne/gt/ge/lt/le/is_x/is_known); a "
-                "predicate is a list of terms (implicit AND — run two calls for OR). Modes: "
+                "over the requested cycles. A term is {signal, op, value} "
+                "(op: eq/ne/gt/ge/lt/le/is_x/is_known) or a typed {expr,...} using SV truth "
+                "conversion. A predicate is a list of terms (implicit AND). Modes: "
                 "always(P), never(P), eventually(P), implication (A |-> B within N "
                 "cycles, the protocol-response template; set overlap=false for |=> = a "
                 "stability/hold property where B must STILL hold the NEXT cycle, e.g. "
@@ -6483,7 +6637,7 @@ async def list_tools():
                     },
                     "predicate": {
                         "type": "array",
-                        "description": "always/never/eventually: list of {signal, op, value} terms, AND-combined.",
+                        "description": "always/never/eventually (or sequence gate): AND-combined {signal,op,value} or {expr,...} terms. Expressions use SV truth conversion.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -6511,12 +6665,12 @@ async def list_tools():
                     },
                     "antecedent": {
                         "type": "array",
-                        "description": "implication only: the A predicate (list of terms).",
+                        "description": "implication only: AND-combined A terms, each {signal,op,value} or {expr,...}.",
                         "items": {"type": "object"},
                     },
                     "consequent": {
                         "type": "array",
-                        "description": "implication only: the B predicate that must follow A.",
+                        "description": "implication only: AND-combined B terms that must follow A, each {signal,op,value} or {expr,...}.",
                         "items": {"type": "object"},
                     },
                     "delta": {
@@ -6542,7 +6696,7 @@ async def list_tools():
                             },
                             "restart_when": {
                                 "type": "array",
-                                "description": "Optional predicate (list of {signal, op, value} terms). On accepted beats where it holds the sequence re-seeds (no check) — use for burst starts (e.g. htrans==NONSEQ) so cross-burst jumps are not flagged.",
+                                "description": "Optional AND-combined {signal,op,value} or {expr,...} terms. On accepted beats where true, re-seed for a new burst without checking its increment.",
                                 "items": {"type": "object"},
                             },
                         },
@@ -6589,11 +6743,16 @@ async def list_tools():
         Tool(
             name="reconstruct_transactions",
             description=(
+                "Reconstruct transactions using signal paths or SV expressions for channel fields. "
+                "Samples acceptance and fields strictly before each selected physical clock edge "
+                "(sampling_phase=before); all changes at that timestamp are excluded. "
                 "Reconstruct id-correlated request/response transactions from two "
                 "handshake channels: walk every clock edge, match accepted request beats "
                 "to completion beats by id, and return per-transaction latency plus "
                 "aggregate facts (outstanding curve incl. per-id peak, ordering, "
-                "unmatched=hang signature). One generic core, not a tool per protocol. "
+                "window-local unmatched endpoints). Inspect coverage_status and analysis: "
+                "state/read budgets return a partial prefix; max_transactions limits display only. "
+                "Pending at a window boundary does not prove a hang. One generic core. "
                 "AXI READ: req=AR (req_valid=arvalid, req_ready=arready, req_id=arid), "
                 "cmp=R (cmp_valid=rvalid, cmp_ready=rready, cmp_id=rid, cmp_last=rlast); "
                 "AXI WRITE: req=AW (awvalid/awready/awid), cmp=B (bvalid/bready/bid, no "
@@ -6715,7 +6874,9 @@ async def list_tools():
                     },
                     "max_transactions": {
                         "type": "integer",
-                        "description": "Max txn records returned (default 256); counts/stats are over ALL. Sets transactions_truncated when exceeded.",
+                        "minimum": 1,
+                        "maximum": 65536,
+                        "description": "Display cap (default 256). Counts/stats cover all analyzed edges independently of display; inspect analysis.stop_reason and display_stop_reason for budget boundaries.",
                         "default": 256,
                     },
                     "cursor_name": {
@@ -6740,6 +6901,9 @@ async def list_tools():
         Tool(
             name="inspect_handshake",
             description=(
+                "Inspect a handshake with signal paths or SV expressions for valid, ready and payload; clocks/control must have the required bit width. "
+                "Samples strictly before each selected physical clock edge (sampling_phase=before); "
+                "all changes at that timestamp are excluded. "
                 "Classify a clocked valid/ready handshake cycle-by-cycle and report "
                 "protocol facts that leave no value pattern in scoreboard logs: stalls "
                 "(valid high, ready low), the longest/over-threshold stall windows, "
@@ -6870,6 +7034,95 @@ async def list_tools():
         # / schemas.py / tests so it can be re-registered here in one block if a
         # real use-case appears.
     ]
+    # Shared selection input contract; legacy string schemas remain a branch.
+    selectable = {
+        "get_signal_at_time": ("signal_path",),
+        "get_signal_transitions": ("signal_path",),
+        "get_signals_around_time": ("signal_paths",),
+        "get_signals_by_cycle": ("clock_path", "signal_paths"),
+        "diff_first_divergence": ("signal_a", "signal_b"),
+        "period": ("signal",),
+        "verify_window": ("clock",),
+        "inspect_handshake": ("clock", "valid", "ready", "valid_htrans", "payload", "hwrite", "write_data"),
+        "reconstruct_transactions": ("clock", "req_valid", "req_ready", "req_id", "req_fields", "req_len",
+                                     "cmp_valid", "cmp_ready", "cmp_id", "cmp_last", "cmp_fields",
+                                     "data_valid", "data_ready", "data_last", "data_fields", "reset"),
+    }
+    for tool in _tools:
+        for name in selectable.get(tool.name, ()):
+            prop = tool.inputSchema["properties"][name]
+            if prop.get("type") == "array":
+                prop["items"] = _signal_selection_schema()
+            else:
+                prop.pop("type", None)
+                prop.update(_signal_selection_schema())
+            prop["description"] = prop.get("description", "") + (
+                " Accepts a path, fixed selection or {expr,...}; see WaveformSignalInput and WaveformExpression.")
+        if tool.name == 'verify_window':
+            props = tool.inputSchema['properties']
+            legacy = props['predicate']['items']
+            legacy['properties']['signal'] = _signal_selection_schema()
+            expression = {'$ref': '#/$defs/WaveformExpression'}
+            term = {'anyOf':[legacy,expression]}
+            for name in ('predicate','antecedent','consequent'):
+                props[name]['items'] = term
+                props[name]['maxItems'] = 128
+            props['delta']['properties']['signal'] = _signal_selection_schema()
+            props['delta']['properties']['restart_when']['items'] = term
+    _tools.extend([
+        Tool(name="inspect_tlul", description=(
+            "Inspect TL-UL fields mapped to signal paths, fixed selections or SV expressions. "
+            "Uses strict before-edge sampling for A/D fields and nested checks (sampling_phase=before). "
+            "Inspect explicitly mapped TL-UL A/D fields with the existing handshake and transaction "
+            "engines. Missing mappings return mapping_required; packed widths are never guessed. "
+            "Reports accepted fields, stalls, source pairing and latency, reset/unknown history, "
+            "carry-in and tail boundaries. Read checks and gaps; no integrity or full compliance claim."),
+            inputSchema={"type": "object", "properties": {
+                "wave_path": {"type": "string"}, "clock": _signal_selection_schema(),
+                "fields": {"type": "object", "additionalProperties": False,
+                           "properties": {n: _signal_selection_schema() for n in schemas.TlulFields.model_fields}},
+                "reset": _signal_selection_schema(), "reset_active_low": {"type": "boolean", "default": True},
+                "edge": {"type": "string", "enum": ["posedge", "negedge"]},
+                "start_time_ps": _integer_or_string_schema(), "end_time_ps": _integer_or_string_schema(),
+                "max_cycles": {"type": "integer", "minimum": 1, "maximum": 65536, "default": 65536},
+                "max_transactions": {"type": "integer", "minimum": 1, "maximum": 65536, "default": 256},
+                "max_wait_cycles": {"type": "integer", "minimum": 0, "default": 16},
+            }, "required": ["wave_path", "clock"]}),
+        Tool(name="resolve_packed_fields", description=(
+            "Resolve requested named packed members from the current content-anchored Source Graph "
+            "artifact and an exact dump declaration. Requires current hierarchy and complete semantic "
+            "type evidence; may run the bounded license-free worker. Returns mapping_required when "
+            "identity, active instance specialization, type or range cannot be proved. Returned explicit "
+            "selections are a compile snapshot: re-resolve after input changes. No waveform/source version inferred."),
+            inputSchema={"type": "object", "properties": {
+                "wave_path": {"type": "string"}, "compile_log": {"type": "string"},
+                "simulator": {"type": "string"}, "top_hint": {"type": "string"},
+                "signal_path": {"type": "string", "description": "Exact dump declaration path."},
+                "source_signal": {"type": "string", "description": "Exact whole aggregate in the compiled hierarchy."},
+                "fields": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 128},
+            }, "required": ["wave_path", "compile_log", "signal_path", "source_signal", "fields"]}),
+    ])
+    for tool in _tools:
+        properties = tool.inputSchema["properties"]
+        if tool.name in selectable or tool.name == 'inspect_tlul':
+            tool.inputSchema['$defs'] = _signal_selection_definitions()
+            tool.description += (
+                " Expressions: {expr,bindings,types}; semantic (default) needs declared types. "
+                "typing=wave_bits explicitly uses unsigned dump vectors. scope only prefixes names. "
+                "Types may use {width:8} for unsigned [7:0]. Arrays need types.<name>.unpacked and "
+                "bindings.<name>.elements OR path_template with one {index} (1D, <=128 elements). "
+                "Range bounds are JSON integers."
+                " Derived results are in expressions: inspect coverage_status/gaps; partial or not_observed "
+                "cannot exclude a problem. Observed X/Z differs from missing data. observations_truncated "
+                "limits displayed evidence only. An error field means failure: use error_code/recovery "
+                "and correct the arguments before retrying.")
+        if tool.name in schemas.COMPACT_OUTPUT_TOOLS:
+            properties.update(schemas.EvidenceOutputOptions.model_json_schema()["properties"])
+        if tool.name in {"inspect_tlul", "reconstruct_transactions"}:
+            model = (schemas.TlulAnalysisOptions if tool.name == "inspect_tlul"
+                     else schemas.TransactionDisplayOptions)
+            for key, prop in model.model_json_schema()["properties"].items():
+                properties[key] = {**properties.get(key, {}), **prop}
     # A/B harness toggle: hide the WHOLE handshake feature (suggestion and
     # inspection tools) from list_tools so a cold
     # "baseline" session cannot see or be hinted by it. Enabled by either
@@ -6881,12 +7134,21 @@ async def list_tools():
         "/tmp/tw_ab_hide_handshake"
     ):
         hidden = {
+            "inspect_tlul",
             "inspect_handshake",
             "suggest_handshakes",
             "suggest_protocol_bundles",
             "sweep_handshakes",
         }
         return [t for t in _tools if t.name not in hidden]
+    from src.expression_examples import expression_examples
+    examples = {e["tool"]: e["arguments"] for e in expression_examples()}
+    for tool in _tools:
+        if tool.name in examples:
+            tool.inputSchema["examples"] = [examples[tool.name]]
+            # Keep one runnable example visible even in clients that discard
+            # the optional JSON Schema examples annotation.
+            tool.description += " Example arguments: " + json.dumps(examples[tool.name], separators=(",", ":"))
     return _tools
 
 
@@ -6895,19 +7157,34 @@ async def list_tools():
 # ═══════════════════════════════════════════════════════════════════
 
 
+@recover_tool_input_errors(app)
 @app.call_tool()
 async def call_tool(name: str, arguments: dict):
     start = time.perf_counter()
+    attribution = usage_telemetry.begin_call(arguments)
     metrics = operation_metrics.OperationMetrics()
     metrics_token = operation_metrics.push(metrics)
     ok = True
     blocked = False
     error_code = None
     text = ""
+    result = None
     try:
-        result = await _dispatch(name, arguments)
+        dispatch_args = dict(arguments)
+        output_options = schemas.EvidenceOutputOptions.model_validate(
+            {"output_format": dispatch_args.pop("output_format")}
+            if "output_format" in dispatch_args else {}
+        )
+        if output_options.output_format == "compact" and name not in schemas.COMPACT_OUTPUT_TOOLS:
+            raise ValueError("compact_output_tool_unsupported")
+        result = await _dispatch(name, dispatch_args)
         serialize_started = time.perf_counter()
-        text = _serialize_result(result)
+        if output_options.output_format == "compact" and not isinstance(
+            result, (schemas.ToolErrorResult, schemas.PrerequisiteBlockResult)
+        ):
+            text = await _run_in_cancellable_thread(lambda: serialize_compact_result(name, result))
+        else:
+            text = _serialize_result(result)
         if name == "sweep_handshakes":
             operation_metrics.set_value(
                 "sweep_result_serialize_ms",
@@ -6928,6 +7205,8 @@ async def call_tool(name: str, arguments: dict):
             error_code = result.error_code or "tool_error"
         elif hierarchy_blocked:
             error_code = str((result.blocker or {}).get("code") or "hierarchy_blocked")
+        if ok and name in {"get_sim_paths", "get_formal_paths"}:
+            attribution = usage_telemetry.note_discovery(name, result)
         return [TextContent(type="text", text=text)]
     except anyio.get_cancelled_exc_class():
         # Client abandoned the request; the finally block still records the
@@ -6946,11 +7225,6 @@ async def call_tool(name: str, arguments: dict):
         return [TextContent(type="text", text=text)]
     finally:
         latency_ms = (time.perf_counter() - start) * 1000.0
-        case = None
-        if name != "get_formal_paths":
-            sim_state = _session_state.get("get_sim_paths")
-            if isinstance(sim_state, dict) and sim_state.get("case_dir"):
-                case = os.path.basename(str(sim_state["case_dir"]).rstrip("/"))
         try:
             usage_telemetry.record_call(
                 name,
@@ -6960,7 +7234,9 @@ async def call_tool(name: str, arguments: dict):
                 blocked=blocked,
                 error_code=error_code,
                 latency_ms=latency_ms,
-                case=case,
+                case=None,
+                attribution=usage_telemetry.finish_call(attribution),
+                readback=usage_telemetry.readback_counts(name, arguments, result, ok),
                 diagnostics=operation_metrics.snapshot(metrics),
             )
         finally:
@@ -7094,14 +7370,15 @@ async def _dispatch(name: str, args: dict):
                 return schemas.SearchSignalsBatchResult.model_validate(
                     {
                         "batch": entries,
-                        "hint": "One entry per keyword, in input order. Use the full path "
-                        "from each result's path field as the signal_path argument "
-                        "for tools such as get_signal_at_time.",
+                        "hint": "One entry per keyword, in input order. "
+                        + _SIGNAL_READBACK_HINT,
                     }
                 )
-            return schemas.SearchSignalsResult.model_validate(
-                annotate_signal_search_result(_search_one(keyword))
+            result = annotate_signal_search_result(_search_one(keyword))
+            result["hint"] = " ".join(
+                part for part in (result.get("hint"), _SIGNAL_READBACK_HINT) if part
             )
+            return schemas.SearchSignalsResult.model_validate(result)
 
         return await _run_in_wave_thread(wave_path, _work)
 
@@ -7109,7 +7386,8 @@ async def _dispatch(name: str, args: dict):
 
         def _work():
             parser = _get_parser(args["wave_path"])
-            raw_path = args["signal_path"]
+            parser, selected = prepare_selections(parser, {"signal_path": args["signal_path"]})
+            raw_path = selected["signal_path"]
             resolved_path = _resolve_signal_path(parser, raw_path)
             try:
                 result = parser.get_value_at_time(
@@ -7124,15 +7402,16 @@ async def _dispatch(name: str, args: dict):
                 raise
             if resolved_path != raw_path:
                 result["resolved_from"] = raw_path
-            return schemas.SignalAtTimeResult.model_validate(result)
+            return schemas.SignalAtTimeResult.model_validate(attach_selections(result, parser))
 
         return await _run_in_wave_thread(args["wave_path"], _work)
 
     elif name == "get_signal_transitions":
 
         def _work():
-            result = _get_parser(args["wave_path"]).get_transitions(
-                args["signal_path"],
+            parser, selected = prepare_selections(_get_parser(args["wave_path"]), {"signal_path": args["signal_path"]})
+            result = parser.get_transitions(
+                selected["signal_path"],
                 _resolve_time(args.get("start_time_ps", 0)),
                 _resolve_time(args.get("end_time_ps", -1), allow_sentinel=True),
             )
@@ -7140,7 +7419,7 @@ async def _dispatch(name: str, args: dict):
             # .get_transitions() still see the full list. Telemetry showed a
             # single uncapped call returning 8.9MB into the model context.
             max_transitions = int(args.get("max_transitions", TRANSITIONS_MAX_RETURNED))
-            return _prepare_signal_transitions_result(result, max_transitions)
+            return _prepare_signal_transitions_result(attach_selections(result, parser), max_transitions)
 
         return await _run_in_wave_thread(args["wave_path"], _work)
 
@@ -7155,7 +7434,8 @@ async def _dispatch(name: str, args: dict):
                 raise ValueError(
                     f"unknown return_mode {return_mode!r}; expected 'full' or 'values_only'"
                 )
-            raw_paths = args.get("signal_paths") or []
+            parser, selected = prepare_selections(parser, {"signal_paths": args.get("signal_paths") or []})
+            raw_paths = selected["signal_paths"]
             signal_paths, aliases = _resolve_signal_list(parser, raw_paths)
             _validate_signals_around_time_args(
                 parser, center_ps, window_ps, signal_paths
@@ -7184,7 +7464,7 @@ async def _dispatch(name: str, args: dict):
                     if hits:
                         suggestions[raw_path] = hits
             result["signal_suggestions"] = suggestions
-            return schemas.SignalsAroundTimeResult.model_validate(result)
+            return schemas.SignalsAroundTimeResult.model_validate(attach_selections(result, parser))
 
         return await _run_in_wave_thread(args["wave_path"], _work)
 
@@ -7199,14 +7479,10 @@ async def _dispatch(name: str, args: dict):
             end_time_ps = (
                 _resolve_time(args["end_time_ps"]) if "end_time_ps" in args else None
             )
-            # Two locating axes, one input per axis (reject mixing within an axis).
+            # One start axis; an explicit count may cap the requested time window.
             if start_time_ps is not None and "start_cycle" in args:
                 raise ValueError(
                     "start_time_ps and start_cycle are mutually exclusive; pass one"
-                )
-            if end_time_ps is not None and "num_cycles" in args:
-                raise ValueError(
-                    "end_time_ps and num_cycles are mutually exclusive; pass one"
                 )
             if (
                 start_time_ps is not None
@@ -7215,33 +7491,36 @@ async def _dispatch(name: str, args: dict):
             ):
                 raise ValueError("end_time_ps must be >= start_time_ps")
             parser = _get_parser(args["wave_path"])
-            raw_paths = args["signal_paths"]
+            parser, selected = prepare_selections(parser, {"signal_paths": args["signal_paths"], "clock_path": args["clock_path"]})
+            raw_paths = selected["signal_paths"]
             signal_paths, aliases = _resolve_signal_list(parser, raw_paths)
             if end_time_ps is not None:
                 # Count derived from the time window; the function applies the cap via
                 # max_cycles since the count is unknown until clock edges resolve.
                 result = get_signals_by_cycle(
                     parser=parser,
-                    clock_path=args["clock_path"],
+                    clock_path=selected["clock_path"],
                     signal_paths=signal_paths,
                     edge=args.get("edge", "posedge"),
                     start_cycle=args.get("start_cycle", 0),
-                    sample_offset_ps=args.get("sample_offset_ps", 1),
+                    sample_offset_ps=args.get("sample_offset_ps"),
+                    sample_phase=args.get("sample_phase", "after"),
                     start_time_ps=start_time_ps,
                     end_time_ps=end_time_ps,
-                    max_cycles=MAX_CYCLES_PER_QUERY,
+                    max_cycles=min(args.get("num_cycles", MAX_CYCLES_PER_QUERY), MAX_CYCLES_PER_QUERY),
                 )
             else:
                 requested_num_cycles = args.get("num_cycles", 16)
                 effective_num_cycles = min(requested_num_cycles, MAX_CYCLES_PER_QUERY)
                 result = get_signals_by_cycle(
                     parser=parser,
-                    clock_path=args["clock_path"],
+                    clock_path=selected["clock_path"],
                     signal_paths=signal_paths,
                     edge=args.get("edge", "posedge"),
                     start_cycle=args.get("start_cycle", 0),
                     num_cycles=effective_num_cycles,
-                    sample_offset_ps=args.get("sample_offset_ps", 1),
+                    sample_offset_ps=args.get("sample_offset_ps"),
+                    sample_phase=args.get("sample_phase", "after"),
                     requested_num_cycles=requested_num_cycles,
                     capped=requested_num_cycles > MAX_CYCLES_PER_QUERY,
                     start_time_ps=start_time_ps,
@@ -7253,7 +7532,7 @@ async def _dispatch(name: str, args: dict):
                 for hits in [_suggest_signal_paths(parser, path)]
                 if hits
             }
-            return schemas.GetSignalsByCycleResult.model_validate(result)
+            return schemas.GetSignalsByCycleResult.model_validate(attach_selections(result, parser))
 
         return await _run_in_wave_thread(args["wave_path"], _work)
 
@@ -7971,12 +8250,19 @@ async def _dispatch(name: str, args: dict):
                 resolved, reason = (await _run_in_cancellable_thread(
                     lambda ctx=ctx: resolve_divergence_context(ctx, _handle_store)
                 )) if ctx is not None else (None, "context_missing")
-                result["next_actions"].append(driver_action(result=result, side=side, context=ctx,
-                                                            bound=resolved, reason=reason))
+                expression = next((r for r in result.get('expressions',[]) if r.get('side')==side),None)
+                targets = expression['dependencies'][:16] if expression else [result[f'signal_{side}']]
+                for target in targets:
+                    action = driver_action(result={**result,f'signal_{side}':target}, side=side, context=ctx,
+                                           bound=resolved, reason=reason)
+                    if expression:
+                        action['reason'] = 'inspect_expression_dependency'
+                        action['evidence']['expression_key'] = expression['key']
+                    result['next_actions'].append(action)
             from src.verify_condition import _attach_cursor
             _attach_cursor(result, _cursor_store, result["first_divergence_time_ps"],
-                           result["value_a"], result["value_b"], args["wave_path_a"], args["signal_a"],
-                           args["wave_path_b"], args["signal_b"], args.get("cursor_name"), args.get("cursor_note"))
+                           result["value_a"], result["value_b"], args["wave_path_a"], result['signal_a'],
+                           args["wave_path_b"], result['signal_b'], args.get("cursor_name"), args.get("cursor_note"))
             for action in result["next_actions"]:
                 action["evidence"]["cursor_name"] = result["cursor"]["name"]
         return schemas.DiffFirstDivergenceResult.model_validate(result)
@@ -8063,6 +8349,26 @@ async def _dispatch(name: str, args: dict):
         )
         return validated
 
+    elif name == "resolve_packed_fields":
+        return await _resolve_packed_fields(args)
+
+    elif name == "inspect_tlul":
+        options = schemas.TlulAnalysisOptions.model_validate({
+            key: args[key] for key in schemas.TlulAnalysisOptions.model_fields if key in args
+        })
+        args = {**args, **options.model_dump()}
+        def _work():
+            return inspect_tlul(
+                get_parser=_get_parser, wave_path=args["wave_path"], clock=args["clock"],
+                fields=args.get("fields"), reset=args.get("reset"),
+                reset_active_low=args.get("reset_active_low", True), edge=args.get("edge", "posedge"),
+                start_ps=_resolve_time(args.get("start_time_ps", 0)),
+                end_ps=_resolve_time(args.get("end_time_ps", -1), allow_sentinel=True),
+                max_cycles=args.get("max_cycles", 65536), max_transactions=args.get("max_transactions", 256),
+                max_wait_cycles=args.get("max_wait_cycles", 16))
+        result = await _run_in_wave_thread(args["wave_path"], _work)
+        return schemas.TlulInspectResult.model_validate(result)
+
     elif name == "inspect_handshake":
 
         def _work():
@@ -8118,6 +8424,10 @@ async def _dispatch(name: str, args: dict):
         return schemas.WindowVerifyResult.model_validate(result)
 
     elif name == "reconstruct_transactions":
+        options = schemas.TransactionDisplayOptions.model_validate({
+            key: args[key] for key in schemas.TransactionDisplayOptions.model_fields if key in args
+        })
+        args = {**args, **options.model_dump()}
 
         def _work():
             return reconstruct_transactions(
@@ -8348,20 +8658,32 @@ def _extract_log_summary(result: schemas.ParseSimLogResult) -> dict:
 
 
 def _extract_structural_scan_summary(result: schemas.ScanStructuralRisksResult) -> dict:
-    return {
+    return schemas.StructuralScanSummary.model_validate({
         "eligible_file_count": result.eligible_file_count,
         "files_scanned": result.files_scanned,
         "coverage_status": result.coverage_status,
         "coverage_warnings": result.coverage_warnings,
+        "analysis_mode": result.analysis_mode,
+        "lexical_coverage_status": result.lexical_coverage_status,
+        "categories_scanned": result.categories_scanned,
         "semantic_status": result.semantic.status,
         "semantic_fact_count": result.semantic.total_facts,
+        "semantic_scope": result.semantic.scope,
+        "semantic_categories_checked": result.semantic.categories_checked,
+        "semantic_gaps": result.semantic.gaps,
+        "semantic_propagation": result.semantic.propagation,
+        "semantic_query_artifact_status": result.semantic.query_artifact_status,
+        "semantic_output_truncated": result.semantic.output_truncated,
         "total_risks": result.total_risks,
+        "risks_returned": len(result.risks),
+        "display_truncated": (result.auto_downgraded or len(result.risks) < result.total_risks
+                              or result.semantic.output_truncated),
         "high_risk_count": sum(1 for risk in result.risks if risk.risk_level == "high"),
-    }
+    }).model_dump(exclude_none=True)
 
 
 def _extract_protocol_health_summary(result: schemas.HandshakeSweepResult) -> dict:
-    return {
+    return schemas.ProtocolHealthSummary.model_validate({
         "interfaces_inspected": result.interface_count,
         "flagged_count": result.flagged_count,
         "discovered_count": result.discovered_count,
@@ -8369,7 +8691,16 @@ def _extract_protocol_health_summary(result: schemas.HandshakeSweepResult) -> di
         "coverage_status": result.coverage_status,
         "coverage_warnings": result.coverage_warnings,
         "suggested_next_actions": result.suggested_next_actions,
-    }
+        "scope": result.scope,
+        "start_ps": result.start_ps,
+        "end_ps": result.end_ps,
+        "edge": result.edge,
+        "discovery": result.discovery,
+        "finding_summary": result.finding_summary,
+        "transition_truncated_count": result.transition_truncated_count,
+        "sampling_phase": result.sampling_phase,
+        "skipped_count": len(result.skipped),
+    }).model_dump(exclude_none=True)
 
 
 def _extract_recommend_summary(result: schemas.RecommendNextStepsResult) -> dict:
@@ -9236,7 +9567,7 @@ def _enforce_output_budget(
     ],
 ) -> schemas.TruncatableResult:
     payload = model.model_dump_json(exclude_none=True)
-    model.payload_bytes = len(payload)
+    model.payload_bytes = len(payload.encode("utf-8"))
     if model.payload_bytes <= schemas.TOKEN_BUDGET_SOFT_LIMIT:
         return model
 
@@ -9245,7 +9576,7 @@ def _enforce_output_budget(
         current = shrink(current)
         current.auto_downgraded = True
         payload = current.model_dump_json(exclude_none=True)
-        current.payload_bytes = len(payload)
+        current.payload_bytes = len(payload.encode("utf-8"))
         if current.payload_bytes <= schemas.TOKEN_BUDGET_SOFT_LIMIT:
             return current
     return current
@@ -9528,7 +9859,7 @@ def _shrink_scan_structural_risks_stage2(
             "detail_hint": "Response truncated. Re-run scan_structural_risks with narrower categories.",
             "semantic": _trim_semantic_scan(model.semantic, 3),
             "risks": risks,
-            "categories_scanned": model.categories_scanned[:3],
+            "categories_scanned": model.categories_scanned,
             "skipped_files": [],
         }
     )
@@ -9545,7 +9876,7 @@ def _shrink_scan_structural_risks_terminal(
             "detail_hint": "Response truncated to fit budget. Re-run scan_structural_risks with one category.",
             "semantic": _trim_semantic_scan(model.semantic, 0),
             "risks": [],
-            "categories_scanned": model.categories_scanned[:3],
+            "categories_scanned": model.categories_scanned,
             "skipped_files": [],
         }
     )
@@ -9720,6 +10051,9 @@ def _serialize_result(result: BaseModel | dict) -> str:
 
 
 def _format_error(exc: Exception) -> schemas.ToolErrorResult:
+    from src.expression_errors import ExpressionError
+    if isinstance(exc, ExpressionError):
+        return schemas.ExpressionToolErrorResult.model_validate(exc.payload())
     message = str(exc)
     if "FSDB parsing unavailable" in message:
         return schemas.ToolErrorResult.model_validate(

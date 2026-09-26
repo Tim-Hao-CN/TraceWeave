@@ -23,25 +23,13 @@ import time
 from typing import Any, Callable
 
 from . import operation_metrics
-from .cancellation import CANCEL_CHECK_STRIDE, check_cancelled
+from .cancellation import CANCEL_CHECK_STRIDE, OperationCancelled, check_cancelled
 from .cursor_store import CursorRef, CursorStore
-from .cycle_query import EdgeSamplingSession, sample_signals_on_edges
+from .cycle_query import EdgeSamplingSession, sample_signals_on_edges, SignalColumnView
+from .waveform_selection import selection_inputs, prepare_selections
 
 
-class _SignalColumnView:
-    """Reusable dict-like view over one edge of compact signal columns."""
-
-    __slots__ = ("columns", "index")
-
-    def __init__(self, columns: dict[str, list[Any]]) -> None:
-        self.columns = columns
-        self.index = 0
-
-    def get(self, signal_path: str, default: Any = None) -> Any:
-        column = self.columns.get(signal_path)
-        if column is None or self.index >= len(column):
-            return default
-        return column[self.index]
+_SignalColumnView = SignalColumnView
 
 
 # ---------------------------------------------------------------------------
@@ -69,12 +57,11 @@ def diff_first_divergence(
     two paths MAY be identical — that's the within-run self-diff case
     (e.g. expected vs actual signals in the same FSDB).
 
-    Algorithm: walk the union of the two signals' transition timelines
-    chronologically. Seed both running values from
-    ``get_value_at_time(signal, start_ps)`` so the comparison begins from
-    the actual pre-window state, not from "unknown". At every event time
-    apply all coincident transitions before comparing — if the values
-    differ then, that time is the first divergence.
+    Supported parsers read bounded event pages and seed from a separate
+    predecessor. Fold every event at the same raw time before comparing;
+    stop further reads at the first known difference. Unknown prefixes keep
+    earliest_difference_proven false. Old wrappers retain the materialized
+    path and report that capability explicitly.
 
     When divergence is found and ``cursor_store`` is provided, register
     an anchor at the divergence time. Auto-generated names are
@@ -82,6 +69,15 @@ def diff_first_divergence(
     so repeated calls converge on the same name.
     """
     from .divergence_compare import compare_signals
+
+    original_get_parser = get_parser
+    parsers, keys = {},{}
+    for side,wave,signal in (('a',wave_path_a,signal_a),('b',wave_path_b,signal_b)):
+        parser = parsers[wave] if wave in parsers else original_get_parser(wave)
+        parser, mapped = prepare_selections(parser,{'signal':signal})
+        parsers[wave],keys[side] = parser,mapped['signal']
+    signal_a,signal_b = keys['a'],keys['b']
+    get_parser = parsers.__getitem__
 
     result = compare_signals(
         get_parser=get_parser, wave_path_a=wave_path_a, signal_a=signal_a,
@@ -91,6 +87,17 @@ def diff_first_divergence(
         _attach_cursor(result, cursor_store, result["first_divergence_time_ps"],
                        result["value_a"], result["value_b"], wave_path_a, signal_a,
                        wave_path_b, signal_b, cursor_name, cursor_note)
+    selections,expressions = [],[]
+    for side,wave in (('a',wave_path_a),('b',wave_path_b)):
+        parser = parsers[wave]
+        if hasattr(type(parser),'receipts'):
+            selections.extend(r for r in parser.receipts() if r['key']==keys[side])
+        if hasattr(type(parser),'expression_receipts'):
+            expressions.extend({**r,'side':side,'wave_path':wave} for r in parser.expression_receipts() if r['key']==keys[side])
+    if selections:
+        result['selections'] = selections
+    if expressions:
+        result['expressions'] = expressions
     return result
 
 
@@ -102,6 +109,7 @@ DEFAULT_PERIOD_TOLERANCE_FRAC = 0.05
 _MIN_EDGES_FOR_PERIOD = 3
 
 
+@selection_inputs('signal')
 def period(
     *,
     get_parser: Callable[[str], Any],
@@ -136,6 +144,11 @@ def period(
     three usable edges — an honest "cannot tell", not a guess.
     """
     parser = get_parser(wave_path)
+    derived = signal in getattr(parser,'expressions',{})
+    if derived and parser.get_signal_width(signal) != 1:
+        from .expression_errors import ExpressionError
+        raise ExpressionError('expression_control_width_invalid', parameter='signal',
+            message='period expression must be 1-bit')
     tr = parser.get_transitions(signal, start_ps, end_ps)
     eff_start = int(tr.get("start_ps", start_ps))
     eff_end = int(tr.get("end_ps", end_ps))
@@ -155,7 +168,20 @@ def period(
         "reason": None,
     }
 
-    edge_times = _edge_times(tr.get("transitions") or (), edge)
+    if derived:
+        from .cycle_query import _clock_value
+        rows = tr.get('transitions') or []
+        if (tr.get('truncated') or getattr(parser,'_time_group_ambiguities',{}).get(signal) or
+                any(_clock_value(r.get('value')) not in (0,1) for r in rows)):
+            result['reason'] = 'expression event coverage incomplete or unknown'
+            return result
+        from .cycle_query import _extract_edge_times
+        if edge not in {'posedge','negedge','any'}:
+            raise ValueError('unknown edge mode')
+        edge_times = sorted(t for direction in (('posedge','negedge') if edge=='any' else (edge,))
+            for t in _extract_edge_times(rows,direction,predecessor=tr.get('predecessor'),raw_time=True))
+    else:
+        edge_times = _edge_times(tr.get("transitions") or (), edge)
     result["edges_used"] = len(edge_times)
 
     if len(edge_times) < _MIN_EDGES_FOR_PERIOD:
@@ -172,7 +198,9 @@ def period(
         return result
 
     tolerance = max(1, round(dominant * tolerance_frac))
-    result["period_ps"] = dominant
+    result["period_ps"] = (dominant+999)//1000 if derived else dominant
+    if derived:
+        result['period_fs'] = dominant
 
     max_dev = 0
     off_beats = 0
@@ -187,13 +215,15 @@ def period(
                 # The edge that *ends* the deviating interval is where the
                 # rhythm visibly broke.
                 first_off_beat = edge_times[idx + 1]
-    result["jitter_ps"] = max_dev
+    result["jitter_ps"] = (max_dev+999)//1000 if derived else max_dev
     result["off_beat_count"] = off_beats
-    result["first_off_beat_time_ps"] = first_off_beat
+    result["first_off_beat_time_ps"] = ((first_off_beat+999)//1000 if derived else first_off_beat) if first_off_beat is not None else None
+    if derived:
+        result.update(jitter_fs=max_dev,first_off_beat_time_fs=first_off_beat)
 
     if first_off_beat is not None and cursor_store is not None:
         _attach_period_cursor(
-            result, cursor_store, first_off_beat, dominant,
+            result, cursor_store, result['first_off_beat_time_ps'], result['period_ps'],
             wave_path, signal, edge, cursor_name, cursor_note,
         )
     return result
@@ -645,6 +675,9 @@ def _attach_cursor(
         "wave_path_a": wave_path_a,
         "wave_path_b": wave_path_b,
     }
+    exact_fs = result.get('first_divergence_time_fs')
+    if exact_fs is not None and exact_fs % 1000:
+        metadata.update(first_divergence_time_fs=exact_fs, cursor_time_rounded_up=True)
     if cursor_name:
         ref: CursorRef = cursor_store.set(
             cursor_name, time_ps, note=note, metadata=metadata
@@ -668,6 +701,7 @@ DEFAULT_MAX_WAIT_CYCLES = 16
 DEFAULT_MAX_HANDSHAKE_FINDINGS = 20
 
 
+@selection_inputs("clock", "ready", "valid", "valid_htrans", "payload", "hwrite", "write_data")
 def inspect_handshake(
     *,
     get_parser: Callable[[str], Any],
@@ -694,6 +728,7 @@ def inspect_handshake(
     _sampling_session: EdgeSamplingSession | None = None,
     _resolution_cache: dict[str, str] | None = None,
     _compact_sampling: bool = False,
+    _sampled: dict | None = None,
 ) -> dict[str, Any]:
     """Classify a valid/ready handshake cycle-by-cycle and surface protocol
     facts an LLM cannot get from a transition dump or a scoreboard log.
@@ -806,11 +841,12 @@ def inspect_handshake(
     wdata_sig = resolve(write_data) if want_write_data_hold else None
     extra_signals = [s for s in (hwrite_sig, wdata_sig) if s]
 
-    sampled = sample_signals_on_edges(
+    sampled = _sampled if _sampled is not None else sample_signals_on_edges(
         parser, clock, [valid_signal, ready, *payload, *extra_signals],
         start_ps=start_ps, end_ps=end_ps, edge=edge,
         sampling_session=_sampling_session,
         compact=_compact_sampling,
+        sample_offset_ps=0, sample_phase="before",
     )
     signal_errors = sampled.get("signal_errors", {})
     transition_signals_truncated = list(
@@ -819,9 +855,10 @@ def inspect_handshake(
     transition_data_truncated = bool(transition_signals_truncated)
     payload_unresolved = [p for p in payload if p in signal_errors]
     resolved_payload = [p for p in payload if p not in signal_errors]
-    warnings: list[str] = []
+    warnings: list[str] = list(sampled.get("sampling_gaps", []))
     coverage: dict[str, Any] = {
         "clock_sampled": False,
+        "sampling_gaps": list(sampled.get("sampling_gaps", [])),
         "valid_ready_resolved": False,
         "stall_checked": False,
         "backpressure_checked": False,
@@ -852,6 +889,7 @@ def inspect_handshake(
         "clock": clock,
         "valid": valid_signal,
         "valid_source": valid_source,
+        "sampling_phase": "before",
         "ready": ready,
         "payload": payload,
         "edge": edge,
@@ -903,7 +941,7 @@ def inspect_handshake(
 
     if transition_data_truncated:
         warnings.append(
-            "TRANSITION DATA TRUNCATED: the native buffer returned only a prefix "
+            "TRANSITION DATA TRUNCATED: the reader or sampling boundary retained only a prefix "
             f"for {len(transition_signals_truncated)} sampled signal(s). Findings "
             "and zero counts cover only that prefix; this is not complete coverage."
         )
@@ -1042,6 +1080,14 @@ def inspect_handshake(
         else:
             sig = samples[cycle_index]["signals"]
             sample_time_ps = samples[cycle_index]["time_ps"]
+        if cycle_index in sampled.get("inactive_cycles", {}):
+            # An adapter can provide an explicit reset/unknown-reset boundary.
+            # It breaks history without manufacturing a producer deassertion.
+            _close_stall(sample_time_ps)
+            wd_phase_open = False
+            wd_outstanding_write = None
+            x_while_valid_active.clear()
+            continue
         if use_htrans:
             v = _ahb_valid_truth(sig.get(valid_signal), htrans_rule)
         else:
@@ -1481,6 +1527,7 @@ def _handshake_input_error(
     return {
         "wave_path": wave_path, "clock": clock, "valid": "", "valid_source": "none",
         "ready": ready, "payload": [], "edge": edge,
+        "sampling_phase": "before",
         "start_ps": int(start_ps), "end_ps": int(end_ps), "active_high": active_high,
         "sample_count": 0, "transfer_count": 0, "stall_count": 0,
         "max_stall_cycles": 0, "max_stall_begin_ps": None,
@@ -1501,6 +1548,7 @@ def _handshake_input_error(
 def _empty_handshake_coverage() -> dict[str, Any]:
     return {
         "clock_sampled": False,
+        "sampling_gaps": [],
         "valid_ready_resolved": False,
         "stall_checked": False,
         "backpressure_checked": False,
@@ -1534,6 +1582,8 @@ def _resolve_signal_path(parser: Any, path: str) -> str:
     try:
         parser.get_signal_width(path)
         return path
+    except OperationCancelled:
+        raise
     except Exception:
         pass
     if "[" in path or not hasattr(parser, "search_signals"):
@@ -1541,6 +1591,8 @@ def _resolve_signal_path(parser: Any, path: str) -> str:
     basename = path.rsplit(".", 1)[-1]
     try:
         results = parser.search_signals(basename).get("results", [])
+    except OperationCancelled:
+        raise
     except Exception:
         return path
     candidates = [

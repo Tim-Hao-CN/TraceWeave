@@ -163,11 +163,17 @@ class _RecordingGroupParser:
         self.inner = VCDParser(path)
         self.transition_group_limit = limit
         self.groups: list[tuple[str, ...]] = []
+        self._transition_group_active = False
 
     @contextmanager
     def transition_group(self, paths):
         self.groups.append(tuple(paths))
-        yield True
+        assert not self._transition_group_active
+        self._transition_group_active = True
+        try:
+            yield True
+        finally:
+            self._transition_group_active = False
 
     def __getattr__(self, name):
         return getattr(self.inner, name)
@@ -239,15 +245,16 @@ def test_sweep_drops_clocking_block_scopes(tmp_path):
     assert r["coverage_status"] == "complete"            # no skip -> not degraded
 
 
-# --- flags / sort: ahb ready_without_valid suppression + x_while_valid ------
+# --- flags / sort: idle-ready suppression + x_while_valid -------------------
 
-def test_flags_suppresses_ready_without_valid_on_ahb():
+def test_flags_suppresses_idle_ready_on_both_families():
     # On an AHB row, ready_without_valid means HREADY high while HTRANS idle (an
-    # idle bus, not backpressure) — it must NOT surface as an anomaly flag. On a
-    # valid_ready row it still does.
+    # idle bus, not backpressure). Both families permit idle ready, so neither
+    # its presence nor its count contributes an anomaly flag or ranking weight.
     res = {"ready_without_valid_cycles": 5}
     assert "ready_without_valid" not in _flags(res, "ahb")
-    assert "ready_without_valid" in _flags(res, "valid_ready")
+    assert "ready_without_valid" not in _flags(res, "valid_ready")
+    assert _sort_key({"kind": "valid_ready", "valid": "a", "ready_without_valid_cycles": 999}) == _sort_key({"kind": "valid_ready", "valid": "a"})
 
 
 def test_flags_includes_x_while_valid():
@@ -822,11 +829,14 @@ def test_sweep_cancellation_inside_clock_group_releases_native_group(
     @contextmanager
     def tracked_transition_group(_paths):
         nonlocal entered, exited
+        assert not getattr(parser, "_transition_group_active", False)
+        parser._transition_group_active = True
         entered += 1
         try:
             yield True
         finally:
             exited += 1
+            parser._transition_group_active = False
 
     def cancel_after_first_interface(**kwargs):
         nonlocal inspect_calls

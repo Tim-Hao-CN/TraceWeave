@@ -40,6 +40,7 @@ Connectivity backends (driver/load/path resolution)
   src/npi_worker.py               # short-lived compute-node NPI entry point
   src/verdi_backend.py            # KDB / license probe, kdb_hint generator
   src/kdb_builder.py              # Auto-build Verdi KDB (vericom + elabcom) for Xcelium
+  src/compile_environment.py      # Bounded log-anchored path recovery shared by hierarchy/KDB/Source Graph
 
 Waveform backends
   src/vcd_parser.py
@@ -47,6 +48,7 @@ Waveform backends
   src/fsdb_signal_index.py
   src/cycle_query.py
   src/waveform_batch.py           # FSDB+VCD batch reader (time-window)
+  src/waveform_selection.py       # request-local declared-coordinate projections
   src/waveform_hints.py           # producer and exact tool pseudo-signal hints
   src/cancellation.py             # cooperative cancel checkpoints for worker-thread scans
   src/operation_metrics.py        # privacy-safe lock/discovery/cancel timings
@@ -63,6 +65,8 @@ Auto-debug primitives (cursors + verification)
   src/window_verify.py            # verify_window: temporal predicate over a clock window
   src/handshake_suggest.py        # suggest_handshakes / suggest_protocol_bundles
   src/handshake_sweep.py          # sweep_handshakes: whole-design handshake anomaly sweep
+  src/tlul.py                     # explicit A/D mapping over handshake/transaction engines
+  src/packed_layout.py            # packed-member export from trusted semantic artifacts
   src/txn_reconstruct.py          # reconstruct_transactions: id-correlated transaction layer
 
 Native integration
@@ -402,16 +406,57 @@ Verification
   result build/serialization cost, and process RSS start/peak/end. All fields
   are numeric or fixed-label aggregates; paths, scopes, signal names, values,
   and search keywords are never recorded.
-- Handshake discovery enumerates at most 65,536 signal descriptors per search,
-  applying the requested scope before that limit. It reports independent
-  `discovery` coverage; search failures or truncation make a sweep incomplete
+- Handshake discovery retains at most 65,536 signal descriptors per request,
+  applying the exact, case-sensitive hierarchy scope before that limit. The
+  optional native scope ABI seeks the existing ordered FSDB index with
+  `lower_bound`, then returns lexical pages of at most 1,024 records, 1 MiB and
+  4,096 visited entries. Actual scope boundaries distinguish escaped names from
+  hierarchy separators. Direct ancestor queries skip child subtrees and have a
+  separate 4,096-record / 256-level cap. Request totals are bounded by 131,072
+  visits, 16 MiB of record bytes and an estimated 64 MiB retained snapshot.
+  Native open still builds the design index; VCD still parses the full input
+  and lazily sorts references to existing declaration keys for paging.
+  Cursors bind the exact scope, file stat identity and parser index generation;
+  replacement, mutation, close or reopen cannot continue an old page. This is
+  stat identity, not a content hash. No cursor or discovery snapshot is persisted.
+  Both sweep families share one read-only snapshot, including empty-result hints,
+  and release it before waveform sampling. Public keyword search retains its
+  existing case-insensitive substring semantics and ranking. Older wrappers use
+  the legacy search fallback and do not claim paged work limits.
+  The existing `discovery` receipt adds `mode`, page/visit/byte counts and caps,
+  a retained-byte estimate, separate scope/ancestor return counts, `scope_total`
+  (null until exhaustion), and `scope_total_lower_bound` (confirmed retained
+  scope members only; an unconsumed lexical key is not counted). These are enumeration
+  facts, not protocol coverage. Search failures or truncation make a sweep incomplete
   even when its interface cap was not reached. `discovered_count` is then a
   lower bound. Narrowing scope can recover interfaces that a global prefix
   missed; raising `max_interfaces` alone cannot repair discovery truncation.
   Valid/ready bit channels pair by identical index and carry an explicit payload
-  mapping need. Named channels never borrow another channel's payload, and an
-  ambiguous nearest clock is left unresolved. These are naming-based proposals,
-  with each inspected row retaining its actual check coverage.
+  mapping need. Port `_i`/`_o` normalization keeps original paths and direction
+  evidence; conflicting directions and duplicate normalized roles are not paired.
+  Payload requires a same-channel field name and compatible known direction;
+  an unnamed channel never absorbs arbitrary register/counter buses. Both generic
+  and protocol candidates leave multiple nearest clocks unresolved and exclude
+  clock enable/status signals. Req/ack naming returns
+  `handshake_semantics="requires_confirmation"`; automatic sweeps skip those
+  candidates until valid-hold semantics are supplied explicitly. Idle-ready counts
+  remain visible for both families but create no sweep flag or ranking weight.
+  Explicit `inspect_handshake` calls retain their previous semantics. Packed-only
+  buses require a future field-selection capability; empty discovery cannot
+  certify them. Each inspected row retains its actual check coverage.
+  Paging and sampling run under the existing wave locks, including the one global
+  FSDB lock. Cancellation is checked between pages and after native calls; native
+  open and individual native calls are still not interruptible internally. Time
+  conversion, four-state values, predecessor and transition truncation are unchanged.
+  Reproduce discovery or sweep workloads with
+  `python3.11 scripts/benchmark_signal_discovery.py --wave /absolute/run.fsdb
+  --mode discovery --scope tb.dut --output /tmp/discovery.json` (omit scope for
+  global discovery; use `--mode sweep --start 0 --end 100000 --max-interfaces 64`
+  for a sweep). Run each revision serially in fresh processes. Reports include
+  first/warm wall and CPU time, peak RSS, native/search call volume, complete
+  facts and source/library/input fingerprints. Candidate sets can change with
+  role corrections: compare common-interface observations separately from new
+  candidates and changed flags, rather than claiming identical whole results.
   The September 18 large SoC replay (18,641 lexical hierarchy nodes, 75,578
   VCD IDs, fresh MCP server, NPI disabled, 64-interface cap) discovered at least
   7,421 interfaces versus 297 in the original evaluation. It explicitly reported
@@ -726,6 +771,34 @@ Verification
   ABI is optional and detected by symbol presence, so an old locally built
   wrapper remains functional through the legacy path; rebuilding the wrapper
   and reconnecting the server is required to activate group loading.
+- FSDB metadata ABI v1 is separately optional and version-probed. Exact width,
+  direction and type lookups use the existing native ordered path map in
+  O(log N), without keyword search or a duplicate Python design index. Width
+  misses and older wrappers retain the existing exact/suffix search fallback.
+  A positive metadata LRU per parser is limited to 1,024 entries and 256 KiB
+  of estimated retained bytes; misses are not cached. Immutable header facts
+  and bounded summary lists are separate from this LRU. Comparison and window
+  validation use `get_header`, with `get_summary` compatibility for other
+  parsers. Normal headers do not enumerate signals; the existing zero-duration
+  recovery can still inspect up to eight sample signals and remains best effort.
+  FSDB open still constructs the native full-design index.
+  Every parser access checks real path, device/inode, size and nanosecond
+  mtime/ctime; replacement/reopen/close invalidates retained metadata and clock
+  indexes. These stat identities are not content hashes. An update during a
+  resident group is refused until its normal cleanup; the process-global FSDB
+  lock, cancellation checkpoints and native-call cancellation limit remain.
+  New summary samples are the first 20 full paths in lexical order, read into
+  a bounded 64 KiB buffer. Actual top scopes are collected during the existing
+  native tree walk and listed separately (256 entries / 64 KiB). Check the
+  additive `metadata_query_mode`, `sample_signals_order` and
+  `top_modules_complete` fields: legacy ranked samples cannot establish the
+  complete top set, and a capped top listing explicitly reports false.
+  Rebuild with `bash scripts/build_wrapper.sh` and reconnect to activate the
+  native ABI. `scripts/benchmark_fsdb_metadata.py --help` describes independent
+  fresh-process metadata, sweep and diff workloads, loaded module/library
+  fingerprints, first preparation, hot queries, RSS and complete fact digests.
+  Timings include nested phases; do not sum them. No OS cache flushing or MCP
+  transport timing is implied.
 - `src/waveform_batch.py` provides `WaveformBatchReader` — a time-window
   multi-signal reader with FSDB and VCD implementations sharing the same
   shape. The FSDB path uses `ffrCreateTimeBasedVCTrvsHdl` for a single
@@ -749,6 +822,13 @@ and engine caches are excluded and never opened. This keeps proof semantics in
 the formal tool or MCP client, where the producing command and property context
 are available.
 
+When waveforms are found without project entries, both automatic `wave_only`
+discovery and explicit exports add one short readback hint to the existing
+`hints` list. It points to summary/search as needed and the existing point/batch
+readers. The caller selects the waveform, signals and timestamp; discovery does
+not open waveforms or construct a query. The coverage receipt and hint cap still
+apply, including when a limited scan has found only a prefix of the artifacts.
+
 Exported VCD/FSDB files reuse the existing waveform backends. A recognized
 JasperGold VCD `$version` produces only a normalized `producer_hint`; exact
 `:jasper_formal_clock` and `:jasper_formal_reset` search rows receive optional
@@ -757,6 +837,54 @@ classification. Automatic clock detection prefers a viable real RTL clock,
 while callers may explicitly sample the pseudo-clock. Tools that already emit
 standard VCD/FSDB need no provider for direct waveform use; unsupported file
 formats require a separate waveform backend.
+
+Signal search returns candidates and a conditional readback hint in both its
+single-keyword and batch forms. The batch places the shared hint only at the
+outer level and preserves each backend's existing hints. Callers choose the
+signal set and times: use a point query for one signal, or
+`get_signals_around_time(return_mode="values_only", window_ps=0,
+extra_transitions=0)` for several signals at the same known time. Cycle queries
+require an explicit clock and sampling semantics; check actual sample times
+and counts, since an initially high clock does not establish a rising edge at
+the initial timestamp. Read a missing initial state separately by time. Keep
+glitch and asynchronous investigations on transition/window queries.
+`values_only` trims the response after reading; it does not bypass the reader
+or clock-detection guardrails and makes no parser-performance guarantee.
+
+The MCP request adapter rejects `search_signals.keyword` lists longer than 16
+before any search or parser access. It returns `isError=true` with matching
+JSON text and structured content: `error_code="too_many_keywords"`,
+`parameter`, `provided_count`, `max_count`, `search_executed=false` and a
+batch-splitting `recovery` instruction. No keyword or path contents are echoed.
+All other requests retain the SDK's original input validation and error
+handling. Neither this precheck nor SDK input-validation failures enter
+tool-handler telemetry; client-side rejection may happen before either layer
+and cannot be customized or counted by the server.
+
+### Readback Client Check
+
+`scripts/check_waveform_readback.py` launches an isolated stdio server with
+telemetry disabled and a neutral VCD, without changing client configuration or
+running an EDA tool/model. Its JSON receipt records the launch checkout commit,
+dirty state and server-file digest, the MCP handshake version, SDK-client
+version, tool names/readback schemas, and actual call outcomes/bytes/latency.
+It checks point/batch agreement, initial and uninitialized values, X/Z, missing
+signals, short cycle reads and the recoverable keyword limit. These timings
+are probe observations, not a performance benchmark.
+
+Use `--work-dir /tmp/traceweave-readback-check` to retain the fixture. The
+`ai_client_probe_requests` in the receipt are explicit point/batch calls with
+known expected values. In a separate smoke session, ask the target AI client
+to execute those exact calls using its configured TraceWeave connection, then
+save its version, actually observable tool-catalog evidence, and call results.
+Distinguish a rejected call from a tool the model did not invoke. Leave
+unobservable catalog/version layers `unknown`; the SDK probe cannot attest to
+an AI client's exposure, and neither probe measures natural model adoption.
+Keep this session separate from any formal experiment or agent A/B.
+
+An optional `--server-command <executable> <args...>` checks another local
+stdio installation without claiming its source commit. The installed-wheel
+CI smoke uses the same readback checks, beyond initialize/tools-list alone.
 
 ## Handle-based Hierarchy Access
 
@@ -1137,11 +1265,28 @@ remains the default. With `TRACEWEAVE_NPI_EXECUTION=lsf`, every cache miss or
 forced rebuild runs in the same LSF policy used by NPI queries; no failure path
 silently starts a licensed local build.
 
+VCS compilation records also support rebuilding from a different terminal.
+`compile_environment` infers only uniquely constrained path variables from
+simulator-recorded absolute paths and bounded nested filelists, then checks
+the replayed project-unit order against the log. The preprocessor and KDB
+builder reuse the same inference as Source Graph. No setup script is executed
+and no process environment is modified; ambiguous or incomplete option replay
+does not authorize conditional hierarchy and fails KDB precheck. Phase-local
+KDB options must agree across the compiled sources.
+
+`files.user` is a browsing inventory and may contain module-body or class
+includes. With compilation-unit evidence, KDB builds use that ordered evidence
+instead; an included file is a separate unit only if the simulator records it
+as one. Nested `-f`/`-F` options retain their path bases and include search
+order. The original compile cwd is restored as an include directory because
+vericom runs under a private cache directory. Legacy caller-built contexts
+without compilation-unit records retain their inventory fallback.
+
 ```text
 build_kdb(compile_log)
 ├── parse_compile_log → top, files, defines, incdirs, UVM flag
-├── hash = sha256(top + sorted(files + mtimes) + sorted(defines)
-│                 + sorted(incdirs) + uvm_bit)
+├── versioned hash = sha256(ordered units + top + dependency contents
+│                          + ordered defines/incdirs + UVM mode)
 ├── cache_dir = $TRACEWEAVE_CACHE_DIR/kdb/<hash>/
 ├── if cache_dir/state.json says ok → return cached, no Verdi spawn
 ├── execution=lsf → submit versioned private worker request via bsub -K
@@ -1155,6 +1300,7 @@ build_kdb(compile_log)
     │   → vericom.log
     ├── elabcom -lib work.lib++ -elab kdb -top <top>
     │   → elabcom.log
+    ├── revalidate inputs after compile; changed inputs cannot be published
     ├── on success: rename tmp → cache_dir (atomic, replaces stale entry)
     └── on failure: rename tmp → .failed-<hash>/ (preserved for inspection;
                       existing cache_dir untouched)
@@ -1192,7 +1338,12 @@ Cross-environment generality:
   (xrun) are both extracted.
 - UVM detection is heuristic: `-ntb_opts uvm`, `-uvm`,
   `+define+UVM*`, or any source path containing `uvm`. Any one
-  signal triggers `-ntb_opts uvm` for vericom.
+  signal triggers `-ntb_opts uvm` for vericom unless the recorded units already
+  provide `uvm_pkg.sv`; an explicit package retains its original order/version.
+- Cache identity includes source, recorded include, and replayed filelist
+  contents, including changes within the same timestamp second. Old cache
+  keys are invalidated by the input-version salt. Content reads are streamed
+  with cancellation checkpoints; this adds validation I/O to cache lookup.
 - Top-module selection prefers names not matching
   `uvm_custom_install*` (Synopsys recorder shims), falling back to
   the first listed top.
@@ -1223,12 +1374,14 @@ validation, and storage cost?* The third is whether metric-bearing Source Graph
 calls repeat within one case and the default 60-second idle window often enough
 to justify retaining a semantic-session frontend process.
 
-- `server.call_tool` is the single choke point every tool call passes
-  through. It wraps `_dispatch` in a `finally` that calls
+- `server.call_tool` wraps `_dispatch` in a `finally` that calls
   `usage_telemetry.record_call(...)`, appending one JSONL line per call to
-  `$TRACEWEAVE_CACHE_DIR/telemetry/usage.jsonl`.
-- Each line records: timestamp, `session_id`, `case` (case-dir basename),
-  tool name, **argument keys + a small whitelist of scalar flags** (never
+  `$TRACEWEAVE_CACHE_DIR/telemetry/usage.jsonl`. This covers handler calls only:
+  keyword-limit adaptation, SDK input validation, and client-side rejection
+  happen before this recorder and are not included in its denominators.
+- Each line records: timestamp, anonymous `session_id`, fixed `artifact_domain`
+  (`simulation` / `formal` / `unknown`) and `attribution_status`,
+  tool name, **argument keys + a small whitelist of fixed decision labels** (never
   argument values or paths — noise + privacy), `ok`/`blocked`, `result_bytes`
   (a token proxy), and `latency_ms`. Failed calls additionally carry a
   classification `error_code` (a code such as `missing_prerequisite` or the
@@ -1248,10 +1401,40 @@ to justify retaining a semantic-session frontend process.
   depth. Artifact fingerprints/digests, cache/source/wave paths,
   signal/scope/value content, free-form diagnostics, and exception text cannot
   enter this block.
-- **A session = a `get_sim_paths` case.** The get_sim_paths handler calls
-  `note_session(identity)`; a new case identity mints a new `session_id`,
-  re-discovering the same case keeps it. This makes "sessions in which a
-  primitive was used at least once" a meaningful presence metric.
+- **Sessions follow discovered artifact owners and observed generations.**
+  `src/telemetry_context.py` registers exact files returned by `get_sim_paths`
+  and `get_formal_paths`. Simulation uses the selected case; formal uses the
+  containing discovered project (deepest when nested), or the export root when
+  no project is recognized. A multi-project discovery has no single session.
+  Repeated discovery reuses a random process-local id; an observed change to a
+  previously registered file starts a new generation and clears that owner's
+  older bindings. Returning to an unchanged earlier project reuses its id.
+  Paths and `(device, inode, size, mtime_ns, ctime_ns)` remain private in memory;
+  stat identity is an ordinary update/replacement check, not a content digest.
+  No paths, names, values, identity hashes, or case basenames are added to JSONL;
+  production writes `case=null`. Legacy `note_session`/direct recorder callers
+  and their old records remain supported.
+- Shared readers match the explicit wave path(s); other requests may match
+  explicit log/compile paths. No explicit registered artifact means `unknown`,
+  including context-only tools that do not supply such a path. Wave ownership
+  takes precedence over additional compile context. Unregistered, changed,
+  unreadable, cross-owner, and conflicting claims never inherit a recent
+  simulation or formal session. The request captures attribution before its
+  first await and checks file versions again on completion, so a concurrent
+  discovery cannot reassign it. This is accounting only, never a tool gate or
+  an inference about proof status, trace kind, or reachability.
+- Retention is bounded to 128 owners and 4,096 file bindings (also at most
+  4,096 entries examined per discovery). Capacity exhaustion clears the registry
+  and latches `unknown/capacity` until server restart; evicting a conflicting
+  claim must never make an ambiguous file look uniquely owned. Telemetry off
+  skips identity I/O entirely. This registry does not read file contents.
+- Explicit point, around-time and cycle readers add a separately allowlisted
+  `readback` block: fixed `kind` (`point`, `batch_point`, `cycle`, `window`) plus
+  numeric requested-signal, returned-sample and returned-timepoint counts.
+  Around-time counts cover center values only; zero-window `values_only` is
+  `batch_point`. X/Z cells count as values; missing/uninitialized cells do not.
+  Failed calls count zero returned samples. These counters measure returned
+  state, not whether the model used it to derive a helper or reach a conclusion.
 - Recording is strictly best-effort — every public function swallows its own
   exceptions so telemetry can never break a tool call.
 - `aggregate(records)` is a pure function backing the offline
@@ -1268,6 +1451,14 @@ to justify retaining a semantic-session frontend process.
   Zero placeholders for stages that were not
   entered are excluded from timing distributions. The report reads only the
   append-only JSONL file and never discovers or scans artifact-cache entries.
+  Its `artifact_usage` block separates formal, simulation, unknown and legacy
+  calls, point/batch/cycle/window calls, sessions with returned state, and
+  sessions containing only discovery/search/summary. New unattributed calls
+  are counted without inventing a shared session; old records keep the legacy
+  `(none)` bucket. Readback labels/counts and attribution are filtered again
+  during aggregation. Legacy records lack readback counters and cannot establish
+  whether state was returned. Session presence is conditional on attributable
+  calls, not on all client requests.
 
 `TELEMETRY_ENABLED` defaults to False. Opt in with `TRACEWEAVE_TELEMETRY=1`
 (or `true`/`yes`/`on`) and restart/reconnect the MCP server. This switch is
@@ -1285,6 +1476,70 @@ denominators. Telemetry is local-only; nothing is sent anywhere.
 `src/divergence_compare.py` owns cursor-free, coverage-aware event comparison;
 `src/divergence_clock.py` adds explicitly aligned clock sampling. The server
 registers the final cursor after wave work and context validation.
+
+Event comparison uses the private `event_readers` session in
+`src/waveform_batch.py` and `src/event_pages.py`. A supported FSDB wrapper exposes
+the optional event-page ABI v1: one existing transition group load per file,
+one traversal cursor per explicitly supplied signal, and bounded subsequent
+pages without repeated seeks. Default pages hold at most 1,024 records and
+256 KiB; hard bounds are 4,096 records and 1 MiB. Native cursors are subordinate
+to the group and are freed before unloading, including cancellation, timeout,
+exceptions and parser close. The global FSDB lock covers the entire session.
+Initial FFR loading can still decompress whole flush sessions; fewer returned
+events do not prove fewer physical disk reads. Cancellation is checked between
+pages and after native returns; opening/loading remains non-preemptible.
+
+Each page keeps a separate strict predecessor and the next unread **raw** time.
+The comparator folds a whole raw-time group, carrying only its last value when
+the group spans pages. A byte-limited, unrepresentable event marks an incomplete
+tail; it cannot establish a difference or equality. Native ticks retain the
+header scale, with public ps still converted through `_ToTag` / `_TagToPs`.
+VCD pages bisect existing records; only non-integral-ps scales add an 8-byte
+raw-tick array per event. Initial VCD parsing and its full-file memory remain.
+Internal ordering uses integer fs, so two sub-ps events are never merged just
+because their public ps timestamps coincide. `first_divergence_time_fs` carries
+the exact positive observation; the compatible integer-ps time/cursor rounds
+up. Cursor metadata marks that rounding, and dynamic tracing retains a sampling
+frontier for a non-integral-ps difference instead of sampling the rounded value.
+Unknown or missing earlier intervals still prevent an earliest-difference proof.
+
+The additive `reading` receipt distinguishes `native_event_pages_v1`,
+`vcd_index_pages`, and `legacy_materialized`, with actual page/record counts and
+record-byte basis. Native bytes count ABI records, VCD bytes conservatively
+estimate records, and unavailable legacy byte counts stay null. Old wrappers,
+or a resident-group configuration that cannot admit the pair, use the existing
+whole-window fallback; their merge early-exit is **not** streaming I/O. No
+multi-pair search is introduced: the comparison proves a result for exactly the
+caller-supplied pair, and trace mappings continue to govern dependency pairing.
+Clock-aligned root comparison keeps its existing materialized clock/sample
+algorithm; event-page gains do not describe that mode.
+
+`src/observation_session.py` reuses immutable windows and samples within one
+`trace_divergence` graph attempt. Keys contain file stat identity, parser
+generation, real declaration/storage identity, ordered selection bits,
+artifact/backend namespace, time coverage, sample time, phase and offset.
+Display keys such as `@bits(...)` alone never identify a selection. A complete
+covering window may supply a smaller window with a newly sliced predecessor;
+truncated/error streams are not retained. The LRU caps both 65,536 retained
+events/samples and 32 MiB of conservative Python/key bytes. Oversized entries
+bypass caching; eviction never changes unknown/coverage/earliest semantics.
+The cumulative transition/time analysis budgets remain independent. Whole-graph
+backend/artifact restarts and request exit release cached observations; final
+wave/compile validation still discards changed evidence. No cross-request
+observation or transaction repository is created. Numeric cache metrics expose
+hits, misses, evictions, bypasses and peaks without names/paths/values.
+
+`scripts/benchmark_divergence_reads.py` compares identical inputs against a
+specified checkout/native library and records first/warm wall time, CPU,
+process peak RSS, read volume, OS I/O counters, cancellation latency and loaded
+source/library hashes. Native dlopen and Python imports are outside its timing;
+first waveform open/index or VCD parse are inside. It never flushes OS caches.
+The existing `benchmark_divergence_trace.py --source-root ...` additionally
+checks independent temporal/graph oracles while counting public calls, event
+reads, native reads and semantic builds; its VCD workloads have zero native
+reads. Hierarchy/scan preparation is outside those trace timings. Reducing
+read calls alone is not a claim of lower elapsed time.
+
 `src/divergence_context.py` freezes each side's exact hierarchy, ordered logs,
 source snapshot and top. Ready driver relays carry those identities into the
 normal public route instead of changing the mutable current session.
@@ -1292,12 +1547,29 @@ normal public route instead of changing the mutable current session.
 `src/dynamic_evidence.py` defines a bounded typed expression contract.
 `src/npi_dynamic.py` obtains cell/port, mux polarity and edge facts from NPI and
 expands generated nets to declared signals/constants. `src/slang_dynamic.py`
-projects typed AST guards, priority and timing into Connectivity IR 1.3;
+projects typed AST guards, priority and timing into Connectivity IR 1.4;
 `src/source_graph_dynamic.py` binds statements and positive port paths to one
 prepared artifact. Old IR versions are cache misses, not implicit dynamic proof.
 The LSF `dynamic_step` request calls the same NPI core. NPI's active-design
 identity is process-wide; fixed elaboration maps distinguish KDB changes while
 transient native lock files do not invalidate an unchanged design.
+
+NPI pseudo selections expand the full typed cell output before selecting its
+ordered declared bits. Typed arithmetic, variable shifts, vector bitwise,
+logical and reduction cells use the shared evaluator. Ambiguous EqComp cells
+(`==` versus `===`), generic OpCells and unproven operand order explicitly
+restart the whole trace on Source Graph. NPI facts are never relabeled as
+Slang evidence. The LSF worker and dynamic step protocols are 2.0.
+
+Slang preserves pure SV operators, casts, packed dimensions, fixed-array leaf
+types, packed fields and net declaration initializers. It samples selected
+array elements only after exact dump metadata binding; array writes never
+reconstruct missing storage. `src/dynamic_selection.py` preserves the entire
+arithmetic computation before projecting result bits, including carries.
+Only an exact reference can establish passthrough; equal numeric values cannot.
+Index differences and changing selected dependencies remain explicit.
+Source Graph build/worker is 3.2, projector schema 1.8, query mapping 1.4 and
+adapter 3.13, so prior expression/cache capabilities cannot silently carry over.
 
 `src/dynamic_observe.py` separates output observation, triggering edge and strict
 predecessor samples; it does not infer simulation scheduling order from integer
@@ -1310,6 +1582,107 @@ backend or artifact discard the graph and restart the original pair with the sam
 again before return. Wave access uses existing locks; backend work stays outside
 them. Metrics contain numeric aggregates only. Static/unsupported semantics and
 incomplete positive Source Graph coverage remain explicit frontiers.
+
+## Bounded X History
+
+`trace_x_source` preserves the same-time `snapshot` mode and adds opt-in `history`.
+History requires `history_start_ps` and a current hierarchy for `compile_log`;
+optional `compile_context` binds an exact hierarchy handle/top as in divergence
+tracing. The compile log must agree with the outer request. The caller still
+owns the waveform-to-compile version relationship; a matching source snapshot
+does not prove a historical waveform came from that compilation. All time
+inputs use the existing TimeSpec resolver. `signal_path` names an exact dump
+declaration; optional `signal_bits` lists ordered declared coordinates (at most
+4,096 bits), preserving generate paths, parameterized ranges and aliases.
+
+The additive `history` payload contains `nodes`, `edges`, `candidates`, `frontier`,
+`coverage` and numeric `operation_metrics`. The legacy `propagation_chain` is
+empty in history mode; `root_cause` remains null/omitted. A known target returns
+`signal_is_clean` for that observation only, with no backend query. Otherwise
+observed graphs remain `partial`; missing prerequisites are `blocked` and
+missing or invalidated observations are `inconclusive`. There is no claim of an
+exclusive source or a proven first origin. Each interval separates the earliest
+observed X/Z in the supplied window from the start of the currently active
+unknown interval. A dump/window prefix already containing X/Z, missing
+predecessor, truncated tail or exhausted window retains its boundary reason.
+
+`src/x_history.py` first locates recorded X/Z, then uses `DynamicRoute` and
+`dynamic_observe` to inspect one supported dynamic statement. Combinational
+dependencies retain the observation time/phase. Registers use a confirmed
+clock edge strictly before a `before` observation, or at/before an `after`
+observation, and sample data/guards strictly before that edge. Reset polarity
+and timing come from typed backend structure, never names. Unexecuted branches
+retain Q; a selected mux's exact ordered Q reference also proves a hold relation.
+Equal X values alone do not prove retention. Previous Q, selected controls and
+data are exposed separately, so recovered present inputs cannot exclude a past
+injection. Same-time changing controls, unknown guards, missing or ambiguous
+clocks, different upstream clock domains and unsupported asynchronous
+structures stop temporal inference. For same-time data changes at a known
+integer-ps scale, a recorded predecessor may extend a bounded candidate path:
+the node carries `sampling_status=candidate_predecessor`, the edge uses
+`candidate_*`, and `predecessor_sampling_candidate` lists unverified scheduling
+and write order. The original `sampling_order_unresolved` frontier remains;
+this is not a supported sampling relation. Precision gaps and uncertain
+controls cannot use this path. Static constant propagation is not historical
+evidence. Full and compact output preserve the same candidate facts and gaps.
+
+History can retain a typed NPI asynchronous boundary with one state driver,
+one clock and at most two reset/set controls. Each control carries a direct
+single-bit expression, pin kind, active level and assertion edge. The optional
+`async_controls` private field is validated at the existing LSF boundary;
+older workers without it keep the previous fallback behavior. Pin kind cannot
+reveal the original reset/set assignment value, including a source X constant,
+so `async_control_value_unmodeled` and temporal/driver frontiers remain. A
+history route keeps these positive NPI observations with an inconclusive,
+partial receipt instead of discarding them on a fallback. Other dynamic routes
+retain their existing fallback policy; one graph still has one provenance.
+
+`src/async_observe.py` reads the typed controls and clock under the same wave
+locks and request observation budgets. Each `async_observation` reports its
+window, observed assertion count/latest time, control level, clock edges and
+whether an edge coincides with the recorded X/Z onset. Missing declarations,
+unknown controls, sub-ps ordering, truncated data and an active window prefix
+without an observed assertion remain separate gaps. Event coincidence may add
+an `async_control_onset_candidate` with executable driver queries for the state
+and control; it never adds a supported temporal edge. Assignment evaluation is
+`not_run`, the value remains `unmodeled`, and `true_origin_proven` remains false.
+Multiple native state writers, unsupported pin types and Source Graph async
+timing still stop at their original incomplete boundaries. No state or waveform
+is retained beyond the existing request cache lifecycle.
+
+`src/x_history_observe.py` consumes PR 04 private event pages under existing wave
+locks. Raw femtoseconds define interval boundaries and timestamp groups; dynamic
+sampling at sub-ps resolution remains an explicit frontier, never a rounded
+replacement value. Cursors/groups close before Source Graph/Static/NPI work.
+Legacy wrappers retain materialized reads, with an explicit mode receipt; an
+unavailable exact timescale prevents temporal inference. FSDB still serializes
+all handles through its process-global lock and cannot cancel within an active
+native call. Initial VCD parsing/FSDB indexing and native signal loading retain
+their existing costs; event limits do not promise bounded physical disk reads.
+
+The request never widens its window. Default/hard limits are 20/64 depth,
+128/1,024 admitted nodes, 65,536/262,144 read events, 32/128 MiB estimated decoded
+event bytes and 30/120 seconds; a node expands at most 16 unknown dependencies.
+At most three whole-graph restarts consume the same cumulative budget. Expression limits remain 256 nodes,
+32 depth and 4,096 selected bits, including after selection projection. The
+ObservationSession cache separately retains its event/byte caps, time coverage
+and offset identity. Node/visited identities include design, backend/artifact,
+file/parser generation, actual declaration, ordered bits, time and phase.
+Every backend/scope-artifact change discards the graph and cached observations
+and restarts the original target. Final wave/source/KDB/parser validation drops
+all stale evidence even after a timeout. No cross-request history or transaction
+cache is introduced.
+
+Partial driver traversal, objective exclusions and testbench/consumer-alias
+cross-checks stay on nodes and frontiers. Positive incomplete statements only
+create candidate relations; unknown, missing or unexecuted checks are never
+negative evidence. Candidate records retain competing hypotheses and explicit
+checked/unchecked boundaries. Read `coverage.checks` separately from its gaps.
+Metrics count read events, ABI/VCD record bytes, conservative decoded bytes,
+wave/page/native calls, backend queries, semantic preparation/builds, elapsed
+time and process/frontend RSS. Record bytes are not physical I/O; process peak
+RSS is lifetime high-water and includes prior preparation. These measurements
+describe bounded work, not an asserted speedup.
 
 ## Structural Scan Invocation
 
@@ -1601,3 +1974,340 @@ cache is not on a shared filesystem. `TRACEWEAVE_NPI_LSF_TIMEOUT` controls
 short connectivity jobs; `TRACEWEAVE_NPI_LSF_KDB_TIMEOUT` separately bounds
 queue wait plus both KDB phases (default 1260 seconds). Scheduler options are
 JSON argv, not shell text, and are limited to scheduler option/value pairs.
+
+## SV waveform expressions
+
+The existing signal-input union adds `WaveformExpression` alongside strings
+and fixed selections. `src/expression_parser.py` performs bounded portable
+parsing and type/context lowering; `src/expression_binding.py` binds exact dump
+declarations and sparse arrays; `src/expression_values.py` supplies shared
+four-state operations. Both frontend projections and public expressions use
+`src/dynamic_evidence.py` for values and selected dependency evidence.
+Type queries use declaration shapes without reading their contents; an optional
+dimension expression is sampled at each observation and retains index evidence.
+
+`src/expression_observe.py` owns request-local derived observations. Point and
+cycle reads reuse real backing values; event reads merge dependency events by
+raw fs time, completing each time group before evaluation. An event predecessor
+is a `dependency_anchor`, not a claimed last output transition. Same-time
+internal changes remain explicit and cannot establish an unambiguous derived
+clock. FSDB groups include real dependencies and never outlive the global wave
+lock; over-capacity groups fall back to bounded sequential declaration reads.
+Cancellation and transaction deadlines remain observable inside these scans.
+
+Window terms, protocol roles, transactions, TL-UL, diff and period reuse the
+same input layer. Derived findings identify their expression and real
+operands; they never manufacture a driver for an `expr@...` display key.
+Signed values retain binary bits; protocol IDs and lengths use their unsigned
+bit patterns. See [expression usage and bounds](expressions.md).
+
+## Packed waveform selections and TL-UL
+
+`WaveformSelection` is an additive input to point, transition, around-time,
+cycle, handshake, and transaction queries. The original string branch retains
+its existing behavior. Structured inputs use one exact dump declaration and
+either `{path, lsb, width}` or `{path, bits}`. A trailing dump range belongs to
+the declaration; it is never interpreted as the requested subfield. `lsb` is
+a declared index and width extends toward the left bound. `bits` is an explicit
+MSB-first ordering of distinct declared indices. Nonzero and negative bounds,
+ascending declarations, existing unambiguous VCD aliases, and separately dumped
+bits/slices retain their identities. No suffix search or fragment concatenation
+proves an otherwise absent declaration.
+
+`SelectionParser` reuses `BitRange` / `SignalSelection` from connectivity IR.
+It checks exact metadata and the parser's file identity before reading, projects
+binary four-state strings before any integer conversion, and returns `bin` plus
+numeric `hex`/`dec` only when every selected bit is known. Result keys ending in
+`@bits(...)` are display keys, not reusable signal paths; the additive
+`selections` receipt carries the declaration, range and ordered bits. Driver
+followups retain real source bit paths and an explicit `signal_selection`.
+Projected transitions coalesce changes in unrelated bits. A pre-window
+`predecessor_kind="declaration_anchor"` anchors the backing declaration's last
+change, not a proven historical change of the selected field. Around-time
+history likewise contains projected backing events, which may repeat a value.
+
+Limits are 128 distinct selections, 4,096 bits per field, 65,536 total selected
+bits and backing-declaration width, 1,048,576 projected sample cells, 16 Mi bits
+of projected work, and 262,144 projected transition rows per field. Exceeding
+projection budgets requests a narrower window instead of silently dropping
+fields. Edge sampling reads each backing declaration once and projects its
+sampled column; VCD storage aliases share that read even with different declared
+coordinates. Only request-local data are retained. A truncated transition
+prefix becomes unknown from its final, possibly incomplete time group onward.
+Cycle results expose `transition_data_truncated` and affected signals; structured
+cycle queries reject an incomplete full-clock read. Window inspections can
+instead return partial evidence over a narrower interval.
+
+`resolve_packed_fields` exports named, including nested, members from the
+existing Source Graph runtime. It requires a reusable content-anchored build
+key, a current compile snapshot, active elaborated instance specialization,
+packed-member type facts, and matching dump/source declaration coordinates.
+Only explicitly projected instances can supply layouts; ancestor port-binding
+fragments cannot. A scoped hierarchy gap alone is acceptable for an explicitly
+projected instance with complete type facts; other semantic gaps and blocking
+diagnostics require an explicit mapping. Compile identity is checked again
+after worker preparation. Missing hierarchy, an unresolved generate edge,
+inactive branches, stale source inputs, budget limits, or missing type evidence
+return `mapping_required`, never a guessed bus profile. Exported selections are
+a snapshot, not a live type handle or proof that a historical waveform was
+generated from today's source. Callers establish that association and re-resolve
+after changes. Semantic preparation runs outside the wave lock; exact dump
+validation uses the normal wave worker and lock.
+
+`inspect_tlul` requires six explicitly mapped controls/IDs:
+`a_valid`, `a_ready`, `a_source`, `d_valid`, `d_ready`, `d_source`. Optional
+opcode/param/size/address/mask/data/user/sink/error fields use the same selection
+contract. It samples the union once, then passes those samples to the existing
+`inspect_handshake` and `reconstruct_transactions` engines. A and D payloads
+belong to their respective valid producers; ready is the opposite side.
+The checks list names acceptance, stall, valid hold, payload hold **during
+continuing stall**, source-ID pairing within known history, matched latency,
+mapped accepted-field capture and, if supplied, sampled reset boundaries.
+It does not add payload-hold checking on the accepting edge, opcode legality,
+request/response opcode or size consistency, source uniqueness, mask/alignment,
+or integrity-code validation. Unknown payloads are retained as evidence rather
+than automatically called illegal data. Missing optional fields are separately
+listed in `unmapped_fields`; `complete` covers only the named implemented checks.
+
+Reset and unknown-reset cycles break handshake history. Reset, uncertain
+acceptance controls, and accepted unknown IDs break transaction correlation;
+the latter conservatively discard both channels' correlation events on that
+edge, while top-level known acceptance counts remain separate. `correlation_breaks`
+counts uncertain boundaries; `unknown_history_clears` counts boundaries that
+actually discarded pending work, separately from observed `reset_clears`.
+Same-edge request/response pairs may have zero latency. Without an initial
+observed reset, carry-in remains unknown even when all visible endpoints match.
+Unmatched responses may predate the window; tail pending requests do not prove
+a hang. The 65,536-cycle analysis cap, unknown history and truncated transitions
+produce partial coverage, with explicit tail labels. `max_transactions` limits
+display, not the checked edge count; all state is bounded by the cycle cap.
+
+These paths keep FSDB's process-global lock, cancellation checkpoints, native
+time conversion, strict windows and predecessor semantics. No new native ABI,
+cross-request waveform result cache or licensed frontend is introduced. The
+existing discovery scope/page budgets, partial coverage, clock ambiguity,
+payload ownership and unconfirmed req/ack exclusions are unchanged. A clean
+mapped interface does not override partial or flagged global sweep evidence.
+
+## Compact evidence output
+
+The inspected waveform, discovery, comparison, X-trace, structural-scan and
+diagnostic tools accept `output_format="compact"`. The default `"full"` retains
+the original JSON shape and formatting. `src/schemas.py` owns the supported tool
+set, `EvidenceOutputOptions`, `CompactEvidenceResult`, the fixed selection
+reference contract, and the shared transaction/TL-UL scalar defaults and bounds.
+Registration derives those properties from the models; dispatch validates them
+before waveform work. The transaction display cap remains 1..65,536 (default
+256), and TL-UL retains its 65,536-cycle default/maximum. Invalid enum/range/type
+values are errors even when an incomplete field mapping would return early.
+
+Compact output is an explicit wire-format change for clients that opt in:
+
+```json
+{"wave_path":"/path/to/run.vcd","output_format":"compact"}
+```
+
+Pass those arguments to `get_waveform_summary`. A TL-UL response uses the same
+envelope contract:
+
+```json
+{
+  "format": "traceweave.compact.v1",
+  "tool": "inspect_tlul",
+  "result": {"selections": [], "channels": {}, "coverage_status": "zero_coverage"},
+  "references": []
+}
+```
+
+The abbreviated example illustrates the envelope, not a complete TL-UL result.
+The actual `result` retains all fields of the full response except exactly
+identical nested selection receipts. For example,
+`{"path":"/result/channels/a/selections","target":"/result/selections"}`
+means the omitted channel receipt is the complete list at the target JSON
+pointer. Only the two channel receipts and the nested transaction receipt can
+be factored; different paths, declared ranges, bit order or contents stay inline.
+There are at most three references, no chains, and no separate evidence table.
+All other result families keep their entire original JSON value within `result`.
+Whitespace is removed; nulls, empty evidence, unknown values, unexecuted checks,
+frontiers, identities and both sides of a comparison retain their original wire
+semantics. Tool errors and missing-prerequisite responses keep their original
+error shape, including on compact requests.
+
+Clients must expand references before validating against the original result
+schema. `src.evidence_output.expand_compact_result(response)` restores that
+exact JSON value and rejects malformed, duplicate or dangling references. This
+is lossless with respect to the already bounded public result, not the entire
+waveform. Analysis limits and existing display caps still apply: read coverage,
+gaps, stop reasons and display truncation independently. Compact mode neither
+recovers omitted transactions nor turns a bounded prefix into complete evidence.
+Request narrower scopes/windows or increase the existing display cap when the
+tool's next action permits it; insufficient retained facts require a new call.
+
+Projection runs after analysis in the existing cancellable worker without a
+waveform lock. It checks cancellation around projection/encoding and between the
+three factoring candidates; an individual Python encoding call is not
+preemptible. It makes no additional waveform/native reads. Temporary JSON
+objects live only for that response; there is no result repository, persistence,
+request coalescing, cache admission, eviction or new pagination API. References
+resolve offline within the captured response after restart, but do not prove
+that its waveform or compiled artifact is still current. Existing `@time`
+cursors and hierarchy handles retain their separate process-scoped lifetimes.
+The existing subtree/file/instance tools remain the way to browse hierarchy.
+
+Diagnostic summaries preserve lexical coverage separately from semantic status,
+scope, checked categories, gaps, propagation and query-artifact disposition.
+Risk totals and returned-risk counts are separate; the legacy `high_risk_count`
+is explicitly labelled as counting displayed risks. Structural output trimming
+preserves the complete checked-category list. Protocol summaries retain discovery
+coverage separately from sweep coverage, window/scope, transition truncation,
+skips, finding summaries and executable next actions. `semantic.status=not_run`,
+partial discovery and zero coverage never become a clean scan. Existing soft
+output-budget accounting uses UTF-8 bytes rather than Unicode character count.
+The budget is a soft limit on minified schema JSON, not a hard transport cap;
+the default indented response can be larger. Diagnostic summary fields are
+additive. Unicode-heavy results can now reach the existing display downgrade
+earlier; their analyzed counts and coverage are still retained.
+
+Reproduce projection costs with `scripts/benchmark_evidence_output.py`: generate
+a packed VCD with `--generate --wave /tmp/packed.vcd --count 2048 --output
+/tmp/unused.json`, then query it using `--source-root`, `--cap`, `--queries` and
+`--output-format full|compact`. Each source/format belongs in a fresh process;
+the script checks independent accepted-edge and payload timing expectations,
+records loaded source/native hashes, parser-open time, sampling/analysis,
+projection, serialization, output rows/bytes, native calls and peak RSS. It does
+not flush OS caches, and excludes imports, conversion and MCP transport.
+Fewer output bytes do not imply fewer reads or lower analysis memory; compact
+projection allocates temporary Python objects and can cost additional CPU/RSS.
+
+## Transaction sampling and bounded facts
+
+`reconstruct_transactions` consumes the existing compact columns through
+`cycle_query.iter_sample_rows`. Each iteration borrows one reusable signal view;
+it does not allocate a signal dictionary or normalized value for every cycle.
+`inspect_tlul` shares those same columns with both handshake inspections and the
+transaction core. Two byte vectors carry reset/uncertain-history boundaries,
+without copying samples or inventing a reset signal. Its private
+`TransactionSampleInput` binds the original parser/epoch, file identity, actual
+declarations and ordered selected bits, roles and ordered payload fields,
+clock/edge/window, fixed 1 ps sample offset, reset polarity and semantic version.
+Identity is captured before sampling and checked again before correlation;
+untyped sample dictionaries, changed files, reopened parsers and incompatible
+mappings cannot be reused. Semantic/layout export remains a separate capability;
+these waveform samples cannot establish a compile-to-waveform association.
+
+`transaction_sampling` adapts bounded event pages to the existing sampler.
+It reads one declaration at a time with the existing `event_readers` context,
+closing the cursor before unloading its FSDB group. Clock transitions are
+released after edge extraction; compact columns keep only sampled value
+references. A per-read normalization table reuses identical four-state values,
+with at most 256 entries and 256 KiB of accounted storage. It is discarded at
+the end of that read, has no cross-request hits or eviction lifecycle, and
+reports hit/miss counts and peak size. Native page reads and every consumption
+loop retain cancellation checks. Missing predecessor values stay unknown;
+unfinished equal-time groups are masked rather than extrapolated. No new native
+ABI or global lock/worker model is introduced.
+
+The fixed transaction budgets are 128 sampled signals plus the clock,
+262,144 samples, 2,097,152 sample
+cells, 1,000,000 admitted events, 256 MiB of conservatively accounted decoded
+events, 16,384 pending requests, 16,384 early data beats, 32 MiB of accounted
+correlation state and a 30 s cooperative analysis deadline. Existing structured
+selection cell/bit limits can lower the sample cap; TL-UL also keeps its 65,536
+cycle cap. Event pages retain the existing 1,024-event/256-KiB limits; a read
+budget may consume one final page whose unused events are reported as read but
+not admitted. File parsing/index memory, FFR residency and the legacy reader's
+single-call decode scratch are outside these accounting limits. Old wrappers
+use the original materialized read and report `legacy_reads`; the new budgets
+bound admission and retained analysis data, not that legacy first-read scratch.
+
+Per-ID FIFO deques, ordered pending/data targets and an early-data deque retain
+same-ID ordering, cross-ID completion order, FIFO mode, W-before-AW, sampled
+reset segmentation, LAST and length checks, and four-state values. Exact latency
+statistics use a bounded histogram. Completed counts, unmatched counts, peaks,
+ordering, length anomalies and timeout-threshold counts cover every analyzed
+edge, including edges after the display cap. Required state is never cleared to
+continue after a budget failure. Read exhaustion admits only the common proven
+column prefix; state exhaustion stops before the next edge and preserves pending
+endpoint evidence. `coverage_status`, `gaps`, `analysis.stop_reason`,
+`analyzed_samples` and `last_time_ps` distinguish partial analysis from a full
+window. Unknown controls/IDs make coverage partial even if every edge was read.
+Tail pending requests and responses without an in-window request do not prove
+a hang or an illegal response. Unknown LAST/length values are not clean-burst
+evidence.
+
+Normalized `TransactionFacts` freeze aggregates and a bounded evidence prefix
+before display and cursor projection. `max_transactions` (1..65,536, default
+256) limits only retained/displayed records; the default shape and correlation
+parameters remain compatible. Transaction record storage has a separate 16 MiB
+accounting cap. Exhausting it marks `analysis.display_status="partial"` and
+`display_stop_reason="result_byte_budget"` while full-window counting continues;
+it does not turn complete counts into an analysis prefix. A larger projection
+of insufficient retained facts reports `retained_fact_prefix` and requires a
+new analysis. Display truncation and cursor naming never change aggregate
+conclusions or the cursor anchor. Unmatched evidence remains limited to 32
+endpoints per side while the counts are complete for the analyzed prefix.
+
+The additive `analysis` receipt reports available/analyzed samples, read versus
+admitted events, binary value bytes, page output bytes, conservative decoded
+bytes, read/page/legacy counts, state/result/table peaks and sampling,
+reconstruction and projection timings. These bytes describe different layers,
+not interchangeable process RSS measures. Benchmark RSS separately with
+`scripts/benchmark_transactions.py`: generate a VCD with `--generate --wave
+/tmp/transactions.vcd --workload dense --size 16384`, then run without
+`--generate`; `--source-root` selects an isolated checkout. The harness also
+provides long-idle, high-outstanding, multibeat and early-write workloads with
+independent arithmetic expectations, first/hot requests, parser-open cost,
+native call counts and serialization timing. OS caches are not flushed and
+these measurements exclude MCP transport.
+
+There is no cross-call transaction result repository or persistent transaction
+cache. The shared TL-UL input and bounded normalization table have request-local
+lifetimes. Repeated benchmark calls alone are not evidence of an actual repeated
+analysis workflow, and a short mapped sample cannot establish a cache benefit
+for long multibeat/high-outstanding workloads. A future cross-call cache needs
+its own source/artifact/selection/semantic identity and lifecycle evidence;
+Source Graph and structural-scan cache keys do not supply that contract.
+
+### Protocol acceptance sampling
+
+`inspect_handshake`, `sweep_handshakes`, `reconstruct_transactions` and
+`inspect_tlul` sample controls, reset and payload strictly **before** each selected
+physical clock edge. Their additive `sampling_phase="before"` receipt describes
+this corrected default. An NBA update at the accepting edge cannot erase a
+transfer or create a false premature deassertion. Every data event at the same
+timestamp is excluded, including groups spanning event pages. This models
+synchronous setup values; the waveform does not prove simulator delta ordering
+for a testbench that drives inputs with blocking assignments at the clock edge.
+
+The private sampler uses raw femtoseconds and retains separate physical edges
+even when their public ceiling-to-picoseconds labels coincide. Missing prefix
+values stay unknown; no point query fills them with a later value. An unknown
+clock or conflicting clock events at one timestamp stops analysis at the proven
+prefix. `transition_data_truncated` remains the compatibility partial-coverage
+flag; warnings or gaps identify `clock_unknown`, `clock_event_order_unresolved`
+or `legacy_sub_ps_order_unavailable`. Old wrappers retain before-edge support
+for integral-ps scales; without raw event paging, sub-ps ordering is unprovable
+and returns partial coverage. No empty result in that path proves a clean bus.
+
+Protocol reads reuse existing native groups and close event cursors before
+unloading, including cancellation and errors. Standalone handshake reads cap
+each signal at 1,000,000 events / 64 MiB decoded accounting; transaction/TL-UL
+reads retain their request budgets above. This bounds retained inputs, not FFR
+residency or parser/index memory. Shared columns and reuse identities include
+the sampling phase. Display caps and cursor names never affect acceptance.
+Sweep metrics distinguish event open/page/close call counts and elapsed ABI
+time from legacy profiled transition reads. Page volume contributes to native
+transition/output totals; unavailable internal seek/traverse phases are not
+inferred from page wall time.
+The general `get_signals_by_cycle` and `verify_window` sampling defaults remain
+unchanged; callers can still inspect post-edge state through those tools.
+
+Dynamic driver observation resolves typed source references to exact dump
+declarations before reading values. A missing FSDB vector suffix is recovered
+only from the source's declared coordinates and exact declaration metadata;
+there is no basename search. Ordered bits, ascending/negative ranges and aliases
+retain their declared meaning. Read paths are local bindings: dependency names
+and A/B mappings retain source identities. X history shares this declaration
+resolver. Missing declarations, invalid coordinates and cancellation retain
+their existing distinct outcomes. Binding does not prove delta-cycle order,
+asynchronous behavior or completeness of the driver inventory.

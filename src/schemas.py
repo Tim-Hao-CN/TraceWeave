@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 import config as _config
 
-from pydantic import BaseModel, ConfigDict, Field, model_serializer
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, WithJsonSchema, model_serializer, model_validator
 
 
 class SchemaModel(BaseModel):
@@ -35,6 +35,79 @@ class SchemaModel(BaseModel):
 
 
 TOKEN_BUDGET_SOFT_LIMIT = 80_000
+
+
+class EvidenceOutputOptions(SchemaModel):
+    output_format: Literal["full", "compact"] = Field(
+        default="full",
+        description=(
+            "full preserves the original result. compact returns a lossless "
+            "traceweave.compact.v1 envelope: result plus response-local selection "
+            "references. Coverage and display limits are unchanged; references "
+            "are JSON pointers, not time cursors or stored result handles."
+        ),
+    )
+
+
+# Only inspected result families opt into the shared presentation contract.
+COMPACT_OUTPUT_TOOLS = frozenset({
+    "get_waveform_summary", "get_signal_at_time", "get_signal_transitions",
+    "get_signals_around_time", "get_signals_by_cycle", "inspect_handshake",
+    "inspect_tlul", "reconstruct_transactions", "resolve_packed_fields",
+    "suggest_handshakes", "suggest_protocol_bundles", "sweep_handshakes",
+    "diff_first_divergence", "trace_divergence", "trace_x_source",
+    "scan_structural_risks", "get_diagnostic_snapshot",
+})
+
+
+class SelectionEvidenceReference(SchemaModel):
+    path: Literal[
+        "/result/channels/a/selections", "/result/channels/d/selections",
+        "/result/transactions/selections",
+    ]
+    target: Literal["/result/selections"] = "/result/selections"
+
+
+class CompactEvidenceResult(SchemaModel):
+    """Lossless projection of the already bounded public result, not a cache."""
+
+    format: Literal["traceweave.compact.v1"] = "traceweave.compact.v1"
+    tool: str
+    result: dict[str, Any]
+    references: list[SelectionEvidenceReference] = Field(default_factory=list, max_length=3)
+
+    @model_validator(mode="after")
+    def validate_references(self):
+        if self.tool not in COMPACT_OUTPUT_TOOLS:
+            raise ValueError("compact_output_tool_unsupported")
+        seen = set()
+        for ref in self.references:
+            if self.tool != "inspect_tlul" or ref.path in seen or not self.result.get("selections"):
+                raise ValueError("compact_evidence_reference_invalid")
+            seen.add(ref.path)
+            parent = self.result
+            for key in ref.path.split("/")[2:-1]:
+                parent = parent.get(key) if isinstance(parent, dict) else None
+            if not isinstance(parent, dict) or "selections" in parent:
+                raise ValueError("compact_evidence_reference_invalid")
+        return self
+
+
+class TransactionDisplayOptions(SchemaModel):
+    max_transactions: StrictInt = Field(
+        default=256, ge=1, le=65536,
+        description=("Display cap only; every admitted sample contributes to analysis. "
+                     "Read analysis.stop_reason separately from display_status."),
+    )
+
+
+class TlulAnalysisOptions(TransactionDisplayOptions):
+    reset_active_low: bool = True
+    edge: Literal["posedge", "negedge"] = "posedge"
+    start_time_ps: int | str = 0
+    end_time_ps: int | str = -1
+    max_cycles: StrictInt = Field(default=65536, ge=1, le=65536)
+    max_wait_cycles: StrictInt = Field(default=16, ge=0)
 
 
 class TruncatableResult(SchemaModel):
@@ -366,6 +439,31 @@ class ScanStructuralRisksResult(TruncatableResult):
     scan_metrics: dict[str, int | str] = Field(default_factory=dict)
 
 
+class StructuralScanSummary(SchemaModel):
+    """Diagnostic projection; lexical, semantic and display coverage stay separate."""
+
+    eligible_file_count: int
+    files_scanned: int
+    coverage_status: str
+    coverage_warnings: list[str]
+    analysis_mode: Literal["fast", "auto", "deep"]
+    lexical_coverage_status: str
+    categories_scanned: list[str]
+    semantic_status: str
+    semantic_fact_count: int
+    semantic_scope: str | None = None
+    semantic_categories_checked: list[str]
+    semantic_gaps: list[str]
+    semantic_propagation: StructuralPropagationReceipt
+    semantic_query_artifact_status: str
+    semantic_output_truncated: bool
+    total_risks: int
+    risks_returned: int
+    display_truncated: bool
+    high_risk_count: int
+    high_risk_count_basis: Literal["displayed_risks"] = "displayed_risks"
+
+
 class ErrorGroup(SchemaModel):
     signature: str
     severity: str
@@ -512,6 +610,9 @@ class WaveformSummaryResult(SchemaModel):
     total_signals: int
     top_modules: list[str] | None = None
     sample_signals: list[str] | None = None
+    metadata_query_mode: Literal["native_v1", "legacy_search"] | None = None
+    sample_signals_order: Literal["lexical", "legacy_ranked"] | None = None
+    top_modules_complete: bool | None = None
     producer_hint: str | None = None
     producer_evidence: str | None = None
 
@@ -544,7 +645,167 @@ class SignalValue(SchemaModel):
     dec: int | None = None
 
 
+class WaveformSelection(SchemaModel):
+    """One exact dump declaration, with ordered declared bits or lsb + width."""
+    path: str = Field(min_length=1, max_length=16384, description="Exact declaration path returned by search_signals.")
+    bits: list[StrictInt] | None = Field(default=None, min_length=1, max_length=4096,
+        description="Unique declared indices, MSB first. Supply bits OR lsb+width.")
+    lsb: StrictInt | None = Field(default=None, description="Declared start index; width extends toward the declaration's left bound.")
+    width: StrictInt | None = Field(default=None, ge=1, le=4096, description="Number of selected bits; requires lsb.")
+
+    @model_validator(mode="after")
+    def validate_selection(self):
+        if self.bits is not None:
+            if self.lsb is not None or self.width is not None:
+                raise ValueError("provide bits OR lsb + width")
+            if len(set(self.bits)) != len(self.bits):
+                raise ValueError("selection bits must be unique")
+        elif self.lsb is None or self.width is None:
+            raise ValueError("provide ordered bits or both lsb and width")
+        return self
+
+
+class WaveformSelectionReceipt(SchemaModel):
+    key: str
+    path: str
+    declared_range: dict[str, int]
+    bits: list[int]
+    width: int
+
+
+class ExpressionMember(SchemaModel):
+    name: str = Field(min_length=1, max_length=256)
+    lsb: StrictInt = Field(ge=0, le=4095, description="Member offset from the packed aggregate's least significant bit.")
+    type: "ExpressionType"
+
+
+# Both bounds have the same type. Publish homogeneous items so clients that
+# support items but discard prefixItems still expose integer bounds to models.
+# Runtime validation and the immutable pair representation remain unchanged.
+ExpressionRange = Annotated[
+    tuple[StrictInt, StrictInt],
+    WithJsonSchema({"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}),
+]
+
+
+class ExpressionType(SchemaModel):
+    """Caller-supplied integral type; width is the packed element width."""
+    width: StrictInt = Field(ge=1, le=4096, description="Total packed bits per element; {width:8} describes unsigned [7:0].")
+    signed: bool = Field(default=False, description="Declared signedness; default unsigned.")
+    two_state: bool = Field(default=False, description="True for two-state; default four-state.")
+    packed: list[ExpressionRange] = Field(default_factory=list, max_length=8,
+        description="Declared [left,right] ranges, outermost first; e.g. [[3,0],[7,0]] for four packed bytes.")
+    unpacked: list[ExpressionRange] = Field(default_factory=list, max_length=8,
+        description="Unpacked [left,right] ranges, outermost first; requires elements or path_template.")
+    members: list[ExpressionMember] = Field(default_factory=list, max_length=128,
+        description="Packed struct/union layout: name, lsb offset, type. For packed arrays, describe the innermost aggregate; its final packed range is the aggregate's flattened bits.")
+
+
+class ExpressionElement(SchemaModel):
+    indices: list[StrictInt] = Field(min_length=1, max_length=8, description="One declared index per unpacked dimension.")
+    signal: str | WaveformSelection
+
+
+class ExpressionArray(SchemaModel):
+    """Sparse elements or a bounded one-dimensional path template."""
+    elements: list[ExpressionElement] = Field(default_factory=list, max_length=128,
+        description="Exact sparse mappings. Missing elements remain missing evidence.")
+    path_template: str | None = Field(default=None, min_length=1, max_length=16384,
+        description="Alternative to elements: one {index}, e.g. tb.mem[{index}][7:0]; expand types.<name>.unpacked (1D, at most 128 elements).")
+
+    @model_validator(mode="after")
+    def check_mapping(self):
+        if self.path_template is not None:
+            if self.elements:
+                raise ValueError("provide elements OR path_template")
+            if self.path_template.count("{index}") != 1 or any(c in self.path_template.replace("{index}", "") for c in "{}"):
+                raise ValueError("path_template requires exactly one {index} and no other placeholders")
+        elif "elements" not in self.model_fields_set:
+            raise ValueError("provide elements OR path_template")
+        return self
+
+
+class WaveformExpression(SchemaModel):
+    """Read-only SV expression, re-evaluated at each sample."""
+    expr: str = Field(min_length=1, max_length=16384,
+        description="SV value expression, e.g. a[i], data[base+:W], valid && ready, or $countones(mask). No assignments, user functions or temporal syntax.")
+    typing: Literal["semantic", "wave_bits"] = Field(default="semantic",
+        description="semantic needs declared types in types; wave_bits opts into unsigned dump-vector inference. Public queries do not load RTL types automatically.")
+    scope: str | None = Field(default=None, max_length=16384,
+        description="Prefix for unbound names, e.g. tb.dut. Explicit bindings override it; this is not a type provider.")
+    bindings: dict[str, str | WaveformSelection | ExpressionArray] = Field(default_factory=dict, max_length=128,
+        description="Names to exact search_signals paths, fixed selections, or array bindings. Bare strings are paths.")
+    types: dict[str, ExpressionType] = Field(default_factory=dict, max_length=128,
+        description="Declared operand types and named cast types. Supply signedness and array/member layout when relevant; dump width alone cannot prove them.")
+    constants: dict[str, str] = Field(default_factory=dict, max_length=128,
+        description="Named integral constants as SV text, e.g. {W: '8'} for a fixed slice width. No automatic parameter/macro lookup.")
+
+
+ExpressionMember.model_rebuild()
+
+
+class ExpressionDependency(SchemaModel):
+    signal: str
+    bits: list[int]
+    width: int
+    role: str
+    value: str | None = None
+
+
+class ExpressionObservation(SchemaModel):
+    time_fs: int
+    time_ps: int
+    phase: Literal['after','before','dependency_anchor']
+    value: str | None = None
+    gaps: list[str] = Field(default_factory=list)
+    dependencies: list[ExpressionDependency] = Field(default_factory=list)
+
+
+class WaveformExpressionReceipt(SchemaModel):
+    key: str
+    expr: str
+    typing: Literal['semantic','wave_bits']
+    kind: Literal['derived'] = 'derived'
+    width: int
+    signed: bool
+    two_state: bool
+    type_sources: dict[str,str] = Field(default_factory=dict)
+    dependencies: list[str] = Field(default_factory=list)
+    observations: list[ExpressionObservation] = Field(default_factory=list)
+    observation_count: int = 0
+    observations_truncated: bool = False
+    coverage_status: Literal['not_observed','complete','partial'] = 'not_observed'
+    gaps: list[str] = Field(default_factory=list)
+    side: Literal['a','b'] | None = None
+    wave_path: str | None = None
+
+
+class TlulFields(SchemaModel):
+    a_valid: str | WaveformSelection | WaveformExpression | None = None
+    a_ready: str | WaveformSelection | WaveformExpression | None = None
+    a_source: str | WaveformSelection | WaveformExpression | None = None
+    a_opcode: str | WaveformSelection | WaveformExpression | None = None
+    a_param: str | WaveformSelection | WaveformExpression | None = None
+    a_size: str | WaveformSelection | WaveformExpression | None = None
+    a_address: str | WaveformSelection | WaveformExpression | None = None
+    a_mask: str | WaveformSelection | WaveformExpression | None = None
+    a_data: str | WaveformSelection | WaveformExpression | None = None
+    a_user: str | WaveformSelection | WaveformExpression | None = None
+    d_valid: str | WaveformSelection | WaveformExpression | None = None
+    d_ready: str | WaveformSelection | WaveformExpression | None = None
+    d_source: str | WaveformSelection | WaveformExpression | None = None
+    d_opcode: str | WaveformSelection | WaveformExpression | None = None
+    d_param: str | WaveformSelection | WaveformExpression | None = None
+    d_size: str | WaveformSelection | WaveformExpression | None = None
+    d_sink: str | WaveformSelection | WaveformExpression | None = None
+    d_data: str | WaveformSelection | WaveformExpression | None = None
+    d_user: str | WaveformSelection | WaveformExpression | None = None
+    d_error: str | WaveformSelection | WaveformExpression | None = None
+
+
 class SignalAtTimeResult(SchemaModel):
+    selections: list[WaveformSelectionReceipt] = Field(default_factory=list)
+    expressions: list[WaveformExpressionReceipt] = Field(default_factory=list)
     signal: str
     time_ps: int
     time_ns: float
@@ -555,6 +816,8 @@ class SignalAtTimeResult(SchemaModel):
 
 
 class SignalTransitionsResult(SchemaModel):
+    selections: list[WaveformSelectionReceipt] = Field(default_factory=list)
+    expressions: list[WaveformExpressionReceipt] = Field(default_factory=list)
     signal: str
     start_ps: int
     end_ps: int
@@ -566,12 +829,15 @@ class SignalTransitionsResult(SchemaModel):
     # remains a strict closed-window list while clock samplers can classify the
     # first in-window edge without rereading the waveform.
     predecessor: dict[str, Any] | None = None
+    predecessor_kind: Literal["declaration_anchor", "dependency_anchor"] | None = None
     truncated: bool = False
     transition_count_is_lower_bound: bool = False
     hint: str | None = None
 
 
 class SignalsAroundTimeResult(SchemaModel):
+    selections: list[WaveformSelectionReceipt] = Field(default_factory=list)
+    expressions: list[WaveformExpressionReceipt] = Field(default_factory=list)
     center_time_ps: int
     center_time_ns: float
     window_ps: int
@@ -600,11 +866,17 @@ class CycleEntry(SchemaModel):
 
 
 class GetSignalsByCycleResult(SchemaModel):
+    selections: list[WaveformSelectionReceipt] = Field(default_factory=list)
+    expressions: list[WaveformExpressionReceipt] = Field(default_factory=list)
+    transition_data_truncated: bool = False
+    transition_signals_truncated: list[str] = Field(default_factory=list)
     clock_path: str
     edge: Literal["posedge", "negedge"]
+    sample_phase: Literal["after", "before"] = "after"
     sample_offset_ps: int = 1
     clock_period_ps: int | None = None
     total_edges_found: int
+    clock_edges_complete: bool = True
     start_cycle: int
     num_cycles_requested: int
     effective_num_cycles: int
@@ -1380,6 +1652,25 @@ class TraceRootCause(SchemaModel):
     source_line: int | None = None
 
 
+class XHistoryEvidence(SchemaModel):
+    """Observed facts and labelled candidates; frontiers never prove exclusion.
+
+    A predecessor_sampling_candidate retains sampling_order_unresolved and
+    uses candidate_* edges. It cannot establish simulator scheduling order.
+    async_observation records typed control/clock events; its assignment value
+    remains unmodeled and async_control_onset_candidate is not causal proof.
+    """
+    status: Literal["partial", "blocked", "inconclusive", "signal_is_clean"]
+    window: dict[str, Any]
+    context: dict[str, Any] = Field(default_factory=dict)
+    nodes: list[dict[str, Any]] = Field(default_factory=list)
+    edges: list[dict[str, Any]] = Field(default_factory=list)
+    candidates: list[dict[str, Any]] = Field(default_factory=list)
+    frontier: list[dict[str, Any]] = Field(default_factory=list)
+    coverage: dict[str, Any] = Field(default_factory=dict)
+    operation_metrics: dict[str, int | float] = Field(default_factory=dict)
+
+
 class TraceXSourceResult(SchemaModel):
     start_signal: str
     start_time_ps: int
@@ -1391,6 +1682,8 @@ class TraceXSourceResult(SchemaModel):
     analysis_guide: dict[str, str] = Field(default_factory=dict)
     backend_status: BackendStatus = Field(default_factory=BackendStatus)
     trace_restarted: bool = False
+    mode: Literal["snapshot", "history"] = "snapshot"
+    history: XHistoryEvidence | None = None
 
 
 class PrerequisiteBlockResult(SchemaModel):
@@ -1407,6 +1700,41 @@ class ToolErrorResult(SchemaModel):
     error_code: str | None = None
     fsdb_runtime: dict[str, Any] | None = None
     fallback: dict[str, Any] | None = None
+
+
+class KeywordLimitErrorResult(ToolErrorResult):
+    error_code: Literal["too_many_keywords"] = "too_many_keywords"
+    parameter: Literal["keyword"] = "keyword"
+    provided_count: StrictInt = Field(gt=0)
+    max_count: StrictInt = Field(gt=0)
+    search_executed: Literal[False] = False
+    recovery: str
+
+
+class CycleInputErrorResult(ToolErrorResult):
+    error_code: Literal["invalid_cycle_arguments"] = "invalid_cycle_arguments"
+    issues: list[str] = Field(min_length=1, max_length=3)
+    sampling_executed: Literal[False] = False
+    recovery: str
+
+
+class ExpressionRecovery(SchemaModel):
+    action: str
+    message: str
+
+
+class ExpressionInputIssue(SchemaModel):
+    parameter: str
+    message: str
+
+
+class ExpressionToolErrorResult(ToolErrorResult):
+    reason: str
+    operand: str | None = None
+    position: int | None = Field(default=None, ge=0)
+    parameter: str | None = None
+    recovery: ExpressionRecovery
+    issues: list[ExpressionInputIssue] = Field(default_factory=list, max_length=16)
 
 
 # ---------------------------------------------------------------------------
@@ -1456,7 +1784,19 @@ class DivergenceNextAction(SchemaModel):
     evidence: dict[str, Any] = Field(default_factory=dict)
 
 
+class ComparisonReading(SchemaModel):
+    mode_a: Literal['native_event_pages_v1', 'vcd_index_pages', 'legacy_materialized', 'event_pages_failed', 'expression_time_groups']
+    mode_b: Literal['native_event_pages_v1', 'vcd_index_pages', 'legacy_materialized', 'event_pages_failed', 'expression_time_groups']
+    events_read: int = Field(default=0, ge=0)
+    pages_read: int = Field(default=0, ge=0)
+    native_read_calls: int | None = Field(default=None, ge=0)
+    record_bytes_read: int | None = Field(default=None, ge=0)
+    byte_basis: Literal['native_abi', 'record_estimate', 'unavailable'] = 'unavailable'
+
+
 class DiffFirstDivergenceResult(SchemaModel):
+    selections: list[WaveformSelectionReceipt] = Field(default_factory=list)
+    expressions: list[WaveformExpressionReceipt] = Field(default_factory=list)
     diverged: bool
     wave_path_a: str
     wave_path_b: str
@@ -1465,6 +1805,7 @@ class DiffFirstDivergenceResult(SchemaModel):
     start_ps: int
     end_ps: int
     first_divergence_time_ps: int | None = None
+    first_divergence_time_fs: int | None = None
     value_a: str | None = None
     value_b: str | None = None
     cursor: CursorRefSchema | None = None
@@ -1482,9 +1823,15 @@ class DiffFirstDivergenceResult(SchemaModel):
     width_a: int | None = None
     width_b: int | None = None
     excluded_intervals: list[dict[str, Any]] = Field(default_factory=list)
+    reading: ComparisonReading | None = None
 
 
 class PeriodResult(SchemaModel):
+    selections: list[WaveformSelectionReceipt] = Field(default_factory=list)
+    expressions: list[WaveformExpressionReceipt] = Field(default_factory=list)
+    period_fs: int | None = None
+    jitter_fs: int | None = None
+    first_off_beat_time_fs: int | None = None
     wave_path: str
     signal: str
     edge: str
@@ -1500,6 +1847,7 @@ class PeriodResult(SchemaModel):
 
 
 class NextAction(SchemaModel):
+    expression_key: str | None = None
     # A forward-link emitted by a bus-fact tool ONLY when it has a concrete
     # finding. Bridges a waveform fact to the next investigation (e.g. attribute a
     # violation to a driving instance). Bus-fact tools never self-attribute
@@ -1508,9 +1856,11 @@ class NextAction(SchemaModel):
     tool: str
     reason: str
     signal_path: str | None = None
+    signal_selection: WaveformSelection | None = None
 
 
 class HandshakeFinding(SchemaModel):
+    expression_key: str | None = None
     type: str
     severity: str
     # long_stall fields
@@ -1550,6 +1900,7 @@ class HandshakeCoverage(SchemaModel):
     # Facts about what inspect_handshake actually evaluated. These are not side
     # or protocol verdicts; discovery/caller context owns those labels.
     clock_sampled: bool = False
+    sampling_gaps: list[str] = Field(default_factory=list)
     valid_ready_resolved: bool = False
     stall_checked: bool = False
     backpressure_checked: bool = False
@@ -1577,6 +1928,9 @@ class HandshakeCoverage(SchemaModel):
 
 
 class HandshakeInspectResult(SchemaModel):
+    sampling_phase: Literal["before"] = "before"
+    selections: list[WaveformSelectionReceipt] = Field(default_factory=list)
+    expressions: list[WaveformExpressionReceipt] = Field(default_factory=list)
     wave_path: str
     clock: str
     valid: str
@@ -1627,6 +1981,7 @@ class HandshakeInspectResult(SchemaModel):
     # is no signal-specific finding. next_actions fires only when a finding
     # exists; it bridges the bus fact to RTL tracing (explain_signal_driver).
     violating_signal: str | None = None
+    violating_expression: str | None = None
     # Structured side attribution for one-sided violations (payload-hold,
     # premature-valid-deassertion). Empty (all None) for a two-sided stall.
     attribution: HandshakeAttribution = Field(default_factory=HandshakeAttribution)
@@ -1646,6 +2001,8 @@ class HandshakeBundle(SchemaModel):
     confidence: str
     rationale: str
     needs: list[str] = Field(default_factory=list)
+    handshake_semantics: Literal["valid_ready", "requires_confirmation"] = "valid_ready"
+    signal_directions: dict[str, str] = Field(default_factory=dict)
 
 
 class SignalDiscoveryCoverage(SchemaModel):
@@ -1653,6 +2010,18 @@ class SignalDiscoveryCoverage(SchemaModel):
     signal_limit: int = 65_536
     signals_returned: int = 0
     reasons: list[str] = Field(default_factory=list)
+    mode: Literal["paged", "native_scope_v1", "vcd_scope_v1", "legacy_search"] | None = None
+    pages_read: int | None = None
+    signals_scanned: int | None = None
+    scan_limit: int | None = None
+    bytes_returned: int | None = None
+    byte_limit: int | None = None
+    resident_bytes_estimate: int | None = None
+    memory_limit: int | None = None
+    scope_signals_returned: int | None = None
+    scope_total: int | None = None
+    scope_total_lower_bound: int | None = None
+    ancestor_signals_returned: int | None = None
 
 
 class SuggestHandshakesResult(SchemaModel):
@@ -1773,6 +2142,7 @@ class FindingSummary(SchemaModel):
 
 
 class HandshakeSweepResult(SchemaModel):
+    sampling_phase: Literal["before"] = "before"
     wave_path: str
     scope: str | None = None
     edge: str = "posedge"
@@ -1800,6 +2170,25 @@ class HandshakeSweepResult(SchemaModel):
     reason: str | None = None
 
 
+class ProtocolHealthSummary(SchemaModel):
+    sampling_phase: Literal["before"] = "before"
+    interfaces_inspected: int
+    flagged_count: int
+    discovered_count: int
+    truncated: bool
+    coverage_status: Literal["complete", "truncated", "zero_coverage", "degraded"]
+    coverage_warnings: list[str]
+    suggested_next_actions: list[dict[str, Any]]
+    scope: str | None = None
+    start_ps: int
+    end_ps: int
+    edge: str
+    discovery: dict[str, SignalDiscoveryCoverage]
+    finding_summary: FindingSummary | None = None
+    transition_truncated_count: int
+    skipped_count: int
+
+
 class VerifyEvidence(SchemaModel):
     time_ps: int
     cycle_index: int
@@ -1807,6 +2196,10 @@ class VerifyEvidence(SchemaModel):
 
 
 class WindowVerifyResult(SchemaModel):
+    selections: list[WaveformSelectionReceipt] = Field(default_factory=list)
+    expressions: list[WaveformExpressionReceipt] = Field(default_factory=list)
+    transition_data_truncated: bool = False
+    coverage_status: Literal["complete","partial","zero_coverage"] = "zero_coverage"
     wave_path: str
     clock: str
     edge: str = "posedge"
@@ -1837,6 +2230,7 @@ class WindowVerifyResult(SchemaModel):
     # violating_signal + next_actions: see HandshakeInspectResult. sequence mode
     # populates these on an address/stride violation (master-driven signal).
     violating_signal: str | None = None
+    violating_expression: str | None = None
     next_actions: list[NextAction] = Field(default_factory=list)
     cursor: CursorRefSchema | None = None
     reason: str | None = None
@@ -1882,7 +2276,41 @@ class TxnEndpoint(SchemaModel):
     completion_time_ps: int | None = None
 
 
+class TxnAnalysis(SchemaModel):
+    available_samples: int = 0
+    analyzed_samples: int = 0
+    last_time_ps: int | None = None
+    stop_reason: str | None = None
+    events_read: int = 0
+    events_admitted: int = 0
+    value_bytes_read: int = 0
+    value_reuse_hits: int = 0
+    value_reuse_misses: int = 0
+    value_table_peak_entries: int = 0
+    value_table_peak_bytes: int = 0
+    decoded_bytes: int = 0
+    read_output_bytes: int = 0
+    read_pages: int = 0
+    read_calls: int = 0
+    legacy_reads: int = 0
+    peak_pending: int = 0
+    peak_early_data: int = 0
+    state_peak_bytes: int = 0
+    result_bytes: int = 0
+    display_status: Literal["complete", "partial"] = "complete"
+    display_stop_reason: str | None = None
+    sample_ms: float = 0.0
+    walk_ms: float = 0.0
+    projection_ms: float = 0.0
+
+
 class TxnReconstructResult(SchemaModel):
+    sampling_phase: Literal["before"] = "before"
+    coverage_status: Literal["complete", "partial", "zero_coverage"] = "zero_coverage"
+    gaps: list[str] = Field(default_factory=list)
+    analysis: TxnAnalysis = Field(default_factory=TxnAnalysis)
+    selections: list[WaveformSelectionReceipt] = Field(default_factory=list)
+    expressions: list[WaveformExpressionReceipt] = Field(default_factory=list)
     wave_path: str
     clock: str
     edge: str = "posedge"
@@ -1898,7 +2326,9 @@ class TxnReconstructResult(SchemaModel):
     max_outstanding_id: int | None = None
     reorder_count: int = 0
     unknown_id_beats: int = 0
+    unknown_control_cycles: int = 0
     reset_clears: int = 0
+    unknown_history_clears: int = 0
     orphan_data_beats: int = 0
     # transactions whose observed beat_count != AxLEN+1 (needs req_len). 0 when
     # req_len was not supplied — a fact, not a clean-burst verdict in that case.
@@ -1916,6 +2346,46 @@ class TxnReconstructResult(SchemaModel):
     reason: str | None = None
     warnings: list[str] = Field(default_factory=list)
     signal_errors: dict[str, str] = Field(default_factory=dict)
+
+
+class TlulInspectResult(SchemaModel):
+    sampling_phase: Literal["before"] = "before"
+    wave_path: str
+    clock: str
+    start_ps: int
+    end_ps: int
+    coverage_status: Literal["zero_coverage", "partial", "complete"]
+    mapping_status: Literal["explicit", "mapping_required"]
+    required_fields: list[str] = Field(default_factory=list)
+    unmapped_fields: list[str] = Field(default_factory=list)
+    checks: list[str] = Field(default_factory=list)
+    gaps: list[str] = Field(default_factory=list)
+    channels: dict[str, HandshakeInspectResult] = Field(default_factory=dict)
+    transactions: TxnReconstructResult | None = None
+    field_facts: dict[str, dict[str, int]] = Field(default_factory=dict)
+    sample_count: int = 0
+    sample_limit_reached: bool = False
+    transition_data_truncated: bool = False
+    unknown_fields: dict[str, int] = Field(default_factory=dict)
+    unknown_control_cycles: int = 0
+    unknown_reset_cycles: int = 0
+    unknown_id_beats: int = 0
+    reset_cycles: int = 0
+    correlation_breaks: int = 0
+    accepted_a_count: int = 0
+    accepted_d_count: int = 0
+    carry_in: str
+    tail: str
+    warnings: list[str] = Field(default_factory=list)
+    selections: list[WaveformSelectionReceipt] = Field(default_factory=list)
+    expressions: list[WaveformExpressionReceipt] = Field(default_factory=list)
+
+
+class PackedFieldsResult(SchemaModel):
+    status: Literal["resolved", "mapping_required"]
+    fields: dict[str, WaveformSelection] = Field(default_factory=dict)
+    reasons: list[str] = Field(default_factory=list)
+    evidence: dict[str, Any] = Field(default_factory=dict)
 
 
 class DistValueCount(SchemaModel):
@@ -1961,6 +2431,25 @@ class DiffValueDistributionResult(SchemaModel):
 
 
 # Explicit dual-context divergence tracing; no mutable current-session defaults.
+class XHistoryInput(SchemaModel):
+    mode: Literal["history"] = "history"
+    wave_path: str = Field(min_length=1)
+    signal_path: str = Field(min_length=1)
+    signal_bits: list[StrictInt] | None = Field(default=None, min_length=1, max_length=4096)
+    time_ps: int | str
+    compile_log: str = Field(min_length=1)
+    simulator: str = "auto"
+    top_hint: str | None = None
+    compile_context: DivergenceContext | None = None
+    history_start_ps: int | str
+    phase: Literal["before", "after"] = "after"
+    max_depth: int = Field(default=_config.DEFAULT_X_TRACE_MAX_DEPTH, ge=0, le=64)
+    max_nodes: int = Field(default=128, ge=1, le=1024)
+    max_events: int = Field(default=65536, ge=1, le=262144)
+    max_read_bytes: int = Field(default=32 * 1024 * 1024, ge=1024, le=128 * 1024 * 1024)
+    timeout_sec: float = Field(default=30, gt=0, le=120)
+
+
 class DivergenceSide(DivergenceContext):
     wave_path: str = Field(min_length=1)
     signal_path: str = Field(min_length=1)

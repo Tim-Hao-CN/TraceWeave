@@ -10,11 +10,12 @@ import re
 
 from .cancellation import check_cancelled, OperationCancelled
 from .dynamic_evidence import DYNAMIC_VERSION, Expr, TRUE, expression_gaps, unsupported_step
+from .dynamic_selection import select_expression
 
 _MAX_STATES = 256
 _MAX_DEPTH = 32
 _MAX_PINS = 64
-_SELECT = re.compile(r"\[-?\d+(?::-?\d+)?\]$")
+_SELECT = re.compile(r"(?:\[-?\d+(?::-?\d+)?\]#)?\[-?\d+(?::-?\d+)?\]$")
 
 
 class ProjectionGap(Exception):
@@ -40,12 +41,16 @@ def query_step(backend, signal: str) -> dict:
     def reference(net):
         width = int(net.size())
         left, right = int(net.left()), int(net.right())
+        if not 1 <= width <= 4096 or abs(left-right)+1 != width:
+            raise ProjectionGap('dynamic_bit_mapping_unavailable')
         bits = tuple(range(left, right + (-1 if left > right else 1), -1 if left > right else 1))
         base = _SELECT.sub("", net.full_name())
         declaration = netlist.get_net(base)
         if declaration is None:
             raise ProjectionGap("signal_declaration_unavailable")
         dl, dr = int(declaration.left()), int(declaration.right())
+        if abs(dl-dr) >= 4096:
+            raise ProjectionGap('dynamic_expression_limit')
         declared = tuple(range(dl, dr + (-1 if dl > dr else 1), -1 if dl > dr else 1))
         return Expr("signal", width, signal=base, bits=bits, declared_bits=declared,
                     signed=bool(net.is_signed()))
@@ -78,8 +83,13 @@ def query_step(backend, signal: str) -> dict:
         if visited > _MAX_STATES or depth > _MAX_DEPTH:
             raise ProjectionGap("dynamic_expression_limit")
         width = int(net.size())
+        if not 1 <= width <= 4096:
+            raise ProjectionGap('dynamic_expression_limit')
         if net.is_literal():
-            return Expr("const", width, value=str(net.value()).lower(), signed=bool(net.is_signed()))
+            value = str(net.value()).lower()
+            if len(value)!=width or any(c not in '01xz' for c in value):
+                raise ProjectionGap('literal_type_unresolved')
+            return Expr("const", width, value=value, signed=bool(net.is_signed()))
         if net.type() == "npiNlConcatNet":
             names = bounded(net.actual_name_list() or [])
             children = [netlist.get_net(n) for n in names]
@@ -110,6 +120,27 @@ def query_step(backend, signal: str) -> dict:
                 return expand(linked, depth+1)
             cell_type = scope.cell_type()
             pins = bounded(scope.instport_list() or [])
+            outputs = [p.connected_net() for p in pins if p.direction() == "npiNlOutput"]
+            outputs = [n for n in outputs if n is not None and
+                       _SELECT.sub('', n.full_name()) == _SELECT.sub('', net.full_name())]
+            if len(outputs) != 1:
+                raise ProjectionGap('dynamic_bit_mapping_unavailable')
+            output = outputs[0]
+            if output is not None and (int(output.left()), int(output.right()), int(output.size())) != (
+                    int(net.left()), int(net.right()), width):
+                # A pseudo net may select only part of a generated cell output.
+                # Expand the full cell first, then project exact native indices;
+                # using the pseudo width as the mux's width selects wrong lanes.
+                if _SELECT.sub('', output.full_name()) != _SELECT.sub('', net.full_name()):
+                    raise ProjectionGap('dynamic_bit_mapping_unavailable')
+                left, right = int(output.left()), int(output.right())
+                declared = tuple(range(left, right + (-1 if left > right else 1), -1 if left > right else 1))
+                left, right = int(net.left()), int(net.right())
+                selected = tuple(range(left, right + (-1 if left > right else 1), -1 if left > right else 1))
+                if len(declared) != int(output.size()) or len(selected) != width or not set(selected).issubset(declared):
+                    raise ProjectionGap('dynamic_bit_mapping_unavailable')
+                return select_expression(expand(output, depth + 1, force=True),
+                                         tuple(declared.index(bit) for bit in selected))
             inputs = [p for p in pins if p.direction() == "npiNlInput"]
             result["sources"].append({"cell": scope.full_name(), "kind": cell_type, "location": scope.src_info()})
             def linked(p):
@@ -120,13 +151,30 @@ def query_step(backend, signal: str) -> dict:
             if cell_type == "npiNlFlipFlopCell":
                 clocks = [p for p in inputs if p.port_type() == "npiNlClockPort"]
                 data = [p for p in inputs if p.port_type() == "npiNlDataPort"]
-                if depth != 0 or len(clocks) != 1 or len(data) != 1 or len(inputs) != 2:
+                controls = [p for p in inputs if p.port_type() in {'npiNlAsyncResetPort', 'npiNlAsyncSetPort'}]
+                if depth != 0 or len(clocks) != 1 or len(data) != 1 or len(controls) > 2 or len(inputs) != 2 + len(controls):
                     raise ProjectionGap("temporal_context_unavailable")
                 edge = {"npiNlRisingActive": "posedge", "npiNlFallingActive": "negedge"}.get(clocks[0].port_state())
                 clock = linked(clocks[0])
                 if edge is None or clock.op != "signal" or clock.width != 1:
                     raise ProjectionGap("temporal_context_unavailable")
                 result.update(boundary="sequential", clock={"expression": asdict(clock), "edge": edge})
+                if controls:
+                    facts = []
+                    for p in controls:
+                        control = linked(p)
+                        active_value = {'npiNlHighActive': '1', 'npiNlLowActive': '0'}.get(p.port_state())
+                        if control.op != 'signal' or control.width != 1 or active_value is None:
+                            raise ProjectionGap('temporal_context_unavailable')
+                        facts.append(dict(kind='reset' if p.port_type() == 'npiNlAsyncResetPort' else 'set',
+                            expression=asdict(control), active_value=active_value,
+                            assertion_edge='posedge' if active_value == '1' else 'negedge'))
+                    # Native pin kind/polarity does not encode the original
+                    # assigned value (including RTL X). Retain observation
+                    # targets, never infer a reset-to-zero/set-to-one value.
+                    result['async_controls'] = facts
+                    result['gaps'].append('temporal_context_unavailable')
+                    return Expr('unsupported', width, reason='async_control_value_unmodeled')
                 return linked(data[0])
             if cell_type == "npiNlMuxCell":
                 controls = [p for p in inputs if p.port_type() == "npiNlControlPort"]
@@ -137,22 +185,71 @@ def query_step(backend, signal: str) -> dict:
                 annotated = {p.cond_annot(): p for p in data}
                 if cond.width != 1 or set(annotated) != {"1'b1", "1'b0"}:
                     raise ProjectionGap("guard_unresolved")
-                return Expr("mux", width, (cond, linked(annotated["1'b1"]), linked(annotated["1'b0"])))
-            op = {"npiNlLogAndCell": "and", "npiNlLogOrCell": "or", "npiNlNotCell": "not",
-                  "npiNlEqCompCell": "eq", "npiNlNotEqCompCell": "ne"}.get(cell_type)
-            operands = tuple(linked(p) for p in sorted(inputs, key=lambda p: p.port_order() or 0))
-            if cell_type in {"npiNlBufCell", "npiNlAssignCell"} and len(operands) == 1 and operands[0].width == width:
+                operands = []
+                for annotation in ("1'b1", "1'b0"):
+                    value = linked(annotated[annotation])
+                    if value.width < width:
+                        raise ProjectionGap('operand_type_unresolved')
+                    # A directly assigned narrow output also truncates wider
+                    # mux inputs. Keep only the contributing declared bits.
+                    operands.append(select_expression(value, tuple(range(value.width - width, value.width))))
+                return Expr("mux", width, (cond, *operands))
+            ordered = sorted(inputs, key=lambda p: p.port_order() if p.port_order() is not None else -1)
+            if [p.port_order() for p in ordered] != list(range(len(inputs))):
+                raise ProjectionGap('operand_order_unresolved')
+            operands = tuple(linked(p) for p in ordered)
+            states = [p.port_state() for p in ordered]
+            if any(state not in {'npiNlHighActive','npiNlLowActive'} for state in states):
+                raise ProjectionGap('operand_polarity_unresolved')
+            logical = {'npiNlLogAndCell':'&&','npiNlLogOrCell':'||','npiNlNotCell':'not'}
+            bitwise = {'npiNlAndCell':'&','npiNlOrCell':'|','npiNlXorCell':'^','npiNlXNorCell':'~^',
+                       'npiNlNandCell':'&','npiNlNorCell':'|'}
+            unary = {'npiNlNegCell':'~','npiNlMinusCell':'u-',
+                     'npiNlAndReduCell':'reduce_&','npiNlOrReduCell':'reduce_|',
+                     'npiNlXorReduCell':'reduce_^','npiNlNandReduCell':'reduce_~&',
+                     'npiNlNorReduCell':'reduce_~|','npiNlXNorReduCell':'reduce_~^'}
+            arithmetic = {'npiNlAdderCell':'+','npiNlSubCell':'-','npiNlMulCell':'*',
+                          'npiNlDivCell':'/','npiNlModCell':'%','npiNlExpCell':'**',
+                          'npiNlShiftLeftCell':'<<','npiNlShiftRightCell':'>>','npiNlSlaCell':'<<<',
+                          'npiNlSraCell':'>>>','npiNlGreateCompCell':'>','npiNlGreateEqCompCell':'>=',
+                          'npiNlLessCompCell':'<','npiNlLessEqCompCell':'<='}
+            # Netlist EqComp loses == versus ===. OpCell also loses its
+            # original operation and packed dimensions. Let the route restart
+            # on Source Graph; pin count and generated names cannot prove it.
+            if cell_type in {'npiNlEqCompCell','npiNlNotEqCompCell','npiNlOpCell','npiNlUnsignedCell'}:
+                raise ProjectionGap('npi_operator_semantics_unresolved')
+            op = logical.get(cell_type) or bitwise.get(cell_type) or unary.get(cell_type) or arithmetic.get(cell_type)
+            if cell_type in logical or cell_type in bitwise:
+                operands = tuple(Expr('not' if cell_type in logical else '~',
+                    1 if cell_type in logical else value.width,(value,),signed=value.signed)
+                    if state == 'npiNlLowActive' else value for value,state in zip(operands,states))
+            elif any(state != 'npiNlHighActive' for state in states):
+                raise ProjectionGap('operand_polarity_unresolved')
+            if cell_type in arithmetic and arithmetic[cell_type] not in {'+','*'}:
+                # Detailed RTL's order for synthetic operands is extraction
+                # order, not a reliable left/right expression ordering.
+                if any(p.connected_net().is_generated() for p in ordered):
+                    raise ProjectionGap('operand_order_unresolved')
+            if cell_type in {'npiNlBufCell','npiNlAssignCell'} and len(operands)==1 and operands[0].width==width:
                 return operands[0]
-            if op and (len(operands) == 2 or op == "not" and len(operands) == 1):
-                if op == "not" and operands[0].width != 1:
-                    raise ProjectionGap("dynamic_evidence_unavailable")
-                return Expr(op, width, operands)
-            return Expr("unsupported", width, operands, reason="dynamic_evidence_unavailable")
+            expected = 1 if cell_type in unary or op=='not' else 2
+            if op and len(operands)==expected:
+                signed = (operands[0].signed if op in {'<<','>>','<<<','>>>','**'} else
+                          all(a.signed for a in operands))
+                if op in {'~','u-'} and operands[0].width != width:
+                    operands = (Expr('cast',width,(operands[0],),signed=signed),)
+                value = Expr(op,width,operands,signed=signed)
+                if cell_type in {'npiNlNandCell','npiNlNorCell'}:
+                    value = Expr('~',width,(value,),signed=signed)
+                return value
+            return Expr('unsupported',width,operands,reason='npi_operator_semantics_unresolved')
         finally:
             active.remove(key)
 
     try:
-        result["bits"] = list(reference(root).bits)
+        state = reference(root)
+        result["bits"] = list(state.bits)
+        result["state"] = asdict(state)
         value = expand(root, force=True)
         result["gaps"].extend(expression_gaps(value))
         if result["boundary"] != "input":

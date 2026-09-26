@@ -5,9 +5,15 @@ The public API matches FSDBParser.
 """
 
 import re
+from array import array
+from contextlib import contextmanager
 from bisect import bisect_left, bisect_right
 from operator import itemgetter
+from itertools import islice
 from pathlib import Path
+from .cancellation import check_cancelled
+from .scope_metadata import (PAGE_ITEMS, PAGE_BYTES, PAGE_SCAN, ScopeCursor,
+                             ScopeIdentityChanged, file_identity, normalize_scope, page_limits)
 
 from src.waveform_hints import annotate_signal_search_result, normalize_vcd_producer
 from src.clock_edge_cache import ClockCacheToken
@@ -29,12 +35,33 @@ class VCDParser:
         self._path_to_sym: dict = {}        # full_path → symbol
         self._range_aliases: set[str] = set()  # exact ranges hidden from search when a base alias exists
         self._transitions: dict = {}        # symbol → [(time_ps, value)]
+        self._raw_ticks = {}  # Only sub-ps scales need an extra compact index.
+        self._end_time_fs = 0
+        self._event_order_valid = True
         self._end_time_ps     = 0
         self._top_modules: list = []
         self._producer_hint: str | None = None
         self._producer_evidence: str | None = None
+        self._scope_ends: dict[str, tuple[int, ...]] = {}
+        self._scope_index = None
+        self._scope_epoch = object()
+        self._parsed_identity = None
+        self._declared_ranges = {}
+        self._declaration_aliases = {}
 
     # ── Public API ────────────────────────────────────────────────
+
+    def _supports_event_pages(self):
+        return True
+
+    @contextmanager
+    def _event_pages(self, path, start=0, end=-1, *, max_events=1024, max_bytes=262144):
+        from .event_pages import VcdEventReader
+        reader = VcdEventReader(self, path, start, end, max_events, max_bytes)
+        try:
+            yield reader
+        finally:
+            reader.close()
 
     def get_value_at_time(self, signal_path: str, time_ps: int) -> dict:
         self._ensure_parsed()
@@ -117,7 +144,7 @@ class VCDParser:
             "truncated":      False,
         }
 
-    def get_summary(self) -> dict:
+    def get_header(self) -> dict:
         self._ensure_parsed()
         if self._end_time_ps == 0:
             for transitions in self._transitions.values():
@@ -132,11 +159,77 @@ class VCDParser:
             "simulation_duration_ps": self._end_time_ps,
             "simulation_duration_ns": self._end_time_ps / 1000,
             "total_signals":          len(self._signals),
-            "top_modules":            self._top_modules,
-            "sample_signals":         list(self._path_to_sym.keys())[:20],
             "producer_hint":           self._producer_hint,
             "producer_evidence":       self._producer_evidence,
         }
+
+    def get_summary(self) -> dict:
+        return {**self.get_header(), "top_modules": list(self._top_modules),
+                "sample_signals": list(islice(self._path_to_sym, 20))}
+
+    def enumerate_scope_page(self, scope: str | None = None, *, cursor=None,
+                             direct: bool = False, max_items: int = PAGE_ITEMS,
+                             max_bytes: int = PAGE_BYTES, max_visited: int = PAGE_SCAN) -> dict:
+        """Page over references to existing declarations, without full metadata copies."""
+        check_cancelled()
+        scope = normalize_scope(scope)
+        if "\0" in scope:
+            raise ValueError("scope contains NUL")
+        max_items, max_bytes, max_visited = page_limits(max_items, max_bytes, max_visited)
+        self._ensure_parsed()
+        try:
+            identity = file_identity(self.file_path)
+        except OSError as exc:
+            raise ScopeIdentityChanged("waveform disappeared during scope enumeration") from exc
+        if identity != self._parsed_identity:
+            raise ScopeIdentityChanged("VCD changed after parsing; obtain a new parser")
+        if cursor is not None:
+            if not isinstance(cursor, ScopeCursor):
+                raise ValueError("invalid scope cursor")
+            cursor.validate(self._scope_epoch, identity, scope, direct)
+        if self._scope_index is None:
+            self._scope_index = tuple(sorted(p for p in self._path_to_sym if p not in self._range_aliases))
+        check_cancelled()
+        paths = self._scope_index
+        prefix = scope + "." if scope else ""
+        index = bisect_left(paths, cursor.next_path if cursor else prefix)
+        rows, visited, nbytes, reason = [], 0, 0, None
+        while index < len(paths) and paths[index].startswith(prefix):
+            check_cancelled()
+            path = paths[index]
+            if len(rows) >= max_items:
+                reason = "page_items"
+                break
+            if visited >= max_visited:
+                reason = "page_scan"
+                break
+            visited += 1
+            ends = self._scope_ends[path]
+            if scope and len(scope) not in ends:
+                index += 1
+                continue
+            if direct and ends and ends[-1] > len(scope):
+                child_end = next(end for end in ends if end > len(scope))
+                index = bisect_left(paths, path[:child_end] + "/", lo=index + 1)
+                continue
+            size = 20 + len(path.encode())
+            if size > max_bytes - nbytes:
+                reason = "page_bytes"
+                break
+            parent_end = ends[-1] if ends else 0
+            signal = self._signals[self._path_to_sym[path]]
+            rows.append({"path": path, "name": path[parent_end + bool(parent_end):],
+                         "scope": path[:parent_end], "width": signal["width"],
+                         "direction": None, "var_type": signal.get("var_type")})
+            nbytes += size
+            index += 1
+        if file_identity(self.file_path) != identity:
+            raise ScopeIdentityChanged("VCD changed during scope enumeration")
+        complete = index == len(paths) or not paths[index].startswith(prefix)
+        return {"results": rows, "complete": complete,
+                "cursor": None if complete else ScopeCursor(self._scope_epoch, identity, scope, direct, paths[index]),
+                "visited": visited, "bytes_returned": nbytes, "mode": "vcd_scope_v1",
+                "stop_reason": None if complete else reason}
 
     def search_signals(self, keyword: str, max_results: int = 100) -> dict:
         """Search signals in a VCD using the in-memory path index.
@@ -171,11 +264,30 @@ class VCDParser:
         sym = self._resolve(signal_path)
         return int(self._signals[sym]["width"])
 
+    def get_signal_declaration(self, signal_path: str) -> dict:
+        """Exact path/alias metadata for projection, without suffix guessing."""
+        check_cancelled()
+        self._ensure_parsed()
+        if file_identity(self.file_path) != self._parsed_identity:
+            raise ScopeIdentityChanged("VCD changed after parsing; obtain a new parser")
+        if signal_path not in self._path_to_sym:
+            raise KeyError(f"Exact dump declaration not found: {signal_path}")
+        path = self._declaration_aliases.get(signal_path, signal_path)
+        symbol = self._path_to_sym[path]
+        left, right = self._declared_ranges[path]
+        return {"path": path, "width": self._signals[symbol]["width"],
+                "declared_range": {"left": left, "right": right},
+                "identity": self._parsed_identity, "storage_key": symbol}
+
     # ── Internal ────────────────────────────────────────────────────
 
     def _ensure_parsed(self):
         if not self._parsed:
+            identity = file_identity(self.file_path)
             self._parse()
+            if file_identity(self.file_path) != identity:
+                raise ScopeIdentityChanged("VCD changed while parsing")
+            self._parsed_identity = identity
             self._parsed = True
 
     def _resolve(self, signal_path: str) -> str:
@@ -206,7 +318,9 @@ class VCDParser:
             self._timescale_fs = _parse_timescale_fs(self._timescale_raw)
 
         scope_stack   = []
+        scope_ends = ()
         current_ps    = 0
+        ticks         = 0
         tokens        = content.split()
         ranged_declarations: dict[str, set[str]] = {}
         i = 0
@@ -215,12 +329,14 @@ class VCDParser:
             if tok == "$scope":
                 scope_name = tokens[i + 2] if i + 2 < len(tokens) else "unknown"
                 scope_stack.append(scope_name)
+                scope_ends += ((scope_ends[-1] + 1 if scope_ends else 0) + len(scope_name),)
                 if len(scope_stack) == 1 and scope_name not in self._top_modules:
                     self._top_modules.append(scope_name)
                 i += 4
             elif tok == "$upscope":
                 if scope_stack:
                     scope_stack.pop()
+                    scope_ends = scope_ends[:-1]
                 i += 2
             elif tok == "$var":
                 # $var <var_type> <size> <id> <reference> [index/range] $end
@@ -242,7 +358,15 @@ class VCDParser:
                     ranged_declarations.setdefault(base, set()).add(full)
                 self._signals[symbol]     = {"path": full, "width": width, "var_type": var_type}
                 self._path_to_sym[full]   = symbol
+                from .waveform_selection import declaration_range
+                # Parse separately supplied range syntax independently of an
+                # escaped identifier. Preserve attached bit/slice declarations.
+                declared = declaration_range("v" + selection if selection else full, width)
+                self._declared_ranges[full] = (declared.left, declared.right)
+                self._scope_ends[full] = scope_ends
                 self._transitions.setdefault(symbol, [])
+                if self._timescale_fs % 1000:
+                    self._raw_ticks.setdefault(symbol, array('Q'))
                 i = end + 1
             elif tok.startswith("#"):
                 try:
@@ -250,9 +374,13 @@ class VCDParser:
                     # sub-ps transition time is reported as the next integer
                     # ps, so querying at a reported timestamp always lands
                     # at-or-after the transition. Exact for >=1ps timescales.
-                    ticks = int(tok[1:])
+                    next_ticks = int(tok[1:])
+                    if next_ticks < ticks:
+                        self._event_order_valid = False
+                    ticks = next_ticks
                     current_ps = (ticks * self._timescale_fs + 999) // 1000
                     self._end_time_ps = max(self._end_time_ps, current_ps)
+                    self._end_time_fs = max(self._end_time_fs, ticks * self._timescale_fs)
                 except ValueError:
                     pass
                 i += 1
@@ -262,12 +390,16 @@ class VCDParser:
                     sym = tokens[i + 1]
                     if sym in self._transitions:
                         self._transitions[sym].append((current_ps, val))
+                        if sym in self._raw_ticks:
+                            self._raw_ticks[sym].append(ticks)
                 i += 2
             elif len(tok) >= 2 and tok[0] in "01xXzZ":
                 val = tok[0]
                 sym = tok[1:]
                 if sym in self._transitions:
                     self._transitions[sym].append((current_ps, val))
+                    if sym in self._raw_ticks:
+                        self._raw_ticks[sym].append(ticks)
                 i += 1
             else:
                 i += 1
@@ -280,7 +412,9 @@ class VCDParser:
                 full = next(iter(paths))
                 if ":" in full[len(base):]:
                     self._path_to_sym[base] = self._path_to_sym[full]
+                    self._scope_ends[base] = self._scope_ends[full]
                     self._range_aliases.add(full)
+                    self._declaration_aliases[base] = full
 
 
 # ── Utility ────────────────────────────────────────────────────────

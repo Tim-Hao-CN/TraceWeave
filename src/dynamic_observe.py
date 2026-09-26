@@ -4,6 +4,7 @@ from __future__ import annotations
 from .cancellation import check_cancelled
 from .divergence_compare import bit_value, known, read_stream
 from .dynamic_evidence import Expr, evaluate
+from .dynamic_binding import signal_expression
 
 
 def clock_edges(stream, edge: str, *, start: int, end: int, before=False):
@@ -40,24 +41,62 @@ def clock_edges(stream, edge: str, *, start: int, end: int, before=False):
 
 
 class ObservationReader:
-    """Per-node cache; no transition arrays escape this object."""
-    def __init__(self, get_parser, wave, start, end, consume=None):
+    """Local view over optional request-owned, immutable observation windows."""
+    def __init__(self, get_parser, wave, start, end, consume=None, session=None):
         self.get_parser, self.wave, self.start, self.end = get_parser, wave, start, end
         self.streams = {}
+        self.bindings = {}
         self.consume = consume
+        self.session = session
+
+    def bind(self, expr):
+        """Bind reads locally; keep source names in dependency/A-B identities."""
+        key = (expr.signal, expr.bits, expr.declared_bits, expr.array_indices)
+        if key not in self.bindings:
+            parser = self.get_parser(self.wave)
+            bound, gaps = expr, []
+            if hasattr(parser, "get_signal_declaration"):
+                try:
+                    bound = signal_expression(parser, expr.signal, expr.bits, expr.declared_bits,
+                                              array_indices=expr.array_indices)
+                except KeyError:
+                    gaps = ["signal_not_dumped"]
+                except ValueError:
+                    gaps = ["dynamic_bit_mapping_unavailable"]
+            self.bindings[key] = bound, gaps
+        return self.bindings[key]
 
     def stream(self, signal):
         check_cancelled()
         if signal not in self.streams:
-            stream = read_stream(self.get_parser, self.wave, signal, self.start, self.end)
-            if self.consume:
-                self.consume(stream)
+            if self.session is not None:
+                stream = self.session.stream(self.get_parser, self.wave, signal, self.start, self.end, self.consume)
+            else:
+                stream = read_stream(self.get_parser, self.wave, signal, self.start, self.end)
+                if self.consume:
+                    self.consume(stream)
             self.streams[signal] = stream
         return self.streams[signal]
 
-    def sample(self, expr: Expr, time: int, phase="after") -> dict:
+    def sample(self, expr: Expr, time: int, phase="after", offset=0) -> dict:
+        key = None
+        if self.session is not None:
+            key = self.session.sample_key(self.get_parser(self.wave), self.wave, expr,
+                self.start, self.end, time, phase, offset)
+            cached = self.session.sample_get(key)
+            if cached is not None:
+                return cached
+        result = self._sample(expr, time + offset, phase)
+        if self.session is not None and not result['gaps']:
+            self.session.sample_put(key, result)
+        return result
+
+    def _sample(self, expr: Expr, time: int, phase="after") -> dict:
+        expr, binding_gaps = self.bind(expr)
+        if binding_gaps:
+            return dict(value=None, time_ps=time, phase=phase, gaps=binding_gaps)
         stream = self.stream(expr.signal)
-        gaps = []
+        gaps = list(binding_gaps)
         event = stream.predecessor
         same_time = []
         for index, current in enumerate(stream.transitions):
@@ -94,28 +133,40 @@ class ObservationReader:
             bits = None
         return dict(value=bits, time_ps=time, phase=phase,
                     predecessor_time_ps=int(event["time_ps"]) if event else None,
+                    ordering_candidate=(phase == "before" and bool(same_time)
+                        and set(gaps) == {"sampling_order_unresolved"}
+                        and stream.scale_fs is not None and stream.scale_fs >= 1000),
                     gaps=list(dict.fromkeys(gaps)))
 
 
 def observe_step(step: dict, *, get_parser, wave: str, time: int, history_start: int,
-                 phase="after", consume=None) -> dict:
-    reader = ObservationReader(get_parser, wave, history_start, time, consume)
+                 phase="after", consume=None, session=None, include_state=False) -> dict:
+    reader = ObservationReader(get_parser, wave, history_start, time, consume, session)
     result = dict(observation_time_ps=time, observation_phase=phase, sampling_time_ps=time,
                   sampling_phase=phase, trigger_time_ps=None, dependencies=[], branches=[],
                   value=None, complete=False, gaps=list(step.get("gaps", ())), boundary=step["boundary"])
+    result['trigger_gaps'] = []
     if step["boundary"] in {"input", "unsupported"}:
         return result
     sample_time, sample_phase = time, phase
     if step["boundary"] == "sequential":
+        if not step.get("clock"):
+            result["gaps"].append("clock_evidence_unavailable")
+            return result
         clock = Expr.from_dict(step["clock"]["expression"])
+        clock, binding_gaps = reader.bind(clock)
+        result["gaps"].extend(binding_gaps)
         edges, gaps = clock_edges(reader.stream(clock.signal), step["clock"]["edge"],
                                   start=history_start, end=time, before=phase == "before")
         result["gaps"].extend(gaps)
+        result['trigger_gaps'] = [*binding_gaps, *gaps]
         if not edges:
             result["gaps"].append("history_window_exhausted")
             return result
         sample_time, sample_phase = edges[-1], "before"
         result.update(trigger_time_ps=sample_time, sampling_time_ps=sample_time, sampling_phase=sample_phase)
+        if include_state and step.get("state"):
+            result["previous_state"] = reader.sample(Expr.from_dict(step["state"]), sample_time, "before")
     def sample(expr):
         return reader.sample(expr, sample_time, sample_phase)
     selected = []
@@ -136,13 +187,17 @@ def observe_step(step: dict, *, get_parser, wave: str, time: int, history_start:
         if step["boundary"] == "sequential":
             # No assignment executes: the predecessor Q is the data source.
             bits = tuple(step["bits"])
-            expr = Expr("signal", len(bits), signal=step["signal"].split("[")[0], bits=bits,
-                        declared_bits=tuple(step.get("declared_bits", bits)))
+            from .divergence_mapping import split_selection
+            expr = (Expr.from_dict(step["state"]) if step.get("state") else
+                    Expr("signal", len(bits), signal=split_selection(step["signal"])[0], bits=bits,
+                         declared_bits=tuple(step.get("declared_bits", bits))))
             value = evaluate(expr, sample)
             result["action"] = "hold"
             result["dependencies"].extend(value.dependencies)
             result["gaps"].extend(value.gaps)
             result["value"] = value.value
+            if value.reference:
+                result['reference'] = dict(signal=value.reference[0], bits=list(value.reference[1]))
         else:
             result["gaps"].append("temporal_context_unavailable")
     else:
@@ -153,6 +208,12 @@ def observe_step(step: dict, *, get_parser, wave: str, time: int, history_start:
             result["branches"].extend(value.branches)
             if not unresolved:
                 result["value"] = value.value
+                if value.reference:
+                    result['reference'] = dict(signal=value.reference[0], bits=list(value.reference[1]))
+                if include_state and step["boundary"] == "sequential" and step.get("state"):
+                    state = Expr.from_dict(step["state"])
+                    if value.reference == (state.signal, state.bits):
+                        result["action"] = "hold"
     result["gaps"] = list(dict.fromkeys(result["gaps"]))
     if result["value"] is not None and len(result["value"]) != step.get("width"):
         result["gaps"].append("dynamic_bit_mapping_unavailable")

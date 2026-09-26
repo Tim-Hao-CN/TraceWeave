@@ -38,7 +38,8 @@ Use it with Claude Code, Codex, Copilot, or another MCP client. Describe the pro
 |---|---|
 | A simulation times out or hangs, with no clear starting point | Summarize failures and scan interface handshakes to narrow down the affected interfaces and time window |
 | A scoreboard mismatch or different results between runs | Compare failure records and waveforms, locate observed differences, and trace data and control sources on both sides |
-| A signal becomes X/Z | Inspect the surrounding waveform and follow upstream drivers to trace unknown-value propagation |
+| A signal becomes X/Z | Follow drivers and review waveform history to check whether a register sampled and retained an unknown value |
+| Packed buses are hard to read, or TL-UL requests are not completing | Inspect address, data, and control fields individually, then check request/response handshakes, latency, and completion |
 | Suspected ties, unconnected inputs, or magic-word conditions | Statically scan source code for constant connections, open inputs, and constant comparisons as investigation leads; no simulation run or waveform required |
 | A deep SoC hierarchy with many modules and interfaces | Browse hierarchy on demand, locate instances and source files, and follow drivers, consumers, and connectivity paths |
 | A debugging hypothesis needs evidence | Sample by cycle and check timing conditions, handshake stability, and transaction completion |
@@ -71,7 +72,7 @@ export VERDI_HOME=/path/to/verdi
 bash scripts/install.sh
 ```
 
-The installer prepares the Python environment, Source Graph, and FSDB reader, then checks the runtime. It leaves shell startup files and MCP client configuration untouched. NPI still requires the appropriate EDA runtime and license from your site.
+The installer prepares the Python environment, Source Graph, and FSDB reader, then checks the runtime. It leaves shell startup files and MCP client configuration untouched. FSDB support builds against the Synopsys FSDB Reader SDK in `VERDI_HOME`; TraceWeave does not redistribute its headers or libraries. Use of the FSDB Reader is subject to the applicable VC Apps Access Program Agreement (or successor). NPI and KDB operations also require the appropriate EDA runtime and license from your site.
 
 For an existing installation, start with a read-only check:
 
@@ -139,6 +140,45 @@ The assistant's default investigation follows these steps:
 5. **Compare after a fix:** check how failure records and waveforms change in the next run.
 
 For a first connection check, ask the assistant to call `get_sim_paths` and confirm that actual MCP tool calls run. See the [debug workflow](https://github.com/gokeshenzhen/TraceWeave/blob/main/docs/workflow.md) for the full procedure.
+
+For a repository readback check without an EDA license, run
+`.venv/bin/python scripts/check_waveform_readback.py --work-dir /tmp/traceweave-readback-check`.
+It checks the server catalog and actual point/batch values through MCP, and
+prints explicit requests for a separate AI-client smoke session. Server checks
+leave AI-client visibility and model adoption unverified; see the
+[readback check procedure](docs/architecture.md#readback-client-check).
+
+### Find Waveform Differences and Trace X/Z Sources
+
+When two simulation runs produce different results, TraceWeave can compare selected signals, locate the earliest difference it can confirm within a time window, and trace the related data, control, and RTL logic on both sides.
+
+For X/Z, inspect the propagation path at the time of interest or look back through history to check whether a register sampled an unknown value and continued to hold it. You can investigate earlier events even if the input is now known:
+
+> `tb.dut.q` is X at 36 ns, but its input is now known. Review the waveform from 0 to 36 ns, check earlier sampling and hold behavior, and trace possible sources.
+
+Results distinguish relationships supported by evidence from leads that need more investigation. When history is missing or a structure is unsupported, TraceWeave explains where tracing stopped. The first recorded anomaly is not automatically its true point of origin.
+
+See [waveform comparison](https://github.com/gokeshenzhen/TraceWeave/blob/main/docs/architecture.md#divergence-evidence-and-backtrace) and [X/Z history tracing](https://github.com/gokeshenzhen/TraceWeave/blob/main/docs/architecture.md#bounded-x-history) for tool parameters and detailed support limits.
+
+### Evaluate SV Expressions
+
+Existing waveform tools accept explicit `{ "expr": "a[b] + c", ... }` inputs. Expressions use SV precedence, widths, signedness and four-state values; indices are sampled again at each observation. Point, cycle, transition, window, handshake, transaction and TL-UL queries share this core with RTL backtracing. No additional MCP tool is required.
+
+Use exact `bindings` and explicit `types`, or choose `typing: "wave_bits"` for an unsigned four-state view of dumped vectors. Fixed arrays use bounded element mappings; reading a formula does not replace the recorded output signal. See [expression inputs, examples and limits](docs/expressions.md).
+
+### Inspect Bus Fields and TL-UL Interfaces
+
+When address, data, and control information share a packed bus, TraceWeave can identify field positions from source types that match the waveform. The assistant can then inspect individual fields, reducing manual work to look up widths and calculate offsets. You can also provide a field-to-bit mapping when automatic resolution is unavailable.
+
+For TL-UL interfaces, once the assistant confirms the field mapping and clock, it can check handshake stalls, request/response matching, response latency, and outstanding requests within a specified time window:
+
+> Check the TL-UL interface under `tb.dut` from 10 to 20 μs for handshake stalls or outstanding requests. List the relevant times and signals.
+
+Results state which checks ran and what information is missing. A request still outstanding at the end of the window is not automatically a deadlock, and these checks do not replace full TL-UL protocol verification.
+
+For a long debugging conversation, ask for compact evidence output. Repeated field mappings are shown once, while checked scope, missing evidence, time boundaries and next steps remain available. Existing clients keep their usual output by default. See [compact evidence output](docs/architecture.md#compact-evidence-output) for examples and client integration.
+
+See [bus fields and TL-UL](https://github.com/gokeshenzhen/TraceWeave/blob/main/docs/architecture.md#packed-waveform-selections-and-tl-ul) for field configuration and detailed support limits.
 
 ### Custom Runtime Error Formats
 
@@ -285,7 +325,7 @@ Usually, you describe the debugging goal and let the assistant select the tools.
     </tr>
     <tr>
       <td><code>trace_x_source</code></td>
-      <td>Follow upstream drivers to trace X/Z propagation</td>
+      <td>Trace X/Z propagation and inspect historical register sampling and hold behavior</td>
     </tr>
     <tr>
       <td rowspan="6">Waveform queries</td>
@@ -330,7 +370,7 @@ Usually, you describe the debugging goal and let the assistant select the tools.
       <td>Verify temporal conditions within a waveform window and return concrete evidence</td>
     </tr>
     <tr>
-      <td rowspan="5">Protocols and transactions</td>
+      <td rowspan="7">Protocols and transactions</td>
       <td><code>suggest_handshakes</code></td>
       <td>Discover valid/ready interfaces and signal bundles for inspection</td>
     </tr>
@@ -349,6 +389,14 @@ Usually, you describe the debugging goal and let the assistant select the tools.
     <tr>
       <td><code>reconstruct_transactions</code></td>
       <td>Reconstruct requests and responses to inspect latency, outstanding requests, and ordering</td>
+    </tr>
+    <tr>
+      <td><code>resolve_packed_fields</code></td>
+      <td>Identify packed bus fields to inspect address, data, and control signals individually</td>
+    </tr>
+    <tr>
+      <td><code>inspect_tlul</code></td>
+      <td>Check TL-UL requests and responses for handshake stalls, response latency, and outstanding requests</td>
     </tr>
     <tr>
       <td rowspan="3">Time cursors</td>
@@ -375,7 +423,13 @@ Usually, you describe the debugging goal and let the assistant select the tools.
 
 **Can I use TraceWeave without a commercial license?**
 
-Log analysis, VCD queries, static structural scanning, and Source Graph do not need a commercial license. **Direct value and transition queries on existing waveforms do not need an NPI license**: VCD uses the built-in parser, while FSDB uses local Verdi FSDB Reader libraries and the wrapper. Verdi NPI signal tracing and KDB builds require the corresponding EDA environment and license.
+Log analysis, VCD queries, static structural scanning, and Source Graph do not need a commercial license. **Direct value and transition queries on existing waveforms do not need an NPI license**: VCD uses the built-in parser, while FSDB uses the local Verdi FSDB Reader and remains subject to its agreement described above. Verdi NPI signal tracing and KDB builds require the corresponding EDA environment and license.
+
+**Can missing path variables be recovered automatically?**
+
+Yes. You can use a CLI agent in a terminal where the project's setup script has not been sourced, or give it logs and waveforms from a run launched in another terminal. TraceWeave can recover compilation input path variables from VCS compile logs and filelists when their values can be determined unambiguously, enabling hierarchy analysis, KDB builds, and Source Graph queries.
+
+Recovery covers compilation input paths; the corresponding source and include files must remain accessible. The runtime prerequisites must already be available: `VERDI_HOME`, installed EDA tools, and license configuration for KDB builds, plus Python and `pyslang` dependencies for Source Graph.
 
 **How should I judge signal-tracing accuracy?**
 
@@ -396,6 +450,8 @@ Conclusions depend on actual coverage. Missing signals, resource limits, or unsu
 **Can I inspect formal waveforms?**
 
 You can query exported VCD / FSDB files and automatically discover JasperGold artifacts. Property results, trace classification, and reachability semantics must come from the formal tool or the user.
+
+Standalone exports do not require a recognized formal project. When discovery finds waveforms without project entries, `get_formal_paths` includes a short hint for the existing point and batch readers; the caller selects the waveform, signals, and timestamp.
 
 **Where is design data processed?**
 

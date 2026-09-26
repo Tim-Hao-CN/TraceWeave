@@ -15,6 +15,7 @@ from .divergence_context import resolve_context, driver_action
 from .divergence_mapping import Mapping, selected_path, split_selection
 from .divergence_routing import DynamicRoute
 from .dynamic_observe import observe_step
+from .observation_session import ObservationSession
 from .schemas import TraceDivergenceInput, TraceDivergenceResult
 
 _COMPETING = [
@@ -98,6 +99,8 @@ async def trace_divergence(services, raw, *, route_factory=DynamicRoute):
         raise ValueError("clock_policy_requires_clock_mode")
     sides = {s: request[f"side_{s}"] for s in ("a", "b")}
     budget = Budget(request["limits"])
+    observations = ObservationSession(budget)
+    budget.observations = observations
     result = dict(
         status="blocked",
         reference_side=request["reference_side"],
@@ -133,15 +136,11 @@ async def trace_divergence(services, raw, *, route_factory=DynamicRoute):
                 result["coverage"]["gaps"].append(reason)
 
     async def wave(fn):
-        budget.cache_bytes = 0
-        try:
-            return await budget.run(
-                lambda: services._run_in_wave_thread(
-                    [s["wave_path"] for s in sides.values()], fn
-                )
+        return await budget.run(
+            lambda: services._run_in_wave_thread(
+                [s["wave_path"] for s in sides.values()], fn
             )
-        finally:
-            budget.cache_bytes = 0
+        )
 
     try:
         # Mapping syntax is validated even before a root diff can early-return.
@@ -229,6 +228,11 @@ async def trace_divergence(services, raw, *, route_factory=DynamicRoute):
                 if comparison["comparison_status"] == "equal"
                 else "inconclusive"
             )
+        elif comparison.get('first_divergence_time_fs', 0) % 1000:
+            # A rounded public cursor is not an exact dynamic sample. Keep the
+            # raw-time positive but do not trace a potentially different value.
+            result['status'] = 'partial'
+            frontier(None, 'sampling_order_unresolved', source='root_comparison')
         else:
             routes = {
                 s: route_factory(services, s, side, bounds[s], budget)
@@ -256,9 +260,11 @@ async def trace_divergence(services, raw, *, route_factory=DynamicRoute):
                         wave,
                         services,
                         frontier,
+                        observations,
                     )
                     break
                 except TraceRestart as restart:
+                    observations.clear()
                     (
                         result["nodes"],
                         result["edges"],
@@ -285,6 +291,8 @@ async def trace_divergence(services, raw, *, route_factory=DynamicRoute):
             if node["status"] == "pending":
                 node["status"] = "frontier"
                 frontier(node["id"], "budget_exhausted", budget=exc.limit)
+    finally:
+        observations.clear()
 
     # Revalidation runs after the bounded work, even after a timeout. It performs
     # only exact local stat checks and never prepares/retries another backend.
@@ -303,13 +311,17 @@ async def trace_divergence(services, raw, *, route_factory=DynamicRoute):
         if label in routes and not routes[label].current():
             changed.append((label, "compile_context_changed"))
     if changed:
-        result.update(status="inconclusive", nodes=[], edges=[], findings=[])
+        result.update(status="inconclusive", nodes=[], edges=[], findings=[], frontier=[], next_actions=[])
+        result['coverage'].update(checks=[], gaps=[])
         if comparison:
             comparison.update(
                 diverged=False,
                 comparison_status="inconclusive",
+                coverage_status="none",
+                coverage_gaps=[dict(reason=reason, side=label, start_ps=start) for label,reason in changed],
                 earliest_difference_proven=False,
                 first_divergence_time_ps=None,
+                first_divergence_time_fs=None,
                 value_a=None,
                 value_b=None,
             )
@@ -426,6 +438,7 @@ async def _walk(
     wave,
     services,
     frontier,
+    observation_session,
 ):
     queue = deque()
     seen = {}
@@ -501,6 +514,10 @@ async def _walk(
             frontier(node_id, "budget_exhausted", budget="max_depth")
             continue
         steps = {}
+        if any(node[s].get('array_indices') for s in ('a','b')):
+            node['status'] = 'boundary'
+            frontier(node_id, 'dumped_array_element_boundary')
+            continue
         for label in ("a", "b"):
             fact = node[label]
             steps[label] = await routes[label].query(
@@ -556,6 +573,8 @@ async def _walk(
             continue
 
         def observe():
+            observation_session.bind(tuple((ids[label], steps[label].get('backend'),
+                steps[label].get('artifact_sha256')) for label in ('a', 'b')))
             return {
                 label: observe_step(
                     steps[label],
@@ -565,6 +584,7 @@ async def _walk(
                     history_start=start,
                     phase=node[label]["phase"],
                     consume=budget.consume,
+                    session=observation_session,
                 )
                 for label in ("a", "b")
             }
@@ -595,6 +615,10 @@ async def _walk(
         matches = []
         used_b = set()
         mapping_complete = True
+        index_changed = any('index' in a['roles'] and known(a['value']) and
+            any('index' in b['roles'] and known(b['value']) and a['value'] != b['value'] and
+                mapping.target(a['signal'],a['bits']) == (b['signal'],tuple(b['bits']))
+                for b in deps['b']) for a in deps['a'])
         for a in deps["a"]:
             budget.check()
             mapped = mapping.target(a["signal"], a["bits"])
@@ -606,7 +630,8 @@ async def _walk(
             if len(candidates) != 1:
                 frontier(
                     node_id,
-                    "mapping_missing" if not candidates else "mapping_ambiguous",
+                    ("selected_dependency_changed" if index_changed and a['role']=='data' else
+                     "mapping_missing") if not candidates else "mapping_ambiguous",
                     side="a",
                     dependency=a,
                 )
@@ -621,12 +646,13 @@ async def _walk(
             matches.append((a, b))
         for i, b in enumerate(deps["b"]):
             if i not in used_b:
-                frontier(node_id, "mapping_missing", side="b", dependency=b)
+                frontier(node_id, "selected_dependency_changed" if index_changed and b['role']=='data'
+                         else "mapping_missing", side="b", dependency=b)
                 mapping_complete = False
         matches.sort(
             key=lambda pair: (
                 0
-                if "control" in pair[0]["roles"] or "control" in pair[1]["roles"]
+                if {'control','index'} & set(pair[0]['roles'] + pair[1]['roles'])
                 else 1
             )
         )
@@ -666,22 +692,23 @@ async def _walk(
                 observations[s]["complete"]
                 and observations[s]["value"] == node[s]["value"]
                 and dep["value"] == node[s]["value"]
+                and observations[s].get('reference') == dict(signal=dep['signal'],bits=dep['bits'])
                 for s, dep in (("a", a), ("b", b))
             ):
                 relation = "value_supported_propagation"
             child_id = add(
                 {"a": a, "b": b}, node["depth"] + 1, node_id, relation, roles
             )
-            if "control" in roles:
+            if 'control' in roles or 'index' in roles:
                 result["findings"].append(
                     dict(
-                        kind="control_difference",
+                        kind="index_difference" if 'index' in roles else "control_difference",
                         node_id=child_id,
                         observed_at_node_id=node_id,
                         checked_sides=["a", "b"],
                         competing_explanations=_COMPETING,
                         limitations=[
-                            "a_control_difference_is_not_by_itself_a_unique_root_cause"
+                            "a_control_or_index_difference_is_not_by_itself_a_unique_root_cause"
                         ],
                     )
                 )

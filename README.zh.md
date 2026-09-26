@@ -38,7 +38,8 @@ TraceWeave 是面向 RTL / SoC 调试的 MCP 服务器。它把编译记录、�
 |---|---|
 | 仿真超时、卡死，不知道从哪里查起 | 汇总失败日志，扫描多接口握手行为，缩小异常接口和时间窗口 |
 | Scoreboard mismatch、两次运行结果不同 | 对比失败记录与波形，定位已观测到的差异，并追踪两侧数据和控制来源 |
-| 信号出现 X/Z | 查看异常前后的波形，沿驱动关系追踪未知值的传播路径 |
+| 信号出现 X/Z | 沿驱动追踪传播路径，回看历史波形，检查寄存器是否曾采入并保持未知值 |
+| 打包总线难读、TL-UL 请求迟迟没有响应 | 按字段查看地址、数据和控制信号，检查请求与响应的握手、延迟和完成情况 |
 | 怀疑 tie 值、悬空输入或 magic word 条件 | 静态扫描源码，提取常量连接、未连接输入和常量比较等线索，供进一步核查；无需运行仿真或提供波形 |
 | SoC 层级深、模块和接口多 | 按需浏览层次、查找实例与源码，追踪信号的驱动、消费者和连通路径 |
 | 想验证一个调试假设 | 按周期采样，检查时序条件、握手保持和事务完成情况，取得具体证据 |
@@ -71,7 +72,7 @@ export VERDI_HOME=/path/to/verdi
 bash scripts/install.sh
 ```
 
-安装器准备 Python 环境、Source Graph 和 FSDB 读取组件，并检查运行环境。它不会修改 shell 启动文件或 MCP 客户端配置；NPI 仍需站点提供相应的运行环境和 license。
+安装器准备 Python 环境、Source Graph 和 FSDB 读取组件，并检查运行环境。它不会修改 shell 启动文件或 MCP 客户端配置。FSDB 支持基于 `VERDI_HOME` 中的 Synopsys FSDB Reader SDK 构建；TraceWeave 不分发该 SDK 的头文件或库。使用 FSDB Reader 须遵守适用的 VC Apps Access Program Agreement（或其后续协议）。NPI 和 KDB 操作仍需站点提供相应的 EDA 运行环境和 license。
 
 已有安装可先执行只读检查：
 
@@ -139,6 +140,43 @@ export TRACEWEAVE_NPI_LSF_QUEUE="digital"
 5. **对比修复结果**：比较下一次运行的失败记录和波形变化。
 
 首次连接时，可先要求助手调用 `get_sim_paths`，确认客户端能够执行真实的 MCP 工具调用。完整流程见[调试工作流](docs/workflow.md)。
+
+仓库安装可运行 `.venv/bin/python scripts/check_waveform_readback.py --work-dir /tmp/traceweave-readback-check`
+做无需 EDA license 的读值自检。它通过 MCP 检查服务端工具列表和实际点／批量读值，
+并输出供独立 AI 客户端会话执行的明确请求。服务端检查不会把客户端可见性或模型采用率
+标记为已证实，详见[读值客户端自检](docs/architecture.md#readback-client-check)。
+
+### 定位波形差异与 X/Z 来源
+
+两次仿真结果不一致时，TraceWeave 可比较指定信号，找到时间窗口内最早能确认的差异，并沿两侧驱动追踪相关的数据、控制和 RTL 逻辑。
+
+对于 X/Z，既可以查看异常时刻的传播路径，也可以回看历史，检查寄存器是否曾采入未知值，随后一直保持。即使当前输入已经正常，也能继续调查之前发生的异常：
+
+> `tb.dut.q` 在 36 ns 时为 X，但输入已经正常。请回看 0～36 ns 的波形，检查此前的采样与保持情况，并追踪可疑来源。
+
+结果会列出有证据支持的关系和仍需核查的环节。历史记录不足或遇到暂不支持的结构时，会说明停止原因，不把“首次看到异常”直接当成“真实首次产生异常”。
+
+工具参数与详细支持范围见[波形差异分析](docs/architecture.md#divergence-evidence-and-backtrace)和 [X/Z 历史追踪](docs/architecture.md#bounded-x-history)。
+
+### 计算 SV 表达式
+
+现有波形工具支持显式 `{ "expr": "a[b] + c", ... }` 输入，按 SV 优先级、位宽、signed 和四态规则求值，每次观察都会重新采样下标。点、周期、变化窗口、条件、握手、事务、TL-UL 及 RTL 自动回溯共用计算核心，无需新增 MCP 工具。
+
+使用精确 `bindings` 和显式 `types`，或选择 `typing: "wave_bits"`，将实际 dump 向量作为 unsigned 四态数据读取。固定数组使用有界元素映射；计算公式不会替换输出信号的实际记录值。详见[表达式输入、示例与限制](docs/expressions.md)。
+
+### 按字段查看总线，检查 TL-UL 接口
+
+当地址、数据和控制信息打包在同一条总线中时，TraceWeave 可依据与波形匹配的源码类型识别字段位置，让助手按字段查看变化，减少手工查位宽、算偏移的工作。无法自动识别时，也支持提供字段与位段的对应关系。
+
+对于 TL-UL 接口，助手确认字段对应关系和时钟后，可检查指定时间范围内的握手停顿、请求与响应的对应关系、响应延迟，以及尚未完成的请求：
+
+> 检查 `tb.dut` 的 TL-UL 接口在 10～20 μs 内是否有握手停顿或未完成的请求，并列出对应的时间和信号。
+
+结果会说明实际检查的项目和缺失信息。窗口内尚未完成的请求不直接判为死锁，这些检查也不替代完整的 TL-UL 协议验证。
+
+调试对话较长时，可以要求助手使用紧凑证据输出。重复的字段映射只展示一份，实际检查范围、缺失证据、时间边界和下一步仍会保留。已有客户端默认保持原有输出。示例及客户端接入方式见[紧凑证据输出](docs/architecture.md#compact-evidence-output)。
+
+字段配置与详细支持范围见[总线字段与 TL-UL 使用说明](docs/architecture.md#packed-waveform-selections-and-tl-ul)。
 
 ### 自定义运行期报错格式
 
@@ -284,7 +322,7 @@ export TRACEWEAVE_CUSTOM_PATTERNS_FILE="/absolute/path/to/custom_patterns.yaml"
     </tr>
     <tr>
       <td><code>trace_x_source</code></td>
-      <td>沿上游驱动追踪 X/Z 的传播来源</td>
+      <td>追踪 X/Z 的传播路径，检查历史上的寄存器采样与保持</td>
     </tr>
     <tr>
       <td rowspan="6">波形查询</td>
@@ -329,7 +367,7 @@ export TRACEWEAVE_CUSTOM_PATTERNS_FILE="/absolute/path/to/custom_patterns.yaml"
       <td>在波形窗口中验证时序条件，返回具体证据</td>
     </tr>
     <tr>
-      <td rowspan="5">协议与事务</td>
+      <td rowspan="7">协议与事务</td>
       <td><code>suggest_handshakes</code></td>
       <td>发现 valid/ready 接口及检查所需的信号组合</td>
     </tr>
@@ -348,6 +386,14 @@ export TRACEWEAVE_CUSTOM_PATTERNS_FILE="/absolute/path/to/custom_patterns.yaml"
     <tr>
       <td><code>reconstruct_transactions</code></td>
       <td>重建请求与响应事务，查看延迟、未完成请求和顺序</td>
+    </tr>
+    <tr>
+      <td><code>resolve_packed_fields</code></td>
+      <td>识别打包总线中的字段位置，便于单独查看地址、数据和控制信号</td>
+    </tr>
+    <tr>
+      <td><code>inspect_tlul</code></td>
+      <td>检查 TL-UL 请求与响应，查看握手停顿、响应延迟和未完成请求</td>
     </tr>
     <tr>
       <td rowspan="3">时间游标</td>
@@ -374,7 +420,13 @@ export TRACEWEAVE_CUSTOM_PATTERNS_FILE="/absolute/path/to/custom_patterns.yaml"
 
 **没有商业 license 也能用吗？**
 
-日志分析、VCD 查询、静态结构扫描和 Source Graph 不需要商业 license。**直接查询已有波形中的信号值或跳变，不需要 NPI license**：VCD 使用内置解析器，FSDB 使用本地 Verdi FSDB Reader 库和 wrapper。Verdi NPI 信号追踪和 KDB 构建需要相应的 EDA 环境与 license。
+日志分析、VCD 查询、静态结构扫描和 Source Graph 不需要商业 license。**直接查询已有波形中的信号值或跳变，不需要 NPI license**：VCD 使用内置解析器；FSDB 使用本地 Verdi FSDB Reader，其使用仍须遵守上文所述协议。Verdi NPI 信号追踪和 KDB 构建需要相应的 EDA 环境与 license。
+
+**路径变量是否支持自恢复**
+
+支持。在没有 source 过案例环境变量 setup 文件的终端上使用 CLI agent，或直接将其他终端已跑出的日志和波形交给 agent 分析时，TraceWeave 可从 VCS 编译日志和 filelist 中自动恢复能唯一确定的编译输入路径变量，用于层次分析、KDB 构建和 Source Graph 查询。
+
+自恢复范围限于编译输入路径变量，对应源码与 include 文件需可访问。自恢复能力依赖的运行环境仍需预先提供：KDB 构建所需的 `VERDI_HOME`、工具安装及许可证配置，以及 Source Graph 所需的 Python / `pyslang` 依赖。
 
 **信号追踪结果的准确性如何判断？**
 
@@ -395,6 +447,8 @@ NPI 基于与当前设计匹配的已展开 KDB；Source Graph 从源码构建�
 **能分析 formal 波形吗？**
 
 可以查询已导出的 VCD / FSDB，并自动发现 JasperGold 产物。Property 结果、反例类型和可达性语义仍需由 formal 工具或用户提供。
+
+独立导出的波形无需已识别的 formal 工程。发现波形但没有工程条目时，`get_formal_paths` 会提示现有点查询和批量读值入口；波形、信号和时刻由调用方选择。
 
 **设计数据在哪里处理？**
 
