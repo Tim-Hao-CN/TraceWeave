@@ -1,8 +1,8 @@
 """Response-local, lossless presentation after analysis and its display limits.
 
-Only identical TL-UL selection receipts are factored. Their containing channel,
-transaction, coverage, identity and time facts remain inline. No waveform data
-is read and no object is retained between calls.
+TL-UL selections retain the original compact.v1 contract. Driver statement
+values use an independent typed-table version. No waveform data is read and
+no object is retained between calls.
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import json
 from pydantic import BaseModel
 
 from .cancellation import check_cancelled
-from .schemas import COMPACT_OUTPUT_TOOLS, CompactEvidenceResult, SelectionEvidenceReference
+from .schemas import LEGACY_COMPACT_OUTPUT_TOOLS, CompactEvidenceResult, SelectionEvidenceReference
 
 
 def _field(value, key):
@@ -25,7 +25,7 @@ def _field(value, key):
 
 def selection_projection(tool: str, result: BaseModel | dict) -> tuple[list, dict]:
     check_cancelled()
-    if tool not in COMPACT_OUTPUT_TOOLS:
+    if tool not in LEGACY_COMPACT_OUTPUT_TOOLS:
         raise ValueError("compact_output_tool_unsupported")
     references = []
     exclude = {}
@@ -64,6 +64,12 @@ def compact_evidence_result(tool: str, result: BaseModel | dict) -> CompactEvide
 
 
 def serialize_compact_result(tool: str, result: BaseModel | dict) -> str:
+    if tool == "explain_signal_driver":
+        from .driver_evidence_codec import encode_driver_result
+        text = json.dumps(encode_driver_result(result), ensure_ascii=False,
+                          separators=(",", ":"), allow_nan=False)
+        check_cancelled()
+        return text
     if isinstance(result, BaseModel):
         references, exclude = selection_projection(tool, result)
         # Encode validated facts directly. Do not allocate a second tree of
@@ -79,12 +85,17 @@ def serialize_compact_result(tool: str, result: BaseModel | dict) -> str:
     return text
 
 
-def expand_compact_result(payload: dict | CompactEvidenceResult) -> dict:
+def expand_compact_result(payload: dict | str | CompactEvidenceResult, *, limits=None) -> dict:
     """Restore the full JSON value without a server, file access or live handles.
 
     Invalid, duplicate or dangling references raise instead of returning an empty
     evidence list. Copies keep mutations of one expanded receipt local.
     """
+    from .driver_evidence_codec import FORMAT, expand_driver_result, parse_compact_json
+    if isinstance(payload, str):
+        payload = parse_compact_json(payload, limits=limits)
+    if isinstance(payload, dict) and payload.get("format") == FORMAT:
+        return expand_driver_result(payload, limits=limits)
     compact = CompactEvidenceResult.model_validate(payload)
     result = deepcopy(compact.result)
     for ref in compact.references:

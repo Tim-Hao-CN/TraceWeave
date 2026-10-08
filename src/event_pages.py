@@ -19,6 +19,17 @@ class Event:
     time_fs: int
     time_ps: int
     value: str | None
+    # State observations and recording boundaries are not value-change facts.
+    kind: str = 'transition'
+
+
+@dataclass(frozen=True)
+class RecordingGap:
+    start_fs: int
+    end_fs: int
+    reason: str
+    start_inclusive: bool = True
+    end_inclusive: bool = False
 
 
 @dataclass(frozen=True)
@@ -29,6 +40,22 @@ class EventPage:
     complete: bool = False
     truncated: bool = False
     output_bytes: int = 0
+    initial_state: Event | None = None
+    recording_gaps: tuple[RecordingGap, ...] = ()
+
+
+def page_records(page):
+    """Account for every retained record, including a separately typed anchor."""
+    return (*((page.initial_state,) if page.initial_state else ()),
+            *((page.predecessor,) if page.predecessor else ()), *page.events)
+
+
+def sampling_anchor(result):
+    """Select state strictly before the read window without renaming its origin."""
+    initial = result.get('initial_state')
+    if initial and initial.get('time_fs', initial['time_ps'] * 1000) >= result.get('start_ps', 0) * 1000:
+        initial = None
+    return result.get('predecessor') or initial
 
 
 def limits(events, nbytes):
@@ -47,6 +74,9 @@ class GroupCursor:
         self.consume = consume
         self.page, self.index = None, 0
         self.predecessor = None
+        self.initial_state = None
+        self._pending_initial = None
+        self.recording_gaps = ()
         self.pages = self.events = self.nbytes = self.compared = 0
         self.last_time = None
         self._read()
@@ -56,43 +86,63 @@ class GroupCursor:
         page = self.reader.read_page()
         self.checkpoint()
         self.pages += 1
-        self.events += len(page.events) + int(page.predecessor is not None)
+        self.events += len(page_records(page))
         self.nbytes += page.output_bytes
         if self.consume:
             self.consume(page)
         if self.page is None:
             self.predecessor = page.predecessor
-        elif page.predecessor is not None:
+            self.initial_state = page.initial_state
+            if page.initial_state and page.initial_state.time_fs >= getattr(self.reader, 'start_fs', 0):
+                self._pending_initial = page.initial_state
+        elif page.predecessor is not None or page.initial_state is not None:
             raise ValueError('replayed_event_predecessor')
+        self.recording_gaps += page.recording_gaps
+        self._events = page.events
         self.page, self.index = page, 0
 
+    @property
+    def anchor(self):
+        """Known state strictly before the window; never invent a change time."""
+        initial = self.initial_state
+        if initial and initial.time_fs >= getattr(self.reader, 'start_fs', 0):
+            initial = None
+        return self.predecessor or initial
+
     def peek(self):
-        if self.index < len(self.page.events):
-            return self.page.events[self.index].time_fs
-        return self.page.next_time
+        upcoming = (self._events[self.index].time_fs if self.index < len(self._events)
+                    else self.page.next_time)
+        if self._pending_initial:
+            return min(upcoming, self._pending_initial.time_fs) if upcoming is not None else self._pending_initial.time_fs
+        return upcoming
 
     def take_group(self, at):
         value = None
         self.group_changed = False
+        self.group_kinds = set()
         while self.peek() == at:
             self.checkpoint()
-            if self.index == len(self.page.events):
+            if self._pending_initial and self._pending_initial.time_fs == at:
+                event, self._pending_initial = self._pending_initial, None
+            elif self.index == len(self._events):
                 if self.page.truncated or self.page.complete:
                     raise IncompleteGroup('transition_data_truncated')
                 self._read()
-                if not self.page.events and self.page.next_time == at:
+                if not self._events and self.page.next_time == at:
                     raise IncompleteGroup('transition_data_truncated')
                 continue
-            event = self.page.events[self.index]
+            else:
+                event = self._events[self.index]
+                self.index += 1
             if self.last_time is not None and event.time_fs < self.last_time:
                 raise IncompleteGroup('transition_order_invalid')
             self.last_time = event.time_fs
+            self.group_kinds.add(event.kind)
             if value is not None:
                 from .divergence_compare import bit_value
                 width = getattr(self.reader,'width',None)
                 self.group_changed |= (bit_value(value,width) != bit_value(event.value,width)) if width else value != event.value
             value = event.value
-            self.index += 1
             self.compared += 1
         if self.peek() is not None and self.peek() < at:
             raise IncompleteGroup('transition_order_invalid')

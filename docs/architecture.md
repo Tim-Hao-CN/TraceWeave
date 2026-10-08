@@ -46,6 +46,9 @@ Waveform backends
   src/vcd_parser.py
   src/fsdb_parser.py
   src/fsdb_signal_index.py
+  src/fst_parser.py              # optional basic digital queries with gap receipts
+  src/fst_runtime.py             # bounded, cancellable process transport
+  src/fst_worker.py              # isolated libfst reader; request-scoped native state
   src/cycle_query.py
   src/waveform_batch.py           # FSDB+VCD batch reader (time-window)
   src/waveform_selection.py       # request-local declared-coordinate projections
@@ -71,7 +74,8 @@ Auto-debug primitives (cursors + verification)
 
 Native integration
   libfsdb_wrapper.so
-  fsdb_wrapper.cpp
+  native/fsdb/fsdb_wrapper.cpp
+  native/fsdb/fsdb_point_read.h
   Verdi ffrAPI/libs or repo-local runtime symlinks
 
 Config and support
@@ -86,6 +90,20 @@ Verification
 
 ## Notes
 
+- Optional driver dependency inventories bind bounded typed references before
+  applying the 32-selection limit. Compatible references to the same source
+  and dump declaration combine exact ordered bit sets only when declaration
+  shape, roles and active level agree. Distinct source aliases and nonidentity
+  packed-member mappings remain separate; sparse bits never become a range.
+  Feedback is limited to intersecting state bits. Expression-node, deadline,
+  output and cancellation limits still apply, and removing a selection gap
+  does not establish complete driver coverage.
+- Project-owned C/C++ code lives in `native/<module>/`; external dependencies
+  live in `third_party/<dependency>/`. FSDB runtime symlinks remain under
+  `third_party/verdi_runtime/linux64/`. `scripts/build_wrapper.sh` builds the
+  FSDB sources into the repository-root `libfsdb_wrapper.so`, preserving the
+  Python loader path and `$ORIGIN`-relative runtime lookup. The portable PyPI
+  distribution excludes native sources and shared libraries.
 - VCD point and window reads bisect the existing ordered transition records;
   separately dumped bits retain their declared indices (`valid[0]`, `valid[1]`)
   and disjoint slices retain their ranges. A unique vector range remains
@@ -119,7 +137,7 @@ Verification
   global period and public result schemas remain unchanged.
 - Standalone FSDB point reads temporarily restrict FFR loading to the queried
   time. FFR loads whole flush sessions, so a single-session file gains little
-  from this restriction. `fsdb_point_read.h` saves the current bounds before
+  from this restriction. `native/fsdb/fsdb_point_read.h` saves the current bounds before
   changing them, releases the traversal and load, then restores those bounds
   on success, failure and exceptions. Missing bounds or unsupported windows
   use the previous loading path; an empty partial read retries the original
@@ -759,7 +777,7 @@ Verification
   from repo-local links first, then `VERDI_HOME`. Time contract at this
   boundary: FSDB tags are tick counts, real time = tick × header scale
   (`ffrGetScaleUnit()`, read once at `fsdb_open`). All tick↔ps conversion is
-  collared in two `fsdb_wrapper.cpp` helpers (`_ToTag` floor / `_TagToPs`
+  collared in two `native/fsdb/fsdb_wrapper.cpp` helpers (`_ToTag` floor / `_TagToPs`
   ceil, integer-fs base), so every timestamp crossing into Python is real
   picoseconds. Unknown scale → time-based calls refuse
   (`FSDB_ERR_SCALE_UNKNOWN`) rather than assume 1ps. Native text buffers also
@@ -803,6 +821,217 @@ Verification
   multi-signal reader with FSDB and VCD implementations sharing the same
   shape. The FSDB path uses `ffrCreateTimeBasedVCTrvsHdl` for a single
   chronological walk; the VCD path is pure Python.
+
+## FST Basic Reading
+
+Private event pages distinguish `initial_state` from a genuine `predecessor`.
+Typed recording-boundary events invalidate carried state, while separate
+`RecordingGap` intervals retain the reason and endpoint semantics. `GroupCursor`
+folds an initial observation at its physical time (or exposes a pre-window state
+anchor), preserving complete same-time groups across pages. Selection projection
+preserves those fields. Existing FSDB/VCD pages keep their previous defaults.
+
+FST event sessions perform a masked native traversal per batch into private
+per-storage spools, then reap the child before exposing logical readers. The
+optional prefix probe described below may add one traversal. Aliases
+reuse immutable storage with independent positions. Across a batch, at most 128
+backing declarations and 64 MiB of temporary event records are admitted; a shared
+30-second deadline includes preparation, admission and consumption. Requests
+that exceed the spool budget fail explicitly. Only selected-window observations
+and actual prefix evidence are retained, with bounded page decoding in Python.
+This is eager window preparation, so early-exit comparisons still pay its scan
+cost; narrow windows can still scan the selected signals' native prefix.
+Spools, readers and positions expire on close, cancellation or file/epoch change.
+They never enter a persistent cache. Generic page support is an internal
+capability; public analysis gates remain until consumer-specific acceptance.
+
+FST cycle and expression queries are now accepted. Sampling preserves integer fs
+for both before and after phases, including several edges sharing a public ps
+label; cycle rows additionally expose `time_fs` and `clock_period_fs`. Initial
+observations seed state without inventing a transition; recording boundaries
+invalidate it. An unknown, interrupted or ambiguous clock stops the trusted
+prefix. Expression types, fixed selections and sparse/template array bindings
+reuse the common engine. Exact declaration lookup remains independent of the
+analysis gate, and local windows retain their separate conservative inference
+policy. Column sampling shares request-local spools across backing dependencies;
+no FST clock index is retained across requests.
+Full sweeps also prepare one FST batch per existing bounded signal pack. Clock
+and interface consumers reuse that pack's immutable spools; the batch closes
+on success, error or cancellation before the next pack begins. FSDB continues
+to use its existing native transition group and process-global lock.
+
+The optional `fst` extra pins `pylibfst==0.2.1` (BSD-3-Clause Python binding,
+bundled MIT libfst; compression dependencies retain their upstream licenses).
+TraceWeave supplies an adapter, without vendoring upstream source or shipping
+another native bridge. Use the dependency's wheel for the server interpreter;
+source builds follow the dependency's own build requirements. Existing
+FSDB/VCD installations do not import or require pylibfst.
+
+On Linux, `get_sim_paths` discovers `.fst` alongside existing formats, retaining
+newest-first/path ordering and explicit `wave_file` selection. Its additive
+`fst_runtime` receipt and `--doctor` report missing/wrong-version dependencies
+without loading native code. `candidate_ready_unloaded` is only a dependency
+probe. An actual `get_waveform_summary` reports the loaded extension path,
+SHA-256 and version under `fst_backend`. Reconnect after code/dependency changes.
+
+Basic reads include `get_waveform_summary`, `search_signals`,
+`get_signal_at_time`, `get_signal_transitions`, and `get_signals_around_time`,
+including fixed `{path,bits}` selections. Declaration aliases retain distinct
+paths and coordinates; an around-time call reads each storage handle once.
+Missing vector coordinates cannot support a structured selection. Unknown
+direction/type/signedness or array layouts are never inferred. Scope paging
+uses private identity-bound cursors; no public event cursor is introduced.
+
+Raw times are integer fs; public `time_ps` labels use ceiling and `time_fs`
+preserves exact event order. The first value at the file start is an
+`initial_state`, separate from true changes and the strictly pre-window
+`predecessor`. A late window can skip older blocks only after a separate bounded
+probe witnesses a callback strictly after the first loaded block's begin tick
+and strictly before the window for that storage handle. The block's initial
+snapshot cannot satisfy this test. The final filtered traversal must therefore
+replace that snapshot with a genuine predecessor before returning events.
+Batch reads partition handles by this evidence: at most one masked full-prefix
+traversal serves unwitnessed handles and one filtered traversal serves witnessed
+handles, after the common probe. A constant or sparse field no longer forces
+unrelated dense clocks to replay their full history. Without evidence, that
+handle still scans from the recorded beginning; files with dump-inactive
+intervals always retain the original full-prefix path. No block/event
+index or prefix cache survives the request. The probe adds a traversal and may
+cost extra on sparse or mixed selections that need the fallback; private native
+callback/iteration totals include all passes. Libfst's block time filter is
+not a strict event filter; the adapter
+clips by physical time and consumes every admitted page before reporting a
+complete result. Same-tick callback order does not prove delta/NBA order.
+Actual X/Z, missing signals, times outside the recorded range, dump inactivity,
+and a resume without a newly recorded value remain distinct. `value_status`
+and `fst_reading.gaps` qualify evidence; two-state inputs establish only their
+recorded observations. Summary metadata coverage does not certify signal data.
+
+`src/fst_worker.py` owns native state in a request-scoped child process.
+The parent never imports the native library, converts to VCD, or retains an
+event index. Basic reads pause the callback between bounded IPC pages; batch
+analysis writes only bounded selected-window spools before exposing readers.
+Normal completion, errors, cancellation and deadlines terminate/reap the child
+and remove its private temporary directory before releasing reader admission.
+This is deliberate isolation for a callback API without cooperative native
+cancellation. FST requests use the existing per-path wave lock plus a parser
+lock; each native handle has a separate process. FSDB keeps its global lock.
+File realpath/device/inode/size/mtime/ctime changes invalidate reads and cursors;
+close/cache replacement rotates parser identity. There is no persistent FST
+index or result cache.
+
+Within one synchronous request, metadata pages, searches and exact declaration
+queries reuse one thread-owned worker/index. Nested consumers share that lease;
+AnyIO context propagation into another thread creates a separate owner, never
+a shared IPC pipe. Switching parsers releases the old worker before acquiring
+the next parser lock or admission slot. Stream/batch reads consume the lease;
+a batch transfers only its private spool directory and reaps the worker before
+exposing pages. Later reads may build a new index, so this is not a persistent
+native reader or a promise of one build for an entire multi-batch analysis.
+Parser close also reaps idle leases, invalidates epochs and rejects stale
+owners. The synchronous request's finally block reaps remaining metadata work
+on completion, error or cancellation. Lock/admission/IPC waits retain the
+cumulative public deadline. Direct Python consumers can use
+`fst_runtime.request_budget()` to obtain the same bounded request lifecycle;
+individual calls outside that context continue to close their own workers.
+
+| Resource | Bound |
+|---|---|
+| Native children | 4 process-wide; 512 MiB address space each; 30 s per child including admission/open/read |
+| Public FST request | 30 s cumulative across metadata, readers and analysis, including nested comparison inputs; cancellation reaps active native work |
+| Native work | Validated block envelopes; advertised value-block working set above 256 MiB rejected before decode; hard process limit also covers hierarchy/decompression |
+| Private temporary files | 64 MiB per file; selected event spools share a 64 MiB batch/session cap; directory removed on cleanup |
+| Metadata | 32,768 declarations and 32 MiB owned-object index accounting, whichever comes first; depth 256, name 4,096 bytes |
+| Signal / activity | 65,536 bits per declaration; 4,096 dump activity changes |
+| Event page | Default 1,024 records / 256 KiB; hard 4,096 / 1 MiB, including initial/predecessor records |
+| Public read result | 65,536 changes / 8 MiB conservative value accounting; aliases also debit output memory |
+| Local window | 128 signals, 128 history changes each, existing fixed fallback window limit; no clock/transient inference |
+
+Native buffers can exceed a page's size inside the worker; page limits are not
+represented as total-memory bounds. A late narrow window without confirmed
+prefix evidence may still scan a large history and hit the deadline. Large metadata can require
+a smaller dump rather than just a narrower time window. Nonzero `timezero`,
+precision below 1 fs, times beyond signed-64-bit fs, external `.hier`, whole-file
+gzip containers, and real/string/special value types are explicitly unsupported.
+Truncated reads carry partial coverage; display caps alone preserve the read
+coverage and total count. `full` and `compact` project the same validated facts.
+
+Metadata declarations use compact immutable records and share parsed scope
+paths/ancestor references. Public rows and range dictionaries are built only
+for IPC output. Accounting includes object/string sizes and container backing
+allocations; shared enum/small scalar objects are conservatively overcharged.
+It replaces the former per-declaration JSON multiplier, not the native memory
+limit. The 32 MiB budget admits the measured 32,189-declaration NIC workload
+(about 24.1 MiB accounted); it is not a general SoC capacity guarantee. A
+bounded in-construction record, container resize, sorting and IPC projection
+need additional transient space covered by the 512 MiB process address cap.
+Four admitted workers can each consume that cap; it is not a combined RSS
+guarantee. Index accounting, worker RSS and sampled parent/child RSS must be
+reported separately when comparing capacity or performance.
+
+Each worker sorts declaration paths once and charges the retained pointer
+table to the same metadata budget. Scope pages binary-search both the inclusive
+cursor and the lexical candidate interval. Parsed ancestry still determines
+membership: dots inside escaped scope/signal names cannot establish a subtree.
+Direct pages retain descendant visit counting and the original item/byte/scan
+stop order, including empty or non-progressing pages. Substring search uses the
+same sorted table but still checks every declaration; scope indexing does not
+turn substring matching into a prefix query.
+
+Log correlation and recommendation tools also accept FST; their read work runs
+in a cancellable worker. Packed-field resolution validates the same semantic
+source layout against exact FST declarations. Structural work holds no FST wave
+lock. Snapshot X tracing reports `value_unavailable` for an unrecorded sample.
+
+Protocol discovery, sweeps, handshake/TL-UL inspection, transaction reconstruction,
+`period` and `verify_window` reuse the shared analysis engines. Transaction
+input budgets charge initial states separately from predecessors; missing
+recording intervals never carry an old value forward as acceptance evidence.
+Discovery receipts accept `fst_scope_v1`. Period measurement preserves integer
+fs and refuses unknown or incomplete clock coverage.
+
+The schema adds `fst_runtime`, `fst_backend`, `fst_reading`, `initial_state`,
+`value_status`, and `metadata_query_mode="fst_isolated_v1"`; existing enum values
+remain. Strict enum clients must accept the new summary and discovery modes,
+and comparison's `fst_spool_pages_v1`. FST/FST, FST/VCD and native FST/FSDB
+comparisons share the integer-fs page consumer. A future recording gap cannot
+invalidate a proven earlier difference; an earlier gap prevents an earliest
+difference claim. Dynamic and X-history observations retain typed initial
+states and recording gaps through bounded request-local cache slices. They
+never substitute a current recovered input for its earlier sampled value.
+Structural backend identity is independent of waveform format; wave readers
+close before connectivity work. Sub-ps causal scheduling and asynchronous
+assignment values retain their existing explicit proof gaps. Tests in
+`tests/test_fst_*.py` use independent expected event tables and must execute
+with the FST extra installed for FST acceptance.
+
+`scripts/check_fst_readback.py` starts a fresh MCP process and checks every
+waveform tool, including nested expression/packed-field inputs, protocol and
+transaction facts, comparisons, snapshot/history X tracing and log correlation.
+It captures the actually loaded Python paths/hashes inside that server after
+calls and the native identity from the summary. `--require-fsdb` also requires
+native cross-scale point values and exact event-page comparisons in both
+directions. `--installed` exercises an independent wheel outside the checkout;
+the full probe requires both `fst` and `source-graph` extras. Use `--work-dir`
+to retain fixtures and `--output` to save calls and MCP round-trip times (which
+include module fingerprinting). Synthetic compile/log/wave inputs execute the
+parallel hierarchy/structural workflow; zero protocol coverage stays explicit.
+CI installs both extras for the installed-wheel probe; portable operation
+without these extras remains covered separately.
+
+`scripts/benchmark_fst_round2.py --work-dir DIR --generate` writes reproducible
+FST/VCD event tables, including a seeded 1.6-million-event 128-bit workload.
+Run `--workload narrow|dense_clock|metadata|sweep|transactions|compare|large`
+with `--backend fst|vcd --output FILE` in separate processes. Each run performs
+three same-parser requests without flushing OS caches and verifies independent
+expected facts. `--workload lifecycle` measures cancellation through child
+reaping and private-directory removal, timeout cleanup and identity invalidation.
+Receipts include module/native hashes, index accounting, native callbacks,
+spool bytes, JSON size and sampled parent/child RSS. Index RSS deltas include
+allocator/native effects; summed RSS counts shared mappings more than once.
+Independent decompression CPU/bytes and general projection-only time remain
+unavailable. Private worker metrics use Linux `VmHWM`, avoiding inherited
+pre-exec `ru_maxrss`; public operation metrics retain their fixed whitelist.
 
 ## Formal Artifact Discovery
 
@@ -1117,6 +1346,141 @@ exception to the normal fallback chain below, because such a recomputation
 would defeat the bootstrap's resource bound.
 
 ## Connectivity Backend Cooperation (NPI, Source Graph, Static)
+
+Source Graph IR 1.5 / projector 1.12 records a template-local
+`structural_driver_id` independently of every statement's `assignment_id`,
+dependencies, guards, location and dynamic expression. The query binds writer
+identity to the instance; distinct generate blocks, processes and continuous
+assignments stay distinct. Missing procedural identity is an explicit gap and
+cannot prove independent or exclusive writers. Older IR artifacts are rejected.
+Driver collection admits up to 256 writer identities while retaining up to 4,096
+statement matches. Independent bounds remain for 4,096 states, 16,384 inspected
+edges, 16,384 assignment inspections and 4,096 frontiers. Evidence saturation
+continues structural inspection; work saturation stops with an explicit gap.
+Dynamic/dependency queries consume the statement view, never one representative
+per process. `traversal.structural_driver_count` counts known identities (a lower
+bound when identity is missing), `inspected_assignment_count` counts work, and
+`retained_evidence_count` counts retained statement mappings. Their individual
+limits and truncation flags must be read separately.
+
+The driver query records the relation between each visited bit and the requested
+bit. Provenance carries `resolution=found|proved_no_driver|unknown`, exact
+`target_bits`, relevant `reason_codes`, and `driver_set_complete`. A positive
+fact and a complete enumeration are different claims. Constants and local
+assignments can be found without a `source_path`. Scoped exclusions remain
+scoped; exclusions on shared definition statements are rebound to every instance.
+Global context gaps remain global. Budget stops conservatively affect the
+uncompleted query; display-only saturation adds `query_evidence_limit` while
+structural inspection continues. Sparse unresolved bits are never widened to a
+continuous range. If a driver query is inconclusive and Static also returns an
+unsupported result without facts, the router returns that one Source Graph
+artifact's partial result with every backend attempt. Supported Static facts
+still replace the entire payload. Bootstrap and NPI acceptance are unchanged.
+Positive facts from the final artifact also survive a stalled or capped frontier
+expansion; its coverage gaps and specific expansion blocker remain visible.
+
+Source Graph's canonical `driver_chain` and `bit_provenance` group only identical
+metadata belonging to the same known writer. `statement_semantics` retains the
+common guard, dependencies, selection, traversal and evidence strength. Every
+distinct line/column remains in ordered `statement_evidence`; `evidence_index`
+allows `src.driver_evidence.expand_driver_evidence` to reconstruct the original
+row order. `statement_count=0` explicitly marks a structural row with no retained
+statement location. The legacy `source_line`/`source_column` are the first
+evidence location, not a representative replacing the rest. Different guards,
+dependencies, confidence or bit mappings stay separate. This is the default
+lossless representation, not a summary option; internal dynamic queries still
+consume all retained statements. NPI rows are not grouped this way.
+`traversal.returned_fact_count` counts returned chain groups;
+`retained_evidence_count` counts query statement mappings before provenance
+segments are split. `query_instance_path` identifies the requested instance;
+`resolved_instance_path` keeps the historical first driver's instance.
+
+`scripts/benchmark_source_graph_driver_evidence.py` measures the 8-instance,
+512-statement ascending-bus fixture with bad and corrected wiring. Each repeat
+uses a fresh isolated Slang worker and empty memory cache, then one exact warm
+hit, with private temporary staging and no disk cache or persistent session.
+It reports work/coverage, evidence counts, JSON characters/bytes, query/build and
+serialization time, frontend launches and process RSS. Scope is explicitly the
+fixture's nine instances. Run each revision/variant in a fresh process with the
+same Python and fixture; compare baseline correctness as well as response size.
+The original isolated-query measurements retain their explicit-full indented
+schema basis, excluding routing/recovery receipts. Raw minified backend bytes
+are separate. Version 3 also measures a captured short-path public result and
+actual `call_tool` TextContent, including routing, recovery, dependency and wave
+root-binding receipts. Five fresh runtimes followed by exact warm calls are the
+default; presentation uses 50 repetitions with median/min/max wall and CPU time.
+`artifact_attempt_count=1` in isolated samples still means one explicit prepare;
+the wire harness reads actual artifact attempts from the final receipt. It
+observes `runtime.prepare` metrics for frontend launches because ordinary
+one-shot public receipts can omit that field. Missing public fields are recorded
+as missing, not interpreted as zero launches.
+
+```bash
+driver_bench_dir="$(mktemp -d -t traceweave-driver-a.XXXXXX)"
+.venv/bin/python scripts/benchmark_source_graph_driver_evidence.py \
+  --output-directory "$driver_bench_dir/bad" > "$driver_bench_dir/bad.json"
+.venv/bin/python scripts/benchmark_source_graph_driver_evidence.py --corrected \
+  --output-directory "$driver_bench_dir/fixed" > "$driver_bench_dir/fixed.json"
+.venv/bin/python scripts/benchmark_source_graph_driver_evidence.py --guards 300 \
+  --output-directory "$driver_bench_dir/guards" > "$driver_bench_dir/guards.json"
+```
+
+Use `--guards 100`/`450` for growth samples, `--assignment-limit 80`,
+`--evidence-limit 80` or `--max-depth 0` for bounded analysis, and
+`--memo-bytes 1024` for presentation optimization exhaustion. These benchmark
+overrides are not new MCP parameters. The wire harness always measures the
+public default codec limits, even when the short-path presentation uses a low
+memo budget. Inputs are synthetic source/log/VCD files; no simulator is run.
+The short-path in-memory frontend includes correctly resolved module names;
+older unit-test fixtures with an unrelated scope top can omit those fields.
+The standalone complete IR's S[5] negative and the scoped public query's S[5]
+`unknown` (`hierarchy_projection_scoped`) are different analysis contexts;
+both must roundtrip unchanged, and their claims cannot be interchanged.
+Each comparison uses the same complete captured model without stripping either
+variant's fields. Fixture digests, source-file digests, path shapes, Python,
+frontend version, limits and revision are recorded. Input-resident Python peak
+allocation and process RSS are measured in separate fresh processes for full,
+encode and decode; decode memory starts with its input dict resident. The child
+peak uses `/proc/self/status`'s `VmHWM` because `ru_maxrss` can inherit pre-exec
+parent history. Native-worker RSS and the parent high-water mark are reported
+separately. These timings and byte sizes do not establish client token budgets,
+client spill behavior, or query acceleration.
+
+Explicit driver `compile_context` recovery is orchestrated by the server; the
+context resolver stays read-only. Only `hierarchy_unavailable` can trigger one
+lexical hierarchy rebuild. Changed or ambiguous identities return a prerequisite
+block with an executable build call. Primary log identity, supplementary log
+order, simulator, compile-selected top, supplied snapshots and historical source
+fingerprints are validated again on the private candidate before publication.
+Recovery without a historical source token establishes current source context,
+not the sources of a past simulation. A top that cannot be selected unambiguously
+from the compile evidence is a blocker; recent session state never fills it in.
+
+`HierarchyRecoveryRuntime` shares only exact live requests, with one admitted
+build, at most four live flights and an independent per-flight deadline. The
+default hard bounds are 30 seconds including admission, 4,096 source files and
+128 MiB of source reads, counting preprocessor includes; nonzero
+`TRACEWEAVE_HIERARCHY_TIMEOUT` and `TRACEWEAVE_HIERARCHY_MAX_SOURCE_BYTES` can make
+these stricter. Bounded reads prevent a growing include from bypassing preflight.
+One waiter cancellation preserves other waiters; final-waiter cancellation arms
+the existing cooperative worker cancellation. No result is published on failure
+or cancellation before completion. Workers hold no waveform lock and invoke no
+NPI overlay, LSF job or Slang session. Only the event loop registers a validated
+handle; other handles, result caches and workflow/scan state remain intact.
+
+`build_tb_hierarchy.handle_lifetime="process"` is explicit. Driver results and
+prerequisite blockers carry an optional `hierarchy_recovery` receipt with status,
+budgets, coalescing, handle and validated context. `structural_scan_performed`
+remains false: recovering hierarchy does not satisfy the independent parallel
+structural-scan workflow. Ordinary matching no-handle hierarchy reuse is retained.
+
+Driver requests can bind a Verilator `TOP.<compiled_top>` dump root to the
+current design root through `wave_design_binding`. The binding requires exactly
+one compiled top, an exact dump declaration, an unchanged wave identity, and a
+matching optional top hint. A real compiled `TOP` or a multi-top context is
+never stripped. `wave_design_binding` retains both names and explicitly does
+not prove historical source/wave identity. Root binding does not resolve
+generate scopes, arrays or fields; semantic query gaps remain separate.
 
 NPI is the deepest path, Source Graph is the bounded semantic fallback, and
 Static is the normal final source-regex fallback. A clean KDB can support both
@@ -2003,6 +2367,29 @@ bit patterns. See [expression usage and bounds](expressions.md).
 
 ## Packed waveform selections and TL-UL
 
+`get_signals_by_cycle` retains global numbering by default. Explicit
+`cycle_index_origin="window"` requires `start_time_ps` and numbers confirmed
+local edges from zero. `src/local_cycles.py` discovers edges in bounded time
+pages, sharing the existing raw-fs event cursors, polarity rules and column
+sampler. It never reads a full clock history to establish a local index.
+The cumulative budget is one million records / 64 MiB estimated decoded data
+over clock and signal reads, 64 expanding time windows and a 30-second deadline;
+native calls remain cancellable at the existing return/checkpoint boundaries.
+The first time window is at most 1 microsecond. FST spool and native decompression
+costs remain format dependent; the budget does not describe total process RSS.
+
+An earlier X does not block a known local predecessor. The first unknown clock,
+recording gap or same-time clock ambiguity ends the contiguous prefix. Data X
+remains a sampled value. `local_coverage` reports the stop reason and whether the
+entire explicit window was inspected; reaching an output cap does not prove its
+total edge count. `clock_edges_complete=false` makes no global count claim.
+`reading` reports admitted/read records and estimated decoded bytes. A missing
+or budget-limited signal remains unknown/partial. `before` excludes all events
+at the edge; `after` uses the stated ps offset, with `time_fs` and
+`sample_time_fs` preserving exact physical times. It is not delta-cycle settling.
+Integer ps labels can repeat; raw timestamps distinguish returned rows, but an
+integer-ps continuation cannot address the middle of such a timestamp group.
+
 `WaveformSelection` is an additive input to point, transition, around-time,
 cycle, handshake, and transaction queries. The original string branch retains
 its existing behavior. Structured inputs use one exact dump declaration and
@@ -2091,6 +2478,101 @@ mapped interface does not override partial or flagged global sweep evidence.
 
 ## Compact evidence output
 
+`explain_signal_driver` alone defaults to the independent
+`traceweave.driver.compact.v1` typed-table envelope. Its complete retained
+evidence is self-contained; `output_format="full"` preserves the previous shape
+and indentation. `output_options_for_tool()` supplies both catalog and runtime
+defaults. `ExplainDriverResult` remains the internal/direct-dispatch model.
+Use `src.evidence_output.expand_compact_result(text_or_dict)` before reading
+its driver arrays. This default wire change requires migration of old parsers.
+
+### Driver response tables
+
+`src/driver_evidence_codec.py` projects the already-validated model once at the
+final output boundary. Routing, NPI priority, identity validation/recovery,
+dynamic branches, dependency analysis and the canonical model are unchanged.
+Successful NPI/Static results can have four empty tables; the encoder never
+invents Source Graph evidence for them. Only successful `ExplainDriverResult`
+models enter this envelope; errors and prerequisites keep their original shape.
+
+| Field under a driver/provenance row | Table in the same response | Meaning |
+|---|---|---|
+| `statement_semantics_ref` | `statement_semantics` | Complete identical JSON object, including guards, ordered mappings and dependencies |
+| `statement_evidence_ref` | `statement_evidence` | Pair of `locations_ref` and `evidence_indices_ref` |
+| pair's `locations_ref` | `locations` | Exact `columns=["source_line","source_column"]`, ordered rows |
+| pair's `evidence_indices_ref` | `evidence_indices` | Exact ordered integers belonging to this original array |
+
+Inline and referenced forms are mutually exclusive per field. IDs are strict,
+nonnegative, response-local integers, not writer/statement/artifact identities.
+The fixed table graph cannot patch arbitrary result paths. Interning compares
+complete canonical JSON values and preserves bool/int/float distinctions; it
+does not merge facts belonging to different writers. No rows or duplicates are
+removed. Resolution, reason codes, bit order, source/target mappings and all
+receipts remain inline. Identical 64-row location sequences can share storage
+while distinct index sequences still preserve each array's statement order.
+Sparse, reversed and repeated indices are literal values, not ranges.
+
+A null in the typed **location table's column cell only** means the public row
+lacked `source_column`; column zero remains zero. Explicit null in arbitrary
+semantics or an inline row remains present. Unknown/empty rows and
+`statement_count=0` survive. Encoding either leaves unsupported location shapes
+inline or rejects invalid schema inputs; it never drops their extra fields.
+Small/nonprofitable candidates stay inline. The planner includes table entries,
+pair/reference wrappers, comma/ID widths and first-table overhead in its cost.
+
+```python
+import json
+from src.evidence_output import expand_compact_result
+from src.driver_evidence import expand_driver_evidence
+
+response = json.loads(text_content.text)
+driver = (expand_compact_result(text_content.text)
+          if str(response.get("format", "")).startswith("traceweave.")
+          else response)  # explicit full, or an original error/prerequisite
+if "error" not in driver and driver.get("ok") is not False:
+    groups = driver.get("driver_chain") or []
+    statements = (expand_driver_evidence(groups)
+                  if all("evidence_index" in g and "statement_evidence" in g for g in groups)
+                  else groups)  # NPI/Static can already be ordinary, ungrouped rows
+```
+
+The decoder dispatches on the independent format version; the original
+`traceweave.compact.v1` rules remain unchanged. It rejects unknown versions/tools,
+bad ID types/bounds, dangling or inline-plus-ref fields, extra table objects,
+illegal columns/row widths, mismatched lengths and referenced statement counts.
+Pass raw JSON text to also reject duplicate object keys during parsing; a dict
+has already lost that information. Expanded groups own independent mutable
+copies. No external table, handle, source file or previous response is consulted.
+This validates a self-contained encoding, not authenticity: a structurally valid
+manually substituted table is not detectable without a trusted signature.
+
+Encoding defaults to a 16-MiB memo accounting budget (keys plus conservative
+candidate/occurrence/created-row charges), 8,192 candidate entries and 8,192
+emitted table entries. On exhaustion all remaining evidence stays inline. These
+are optimization limits, not a constant total-process-memory promise: input,
+projection and final text scale with evidence size. `DecodeLimits` defaults to
+64 MiB of input/expanded JSON bytes, 2,000,000 value/container nodes, 200,000 total
+statement rows and depth 128. Preflight checks precede output allocation and
+allocation is counted again while copying. A limit raises
+`DriverCodecLimitError`, never a successful empty/partial decode. Trusted offline
+callers may supply explicit limits; they are not client token budgets.
+
+The cancellable worker checks groups, key chunks and location/table rows and
+holds no wave lock. It performs zero additional frontend/backend/wave reads.
+One Pydantic export or Python JSON primitive/final serialization cannot be
+preempted mid-call; cancellation is checked on return. There is no pagination,
+summary mode, retained-result store or automatic evidence downgrade. Distinct
+301-guard evidence remains large even though singleton locations stay inline.
+Use the decoder before the existing per-statement expander; lossless delivery
+of retained facts does not change analysis limits or prove exhaustive coverage.
+
+The repository harness records client status `not_verified`. A real client can
+be labelled `verified_inline` or `verified_spill` only after confirming the new
+format and complete consumption in that client/version. TextContent size alone
+cannot establish either state.
+
+### Original compact.v1 tools
+
 The inspected waveform, discovery, comparison, X-trace, structural-scan and
 diagnostic tools accept `output_format="compact"`. The default `"full"` retains
 the original JSON shape and formatting. `src/schemas.py` owns the supported tool
@@ -2127,7 +2609,7 @@ means the omitted channel receipt is the complete list at the target JSON
 pointer. Only the two channel receipts and the nested transaction receipt can
 be factored; different paths, declared ranges, bit order or contents stay inline.
 There are at most three references, no chains, and no separate evidence table.
-All other result families keep their entire original JSON value within `result`.
+All other result families in the original v1 keep their entire JSON value within `result`.
 Whitespace is removed; nulls, empty evidence, unknown values, unexecuted checks,
 frontiers, identities and both sides of a comparison retain their original wire
 semantics. Tool errors and missing-prerequisite responses keep their original
@@ -2143,7 +2625,7 @@ recovers omitted transactions nor turns a bounded prefix into complete evidence.
 Request narrower scopes/windows or increase the existing display cap when the
 tool's next action permits it; insufficient retained facts require a new call.
 
-Projection runs after analysis in the existing cancellable worker without a
+For the original v1, projection runs after analysis in the existing cancellable worker without a
 waveform lock. It checks cancellation around projection/encoding and between the
 three factoring candidates; an individual Python encoding call is not
 preemptible. It makes no additional waveform/native reads. Temporary JSON
@@ -2311,3 +2793,43 @@ and A/B mappings retain source identities. X history shares this declaration
 resolver. Missing declarations, invalid coordinates and cancellation retain
 their existing distinct outcomes. Binding does not prove delta-cycle order,
 asynchronous behavior or completeness of the driver inventory.
+
+### Bounded elaboration candidates
+
+When the compile hierarchy records a generate/instance-array gap, a deeply dotted
+target may add its exact parent as an `elaboration_candidates` lookup request.
+These paths are separately serialized and fingerprinted; they never enter the
+lexically proved ancestor chains. At most 64 candidates of depth 64 are admitted.
+The focused Slang projector admits only actual Instance objects, retains missing
+candidate gaps, and never enumerates siblings. Trace scope checks require exact
+candidate coverage before a fact enters the chain. Old artifact identities are
+invalidated by the versioned build/worker contract.
+
+The shared `wave_design_binding` maps only a verified unique Verilator top and
+exact dump declaration. Driver/load/path, X-trace and dynamic observation routes
+reuse that mapping without changing source coordinates in the semantic artifact.
+Packed aggregate selections can bind to a typed field alias only when its exact
+dump declaration has the expected range and storage identity. Missing/ambiguous
+aliases remain observation gaps. Constant field selection is projected from the
+same typed assignment RHS; it does not imply complete driver coverage.
+
+### Optional driver dependency inventory
+
+NPI candidate extraction is isolated by the internal
+`include_dependency_candidates` flag, including its LSF worker transport.
+Only an explicit driver dependency request enables it. Ordinary history and
+divergence queries retain their original async observation boundary, opaque
+operator gaps, and traversal cost; they never expand an async data pin solely
+for the optional inventory.
+
+`explain_signal_driver(include_dependencies=true)` attaches a one-hop inventory
+from the selected backend and the same Source Graph artifact, where applicable.
+It reuses typed dynamic expressions and NPI pins; unavailable semantics remain
+gaps. Candidate roles and exact wave selections do not prove an active branch.
+Source coordinates are included when different from the dump selection. The
+default performs no extra query. Limits are 32 selections, 256 expression nodes,
+32 KiB output and a 10-second cooperative deadline; native NPI cancellation still
+waits for its bounded native call to return. Metadata binding runs under the
+wave lock after semantic work finishes. A dependency failure cannot change the
+original backend or erase its driver facts. Choose a time window and phase in
+a separate cycle query; query a direct data input for another explicit hop.

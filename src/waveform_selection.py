@@ -124,15 +124,16 @@ class SelectionParser:
             class ProjectedReader:
                 width = p.selection.width
                 end_fs, mode, native = reader.end_fs, reader.mode, reader.native
+                start_fs = start * 1000
                 def read_page(self):
                     adapter._validate(p)
                     page = reader.read_page()
                     def project(event):
                         value = p.value(event.value)
                         return replace(event, value=value['bin'] if value else None)
-                    return EventPage(tuple(project(e) for e in page.events),
-                        project(page.predecessor) if page.predecessor else None,
-                        page.next_time, page.complete, page.truncated, page.output_bytes)
+                    return replace(page, events=tuple(project(e) for e in page.events),
+                        predecessor=project(page.predecessor) if page.predecessor else None,
+                        initial_state=project(page.initial_state) if page.initial_state else None)
             yield ProjectedReader()
 
     def bind(self, spec):
@@ -210,7 +211,12 @@ class SelectionParser:
         predecessor = result.get("predecessor")
         predecessor = ({**predecessor, "value": p.value(predecessor.get("value"))}
                        if predecessor else None)
-        projected, previous = [], predecessor.get("value") if predecessor else None
+        initial = result.get("initial_state")
+        if initial is not None:
+            initial = {**initial, "value": p.value(initial.get("value"))}
+            result = {**result, "initial_state": initial}
+        anchor = predecessor or initial
+        projected, previous = [], anchor.get("value") if anchor else None
         for row in rows:
             check_cancelled()
             value = p.value(row.get("value"))
@@ -283,6 +289,9 @@ class SelectionParser:
                 signals[path] = entry
                 continue
             mapped = {**entry, "value_at_center": projection.value(entry.get("value_at_center"))}
+            initial = entry.get("initial_state")
+            if initial is not None:
+                mapped["initial_state"] = {**initial, "value": projection.value(initial.get("value"))}
             for name in ("transitions_in_window", "pre_window_transitions"):
                 rows = entry.get(name, [])
                 work += len(rows) * projection.selection.width

@@ -78,7 +78,7 @@ from .source_graph_contract import (
 )
 
 
-SOURCE_GRAPH_ADAPTER_VERSION = "3.13"
+SOURCE_GRAPH_ADAPTER_VERSION = "3.14"
 DEFAULT_SOURCE_GRAPH_FRONTIER_INSTANCE_LIMIT = 128
 _INITIAL_ADJACENT_MAX_NEW_INSTANCES = 32
 _INITIAL_ADJACENT_MAX_ADDED_INPUTS = 24
@@ -96,6 +96,7 @@ _MAX_FILELIST_DEPTH = 64
 _MAX_FILELIST_TOKENS = 1_000_000
 _MANIFEST_CACHE_MAX_ENTRIES = 8
 _BASE_OPTIONS = {
+    "verilator": ("--compat", "all", "--single-unit", "-Wno-unknown-sys-name", "-DVERILATOR=1"),
     "vcs": (
         "--compat",
         "vcs",
@@ -690,7 +691,7 @@ def _translate_tokens(
     index = 0
     if skip_executable and tokens:
         executable = Path(tokens[0]).name
-        if executable in {"vcs", "vlogan", "vhdlan", "xrun", "irun"}:
+        if executable in {"vcs", "vlogan", "vhdlan", "xrun", "irun", "verilator", "verilator_bin"}:
             index = 1
         else:
             state.options_complete = False
@@ -706,6 +707,40 @@ def _translate_tokens(
             return
         token = tokens[index]
         suffix = Path(token).suffix.lower()
+        if state.simulator == "verilator":
+            from .verilator_compile import VALUE_FLAGS
+            if token.startswith("-G") and len(token) > 2:
+                state.options.append(token); index += 1; continue
+            if token in {"--timescale", "--timescale-override"} and index + 1 < len(tokens):
+                state.options.extend(("--timescale", tokens[index + 1])); index += 2; continue
+            if token in VALUE_FLAGS:
+                if index + 1 >= len(tokens):
+                    _mark_unclassified(state)
+                index += 2
+                continue
+            if token in {"--top-module", "--top"} and index + 1 < len(tokens):
+                _append_top(state, tokens[index + 1]); index += 2; continue
+            if token.startswith("--top-module="):
+                _append_top(state, token.split("=", 1)[1]); index += 1; continue
+            if token in {"--sv", "--cc", "-cc", "--sc", "-sc", "--exe", "--build", "--xml-only", "--lint-only", "--assert", "--no-timing", "--timing", "--trace", "--trace-fst", "--trace-structs", "--trace-params", "-Wall", "-Wno-fatal", "--vpi", "--public-flat-rw"} or token.startswith(("-Wno-", "-Wwarn-")):
+                index += 1; continue
+            if not token.startswith(("-", "+")) and suffix == ".vlt":
+                path = _resolve_path(token, base, state)
+                if path is not None:
+                    state.support_files.add(path)
+                    # Waivers and trace selection do not alter RTL. Other control
+                    # directives stay an objective exclusion, never silently exact.
+                    try:
+                        content = path.read_text(errors="replace") if path.stat().st_size <= 1024 * 1024 else ""
+                    except OSError:
+                        content = ""
+                    body = re.sub(r"/\*.*?\*/|//[^\n]*", "", content, flags=re.S).replace("\\\n", " ")
+                    body = re.sub(r"\n\s+(-[A-Za-z])", r" \1", body)
+                    if not content or any(line.strip() and not line.strip().startswith(("`verilator_config", "lint_off", "lint_on", "tracing_on", "tracing_off", "split_var", "isolate_assignments")) for line in body.splitlines()):
+                        state.options_complete = False
+                        state.gap_codes.add("verilator_configuration_unmodeled")
+                        state.objective_exclusions.add("verilator_configuration_unmodeled")
+                index += 1; continue
 
         # Simulator switches can carry values that look like source paths
         # (for example ``+define+ROM=/images/boot.v``, ``-DMODEL=foo.sv``,
@@ -1419,6 +1454,16 @@ def _manifest_snapshot_key(
             or str(Path(record["path"]).resolve(strict=False)) in snapshot_paths
             for record in user_records
         )
+    # New Verilator controls are support inputs, not HDL hierarchy files.
+    # Stat-validate them before every manifest-cache hit, including normal waivers.
+    configuration_records = []
+    if compile_result.get("simulator") == "verilator":
+        evidence = compile_result.get("compile_evidence") or {}
+        for rendered in evidence.get("configuration_files", ()):
+            record = _stat_record(Path(rendered))
+            if record is None:
+                return None
+            configuration_records.append(record)
     payload = {
         "adapter_version": SOURCE_GRAPH_ADAPTER_VERSION,
         "compile_log": log_record,
@@ -1443,6 +1488,8 @@ def _manifest_snapshot_key(
             else None
         ),
     }
+    if configuration_records:
+        payload["verilator_configuration_stats"] = configuration_records
     if content_snapshot is not None and payload["compile_content_snapshot"] is None:
         return None
     try:
@@ -2125,6 +2172,27 @@ def _blocked_plan(
     )
 
 
+def signal_projection_paths(resolution, signal_path: str) -> tuple[str, ...]:
+    """Keep lexical proof separate from a bounded elaboration candidate.
+
+    A generate scope is not an instance. Ask Slang to resolve the exact parent
+    of the target through lookupName, without a sibling or descendant walk.
+    Only the projector's actual Instance objects become IR instances. Keep all
+    lexical gaps and do not promote this candidate into the proved chain.
+    """
+    ancestors = resolution.ancestors
+    parent = signal_path.rpartition(".")[0]
+    gaps = set(resolution.coverage_gap_codes)
+    if (resolution.remaining_path_segment_count >= 3
+            and gaps & {"hierarchy_generate_scope_unmodeled", "hierarchy_instance_array_unexpanded"}
+            and not resolution.missing_instance_proved
+            and len(parent.split(".")) <= 64
+            and all(re.fullmatch(r"[a-zA-Z_$][\w$]*(?:\[-?\d+\])*", part)
+                    for part in parent.split("."))):
+        return tuple(dict.fromkeys((*ancestors, parent)))
+    return ancestors
+
+
 def build_source_graph_plan(
     *,
     compile_log: str,
@@ -2260,11 +2328,7 @@ def build_source_graph_plan(
         signal_path=normalized_signal,
         instance_path_hint=ancestors[-1],
     )
-    # The proved ancestor chain is the canonical bounded projection.  It lets
-    # driver/load and same-chain path queries share one artifact without adding
-    # siblings or descendants; every admitted path came directly from the
-    # hierarchy handle.
-    boundary_paths = tuple(dict.fromkeys(ancestors))
+    boundary_paths = signal_projection_paths(hierarchy_resolution, normalized_signal)
     compile_projection = plan_source_graph_compile_projection(
         manifest=manifest,
         hierarchy_result=hierarchy_result,
@@ -2284,6 +2348,7 @@ def build_source_graph_plan(
         top=top,
         target=target,
         hierarchy_ancestors=ancestors,
+        elaboration_candidates=tuple(p for p in boundary_paths if p not in ancestors),
         requested_cone=RequestedCone(
             operation=operation,
             max_hops=max_hops,
@@ -2433,7 +2498,7 @@ def _expanded_single_endpoint_plan(
     unique_chains = tuple(dict.fromkeys(chains))
     ancestor_union = tuple(
         sorted(
-            set().union(*(set(chain) for chain in unique_chains)),
+            set().union(*(set(chain) for chain in unique_chains), request.artifact_identity.scope.elaboration_candidates),
             key=lambda path: (path.count("."), path),
         )
     )
@@ -2465,6 +2530,7 @@ def _expanded_single_endpoint_plan(
         projection_instance_paths=ancestor_union,
         coverage_boundary=boundary,
         capabilities=base_artifact.scope.capabilities,
+        elaboration_candidates=tuple(p for p in ancestor_union if p not in set().union(*(set(c) for c in unique_chains))),
     )
     artifact = replace(
         base_artifact,
@@ -3047,6 +3113,7 @@ def build_source_graph_trace_plan(
     manifest = request.identity.compile_inputs
     top = request.scope.top
     chains: list[tuple[str, ...]] = []
+    projection_paths: set[str] = set()
     hierarchy_resolutions: list[HierarchyAncestorResolution] = []
     trace_hierarchy_gap_codes: set[str] = set()
     for signal_path in normalized_paths:
@@ -3110,11 +3177,12 @@ def build_source_graph_trace_plan(
             )
         ancestors = hierarchy_resolution.ancestors
         chains.append(ancestors)
+        projection_paths.update(signal_projection_paths(hierarchy_resolution, signal_path))
 
     unique_chains = tuple(dict.fromkeys(chains))
     ancestor_union = tuple(
         sorted(
-            set().union(*(set(chain) for chain in unique_chains)),
+            projection_paths,
             key=lambda path: (path.count("."), path),
         )
     )
@@ -3148,6 +3216,7 @@ def build_source_graph_trace_plan(
         projection_instance_paths=ancestor_union,
         coverage_boundary=boundary,
         capabilities=base_artifact.scope.capabilities,
+        elaboration_candidates=tuple(p for p in ancestor_union if p not in set().union(*(set(c) for c in unique_chains))),
     )
     artifact = replace(
         base_artifact,
@@ -3166,7 +3235,7 @@ def build_source_graph_trace_plan(
     query_key = compute_source_graph_query_key(trace_request.query_identity)
     receipt = replace(
         base.receipt,
-        ancestor_count=len(ancestor_union),
+        ancestor_count=len(set().union(*(set(chain) for chain in unique_chains))),
         requested_cone_instance_count=len(ancestor_union),
         coverage_boundary_instance_count=len(ancestor_union),
         scope_kind=scope_kind,
@@ -3412,6 +3481,10 @@ def build_source_graph_path_plan(
     from_ancestors = from_resolution.ancestors
     to_ancestors = to_resolution.ancestors
     ancestor_union = _path_ancestor_union(from_ancestors, to_ancestors)
+    projection_paths = _path_ancestor_union(
+        signal_projection_paths(from_resolution, normalized_from),
+        signal_projection_paths(to_resolution, normalized_to),
+    )
     lca = _path_lca(from_ancestors, to_ancestors)
     target = ConnectivityPathTarget(
         operation=QueryOperation.PATH,
@@ -3431,7 +3504,7 @@ def build_source_graph_path_plan(
         manifest=manifest,
         hierarchy_result=hierarchy_result,
         top=top,
-        instance_paths=ancestor_union,
+        instance_paths=projection_paths,
     )
     projected_gaps = tuple(sorted({*gaps, *compile_projection.gap_codes}))
     projected_exclusions = tuple(
@@ -3446,17 +3519,18 @@ def build_source_graph_path_plan(
         top=top,
         target=target,
         hierarchy_ancestors=ancestor_union,
+        elaboration_candidates=tuple(p for p in projection_paths if p not in ancestor_union),
         requested_cone=RequestedCone(
             operation=QueryOperation.PATH,
             max_hops=max(len(from_ancestors), len(to_ancestors)) - 1,
-            instance_paths=ancestor_union,
+            instance_paths=projection_paths,
             cross_instance_boundaries=True,
             stop_at_sequential=True,
             include_control_dependencies=False,
         ),
         coverage_boundary=CoverageBoundary(
             mode=BoundaryMode.EXPLICIT,
-            instance_paths=ancestor_union,
+            instance_paths=projection_paths,
             objective_exclusions=projected_exclusions,
         ),
         path_hierarchy=path_hierarchy,
@@ -3509,8 +3583,8 @@ def build_source_graph_path_plan(
         gap_codes=projected_gaps,
         objective_exclusions=projected_exclusions,
         ancestor_count=len(ancestor_union),
-        requested_cone_instance_count=len(ancestor_union),
-        coverage_boundary_instance_count=len(ancestor_union),
+        requested_cone_instance_count=len(projection_paths),
+        coverage_boundary_instance_count=len(projection_paths),
         scope_kind=scope_kind,
         endpoint_count=endpoint_count,
         lca_depth=lca.count("."),

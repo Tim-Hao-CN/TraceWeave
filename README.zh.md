@@ -44,9 +44,42 @@ TraceWeave 是面向 RTL / SoC 调试的 MCP 服务器。它把编译记录、�
 | SoC 层级深、模块和接口多 | 按需浏览层次、查找实例与源码，追踪信号的驱动、消费者和连通路径 |
 | 想验证一个调试假设 | 按周期采样，检查时序条件、握手保持和事务完成情况，取得具体证据 |
 
-支持 VCS / Xcelium 仿真日志及 VCD / FSDB 波形。已有 formal 导出波形同样可查询；当前支持自动发现 JasperGold 产物。
+支持 VCS / Xcelium / Verilator 仿真日志及 VCD / FSDB / FST 波形。已有 formal 导出波形同样可查询；当前支持自动发现 JasperGold 产物。
+
+Linux 上可选启用 FST，支持文件发现、基础读取、固定 bit 选择、表达式、周期采样、协议与事务分析、跨格式比较及 X 历史。摘要列出当前已验收的工具。
 
 信号追踪（驱动、负载与连通路径查询）默认采用 **Verdi NPI → Source Graph → 基础静态分析（Legacy Static）** 三级路由：优先查询已展开的 KDB；NPI 不可用或无法提供可信结果时，尝试免商业 license 的 Source Graph，必要时再按支持范围回退到基础静态分析。
+
+Source Graph 分别统计独立结构驱动和赋值语句，保留限额内的全部分支证据；
+`traversal` 分别报告驱动、赋值检查和证据保留限额。结构驱动重叠不等于波形中
+已经发生值冲突。
+逐位来源明确区分 `found`、`proved_no_driver` 和 `unknown`，并给出原因及
+`driver_set_complete`。预算或未建模写入不能证明无驱动。Source Graph 尚无结论、
+Static 也不支持时，保留 Source Graph 的有限检查证据和完整后端尝试记录。
+驱动链和逐位来源按同一驱动的相同元信息分组，`statement_evidence` 保留全部源码行列；
+旧 `source_line` 对应首条证据。`query_instance_path` 指明查询实例，
+`resolved_instance_path` 保持首个驱动所在实例的兼容含义。VCD 搜索会说明
+`direction=null` 表示元数据不可用。
+
+**驱动输出迁移：** `explain_signal_driver` 现在默认返回
+`traceweave.driver.compact.v1`。单次响应保留全部已保留证据，在响应内的
+typed `evidence_tables` 共享相同语义及有序位置、索引序列。旧脚本可以显式传
+`output_format="full"` 保留原 JSON 形状和缩进，或先解码：
+
+```python
+from src.evidence_output import expand_compact_result
+driver = expand_compact_result(text_content.text)
+print(driver["driver_chain"])
+```
+
+只读取 `response["result"]` 尚未展开引用。表项数、位置出现次数不是 writer 数。
+其他工具默认与 `traceweave.compact.v1` 保持不变。不同证据仍可能很大，不能据此
+保证任意客户端都不转储文件。
+
+层次 handle 仅在服务器进程内有效。驱动查询的显式 `compile_context` 可对丢失的
+handle 尝试一次恢复，受 30 秒、4,096 个源文件和 128 MiB 读取预算约束（已有更严格
+的层次配置优先）。`hierarchy_recovery` 报告复用、重建或阻塞原因。恢复重新校验
+调用方身份；没有历史源码指纹时只建立当前源码上下文，结构扫描仍需单独执行。
 
 面向大型设计的能力与已验证的部分规模：
 
@@ -88,6 +121,16 @@ traceweave-mcp --doctor
 ```
 
 如果只需要日志、VCD 和基础静态分析，可安装 `traceweave-mcp`，省略 `[source-graph]`。PyPI 包不包含 FSDB 读取组件；需要 FSDB 时请选择仓库安装。
+
+### 可选 FST 读取
+
+在 MCP 服务使用的 Python 环境安装：`python3.11 -m pip install "traceweave-mcp[fst]"`。仓库安装则使用 `.venv/bin/python -m pip install "pylibfst==0.2.1"`。重新连接服务后，通过 `traceweave-mcp --doctor` 或 `get_sim_paths` 检查依赖状态。已有 VCD/FSDB 用户无需安装此依赖。
+
+例如：“找到 `/path/to/run` 下的 FST 波形，查看摘要，搜索 `top.data`，读取 10 ns 到 20 ns 的跳变。”基础工具保留 X/Z，并区分缺失记录区间与实际观测值。当前不支持非零时间偏移、real/string 信号、外置层级文件和整文件 gzip 容器。索引、原生内存、结果量或时间超过限制时会明确停止；可缩小查询或使用更小的 dump。详见 [FST 能力与资源限制](docs/architecture.md#fst-basic-reading)。
+
+可继续使用相同工具检查 FST 握手、重建事务、与 VCD/FSDB 信号比较，或在输入恢复后
+回溯先前传播的 X。源码分析仍需提供相应编译上下文；记录缺口和不完整时钟历史只作为
+部分证据，不能据此排除问题。
 
 ## 客户端配置
 
@@ -174,11 +217,41 @@ export TRACEWEAVE_NPI_LSF_QUEUE="digital"
 
 结果会说明实际检查的项目和缺失信息。窗口内尚未完成的请求不直接判为死锁，这些检查也不替代完整的 TL-UL 协议验证。
 
-调试对话较长时，可以要求助手使用紧凑证据输出。重复的字段映射只展示一份，实际检查范围、缺失证据、时间边界和下一步仍会保留。已有客户端默认保持原有输出。示例及客户端接入方式见[紧凑证据输出](docs/architecture.md#compact-evidence-output)。
+调试对话较长时，可以要求助手使用紧凑证据输出。重复的字段映射只展示一份，实际检查范围、缺失证据、时间边界和下一步仍会保留。这些波形工具默认保持原有输出；驱动工具按上文迁移。示例及客户端接入方式见[紧凑证据输出](docs/architecture.md#compact-evidence-output)。
 
 字段配置与详细支持范围见[总线字段与 TL-UL 使用说明](docs/architecture.md#packed-waveform-selections-and-tl-ul)。
 
 ### 自定义运行期报错格式
+
+### Verilator 运行日志
+
+`parse_sim_log(log_path=..., simulator="verilator")` 支持原生 assertion、
+`$error` / `$fatal` / `$stop`，带有界 Python traceback 的 cocotb test failed，
+X-HEEP `example_dma` 数据比较及软件退出值，以及 OpenTitan 软件比较和状态失败。
+编译 warning/error、`ERROR:cocotb:` 外层级别、源码回显、正常 `$finish` 和软件退出 0
+不会计作运行失败。其他自定义 TB 文本需要明确配置 custom patterns。
+
+裸原生时间默认保持 `time_ps=None`。只有独立核实 TB/context 后才传
+`native_time_unit="ps"`（也支持 fs/ns/us/ms/s），它只换算原生/custom/UVM 的裸仿真时间；
+日志显式单位优先。换算使用精确十进制，亚 ps 向上取整到公开整数 ps。
+周期数、UART 行和宿主墙钟不获得波形时间。可选 TraceWeave 验收观察器只给软件退出或
+终止锚点，不代表首个错误 RTL 交易；源码位置是检测点，不能直接作为根因。
+分析和 snapshot/log diff 必须使用同一已核实单位；不同单位设置的快照拒绝比较。
+未知时间仍返回日志上下文，不自动查询 0ps。
+
+Verilator 发现使用有界日志头尾采样，支持延后的 cocotb banner。
+层次和结构分析需要真实 HDL 命令（`verilator --cc/--xml-only ...`）、显式
+`--top-module`、执行 cwd（如 Make entering-directory 行）及可读的有序 `-f`/`-F`
+输入。include、define 和 top 参数覆盖接入既有 Source Graph frontend；C++ 和 `.vlt`
+控制文件不混入 HDL。waiver/trace/优化控制作为支持输入纳入指纹，未建模控制保留明确
+覆盖缺口。缺少 HDL 命令、filelist 或 top 时不猜测；纯 C++ 构建日志不能代替 HDL
+上下文，不自动恢复无关侧车或遍历 vendor 全树。
+
+先 `get_sim_paths`，再对同一 compile log 并行执行 `build_tb_hierarchy` 与
+`scan_structural_risks`，然后解析/分析运行日志。失败有波形时执行 `sweep_handshakes`；
+zero/partial coverage 不能排除 OBI 故障。源码查询使用实际 HDL top 路径；波形中的
+Verilator 合成 `TOP.` 前缀不是 HDL instance，只在确认后续段等于编译 top 后移除。
+Static/Source Graph 仍保留有界覆盖，不引入 Verilator NPI/KDB 后端。
 
 `parse_sim_log` 已内置标准 `UVM_ERROR` / `UVM_FATAL` 和 VCS / Xcelium 断言失败的解析，并提供通用 `ERROR` 匹配。对于项目自定义的 checker、scoreboard 或 `$display` 输出，可以在 [custom_patterns.yaml](custom_patterns.yaml) 中添加 Python 正则表达式，无需修改 Python 代码。日志不必包含 `UVM_ERROR`，甚至不必包含 `ERROR`。
 

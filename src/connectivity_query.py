@@ -44,6 +44,8 @@ from .source_graph_contract import (
     DEFAULT_QUERY_FRONTIER_LIMIT,
     DEFAULT_QUERY_MATCH_LIMIT,
     DEFAULT_QUERY_STATE_LIMIT,
+    DEFAULT_QUERY_ASSIGNMENT_LIMIT,
+    DEFAULT_QUERY_EVIDENCE_LIMIT,
 )
 
 
@@ -140,6 +142,8 @@ class QueryMatch:
     # positive match is downgraded because the surrounding artifact is
     # incomplete, preserve the source-evidence strength independently.
     positive_fact_confidence: QueryConfidence | None = None
+    structural_driver_id: str | None = None
+    selected_target: SignalSelection | None = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +152,14 @@ class QueryFrontier:
 
     signal: SignalSelection
     query_target: SignalSelection
+
+
+@dataclass(frozen=True)
+class QueryBitResolution:
+    bit: int
+    resolution: str
+    reason_codes: tuple[str, ...]
+    driver_set_complete: bool
 
 
 @dataclass(frozen=True)
@@ -175,6 +187,14 @@ class ConnectivityQueryResult:
     edge_truncated: bool = False
     match_truncated: bool = False
     frontier_truncated: bool = False
+    structural_matches: tuple[QueryMatch, ...] = ()
+    structural_driver_count: int = 0
+    inspected_assignment_count: int = 0
+    assignment_limit: int = DEFAULT_QUERY_ASSIGNMENT_LIMIT
+    evidence_limit: int = DEFAULT_QUERY_EVIDENCE_LIMIT
+    assignment_truncated: bool = False
+    evidence_truncated: bool = False
+    bit_resolutions: tuple[QueryBitResolution, ...] = ()
 
     @property
     def truncated(self) -> bool:
@@ -183,6 +203,8 @@ class ConnectivityQueryResult:
             or self.edge_truncated
             or self.match_truncated
             or self.frontier_truncated
+            or self.assignment_truncated
+            or self.evidence_truncated
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -277,6 +299,11 @@ class _QueryWorkBudget:
     edge_truncated: bool = False
     match_truncated: bool = False
     frontier_truncated: bool = False
+    assignment_limit: int = DEFAULT_QUERY_ASSIGNMENT_LIMIT
+    evidence_limit: int = DEFAULT_QUERY_EVIDENCE_LIMIT
+    inspected_assignment_count: int = 0
+    assignment_truncated: bool = False
+    evidence_truncated: bool = False
 
     @property
     def truncated(self) -> bool:
@@ -285,6 +312,7 @@ class _QueryWorkBudget:
             or self.edge_truncated
             or self.match_truncated
             or self.frontier_truncated
+            or self.assignment_truncated
         )
 
     def admit_state(self, visited_state_count: int) -> bool:
@@ -302,12 +330,26 @@ class _QueryWorkBudget:
         self.inspected_edge_count += 1
         return True
 
+    def inspect_assignment(self) -> bool:
+        check_cancelled()
+        if self.inspected_assignment_count >= self.assignment_limit:
+            self.assignment_truncated = True
+            return False
+        if not self.inspect_edge():
+            return False
+        self.inspected_assignment_count += 1
+        return True
+
 
 class _BoundedQueryCollector:
     """Keep deterministic unique matches/frontiers within fixed output caps."""
 
-    def __init__(self, budget: _QueryWorkBudget) -> None:
+    def __init__(self, budget: _QueryWorkBudget, *, drivers: bool = False) -> None:
         self.budget = budget
+        self.drivers = drivers
+        self._driver_keys: set[tuple[str, str]] = set()
+        self.structural_matches: dict[tuple[Any, ...], QueryMatch] = {}
+        self.evidence_truncated_bits: set[int] = set()
         self._matches: dict[tuple[Any, ...], QueryMatch] = {}
         self._frontiers: dict[tuple[Any, ...], QueryFrontier] = {}
 
@@ -326,9 +368,24 @@ class _BoundedQueryCollector:
             if len(match.traversal) < len(current.traversal):
                 self._matches[key] = match
             return True
-        if len(self._matches) >= self.budget.match_limit:
+        driver_key = _structural_driver_key(match)
+        admitted_key = driver_key or (match.instance_path, "unknown:" + match.fact_id)
+        count = len(self._driver_keys) if self.drivers else len(self._matches)
+        is_new = admitted_key not in self._driver_keys if self.drivers else True
+        if is_new and count >= self.budget.match_limit:
             self.budget.match_truncated = True
             return False
+        if self.drivers:
+            self._driver_keys.add(admitted_key)
+            # Structural summaries carry bit mappings, not substitutes for
+            # statements. Dynamic/dependency consumers still use all matches.
+            structural_key = (admitted_key, match.target, match.covered_signal,
+                              match.constant_bits, match.traversal)
+            self.structural_matches.setdefault(structural_key, match)
+            if len(self._matches) >= self.budget.evidence_limit:
+                self.budget.evidence_truncated = True
+                self.evidence_truncated_bits.update(match.covered_signal.bits)
+                return True
         self._matches[key] = match
         return True
 
@@ -397,6 +454,8 @@ class ConnectivityQueryEngine:
         edge_limit: int = DEFAULT_QUERY_EDGE_LIMIT,
         match_limit: int = DEFAULT_QUERY_MATCH_LIMIT,
         frontier_limit: int = DEFAULT_QUERY_FRONTIER_LIMIT,
+        assignment_limit: int = DEFAULT_QUERY_ASSIGNMENT_LIMIT,
+        evidence_limit: int = DEFAULT_QUERY_EVIDENCE_LIMIT,
     ) -> ConnectivityQueryResult:
         if max_depth < 0:
             raise ValueError("max_depth must not be negative")
@@ -404,13 +463,17 @@ class ConnectivityQueryEngine:
         edge_limit = _positive_query_limit(edge_limit, "edge_limit")
         match_limit = _positive_query_limit(match_limit, "match_limit")
         frontier_limit = _positive_query_limit(frontier_limit, "frontier_limit")
+        assignment_limit = _positive_query_limit(assignment_limit, "assignment_limit")
+        evidence_limit = _positive_query_limit(evidence_limit, "evidence_limit")
         budget = _QueryWorkBudget(
             state_limit=state_limit,
             edge_limit=edge_limit,
             match_limit=match_limit,
             frontier_limit=frontier_limit,
+            assignment_limit=assignment_limit,
+            evidence_limit=evidence_limit,
         )
-        collector = _BoundedQueryCollector(budget)
+        collector = _BoundedQueryCollector(budget, drivers=True)
         check_cancelled()
         signal = self.resolve_signal(
             signal_path,
@@ -421,6 +484,8 @@ class ConnectivityQueryEngine:
         traversed = 0
         depth_limited = False
         touched_paths: set[str] = {signal.path()}
+        bit_paths: list[tuple[SignalSelection, SignalSelection]] = []
+        depth_limited_bits: set[int] = set()
 
         def visit(
             current: SignalSelection,
@@ -441,10 +506,11 @@ class ConnectivityQueryEngine:
                 return
             visited.add(state)
             touched_paths.add(current.path())
+            bit_paths.append((current, query_target))
             covered_positions: set[int] = set()
 
             for assignment in self._writes.get(_endpoint_key(current), ()):
-                if not budget.inspect_edge():
+                if not budget.inspect_assignment():
                     return
                 if not _overlaps(assignment.target.bits, current.bits):
                     continue
@@ -534,6 +600,7 @@ class ConnectivityQueryEngine:
                 )
                 if depth >= max_depth:
                     depth_limited = True
+                    depth_limited_bits.update(covered.bits)
                     if not collector.add_frontier(
                         QueryFrontier(signal=upstream, query_target=covered)
                     ):
@@ -571,6 +638,10 @@ class ConnectivityQueryEngine:
             query_gaps=query_gaps,
             budget=budget,
             visited_state_count=len(visited),
+            structural_matches=list(collector.structural_matches.values()),
+            bit_paths=bit_paths,
+            depth_limited_bits=depth_limited_bits,
+            evidence_truncated_bits=collector.evidence_truncated_bits,
         )
 
     def query_loads(
@@ -990,6 +1061,16 @@ class ConnectivityQueryEngine:
                 f"signal path does not resolve to an IR instance: {signal_path}",
             )
         symbol = base[len(instance_path) + 1 :]
+        # An elaborated packed-array alias such as req[4] is an element,
+        # whereas req.data[4] is a bit select. Exact typed aliases win before
+        # interpreting the last bracket as a flat packed selection.
+        full_symbol = signal_path.strip()[len(instance_path) + 1:]
+        definition = self._definitions[self._instances[instance_path].definition_id]
+        exact_member = definition.packed_member(full_symbol)
+        if exact_member is not None:
+            return SignalSelection(instance_path=instance_path,
+                                   symbol=exact_member.aggregate,
+                                   bits=exact_member.aggregate_bits)
         resolved = self._resolve_symbol(instance_path, symbol)
         if resolved is None:
             root, separator, _ = symbol.partition(".")
@@ -1218,6 +1299,8 @@ class ConnectivityQueryEngine:
         return QueryMatch(
             instance_path=instance_path,
             fact_id=assignment.assignment_id,
+            structural_driver_id=assignment.structural_driver_id,
+            selected_target=selected_target,
             kind=assignment.kind,
             target=assignment.target.bind(instance_path),
             covered_signal=covered_signal,
@@ -1317,11 +1400,20 @@ class ConnectivityQueryEngine:
         query_gaps: Iterable[CoverageGap],
         budget: _QueryWorkBudget,
         visited_state_count: int,
+        structural_matches: list[QueryMatch] | None = None,
+        bit_paths: list[tuple[SignalSelection, SignalSelection]] | None = None,
+        depth_limited_bits: set[int] | None = None,
+        evidence_truncated_bits: set[int] | None = None,
     ) -> ConnectivityQueryResult:
+        coverage_gaps = (
+            tuple(gap for gap in self.ir.coverage.gaps if
+                  any(_gap_affects_selection(gap, current) for current, _ in bit_paths))
+            if bit_paths is not None else _relevant_gaps(self.ir.coverage.gaps, touched_paths)
+        )
         gaps_by_key = {
             _gap_key(gap): gap
             for gap in (
-                *_relevant_gaps(self.ir.coverage.gaps, touched_paths),
+                *coverage_gaps,
                 *query_gaps,
             )
         }
@@ -1354,6 +1446,10 @@ class ConnectivityQueryEngine:
                 "query_frontier_limit",
                 "query result exceeds the internal expansion-frontier limit",
             ),
+            (budget.assignment_truncated, "query_assignment_limit",
+             "query reached the assignment inspection work limit"),
+            (budget.evidence_truncated, "query_evidence_limit",
+             "statement evidence retention limit reached; structural inspection continued"),
         )
         for active, code, message in truncation_gaps:
             if not active:
@@ -1368,16 +1464,67 @@ class ConnectivityQueryEngine:
         deduped = _dedupe_matches(matches)
         drivers_by_bit: dict[int, set[tuple[str, str]]] = defaultdict(set)
         constant_bit_set: set[int] = set()
-        for match in deduped:
-            driver_key = (match.instance_path, match.fact_id)
+        structural = _dedupe_matches(structural_matches) if structural_matches is not None else deduped
+        resolved_bit_set: set[int] = set()
+        for match in structural:
+            driver_key = _structural_driver_key(match)
+            resolved_bit_set.update(match.covered_signal.bits)
+            if driver_key is None and operation == "driver":
+                gap = CoverageGap(code="driver_identity_unavailable",
+                    message="statement evidence has no known structural writer identity",
+                    impact=CoverageStatus.PARTIAL,
+                    scopes=(match.covered_signal.path(include_bits=True),))
+                gaps_by_key[_gap_key(gap)] = gap
             for bit in match.covered_signal.bits:
-                drivers_by_bit[bit].add(driver_key)
+                if driver_key is not None:
+                    drivers_by_bit[bit].add(driver_key)
                 if match.kind is EdgeKind.CONSTANT_DRIVER:
                     constant_bit_set.add(bit)
-        resolved_bit_set = set(drivers_by_bit)
         unresolved_bits = tuple(
             bit for bit in signal.bits if bit not in resolved_bit_set
         )
+        bit_resolutions = ()
+        if operation == "driver":
+            reasons: dict[int, set[str]] = {bit: set() for bit in signal.bits}
+            # This is query evidence, computed before rendering. A missing bit
+            # inherits only gaps on the inspected paths that map to that bit.
+            for current, target in bit_paths or [(signal, signal)]:
+                check_cancelled()
+                for gap in gaps_by_key.values():
+                    if gap.code in {"query_evidence_limit", "query_depth_limit"}:
+                        continue
+                    for local_bit, query_bit in zip(current.bits, target.bits):
+                        selected = SignalSelection(current.symbol, (local_bit,), current.instance_path)
+                        if _gap_affects_selection(gap, selected):
+                            reasons[query_bit].add(gap.code)
+            # Query-local gaps use requested bit coordinates, including paths
+            # whose traversal was prevented by a work budget.
+            for bit in signal.bits:
+                check_cancelled()
+                selected = SignalSelection(signal.symbol, (bit,), signal.instance_path)
+                for gap in gaps_by_key.values():
+                    if gap.code not in {"query_evidence_limit", "query_depth_limit"} and _gap_affects_selection(gap, selected):
+                        reasons[bit].add(gap.code)
+                if _query_coverage(self.ir.coverage, ()) is not CoverageStatus.COMPLETE:
+                    # Missing files or unscoped global incompleteness cannot
+                    # turn into a negative merely because no local row exists.
+                    if not reasons[bit]:
+                        reasons[bit].add("projection_coverage_incomplete")
+                if bit in (depth_limited_bits or ()):
+                    reasons[bit].add("query_depth_limit")
+            resolutions = []
+            for bit in signal.bits:
+                complete = not reasons[bit]
+                if bit in (evidence_truncated_bits or ()):
+                    reasons[bit].add("query_evidence_limit")
+                resolutions.append(QueryBitResolution(
+                    bit=bit,
+                    resolution=("found" if bit in resolved_bit_set else
+                                "proved_no_driver" if complete else "unknown"),
+                    reason_codes=tuple(sorted(reasons[bit])),
+                    driver_set_complete=complete,
+                ))
+            bit_resolutions = tuple(resolutions)
         if operation == "driver" and deduped and unresolved_bits:
             base_gaps = tuple(gaps_by_key.values())
             base_coverage = _query_coverage(self.ir.coverage, base_gaps)
@@ -1438,6 +1585,14 @@ class ConnectivityQueryEngine:
             edge_truncated=budget.edge_truncated,
             match_truncated=budget.match_truncated,
             frontier_truncated=budget.frontier_truncated,
+            structural_matches=structural if operation == "driver" else (),
+            structural_driver_count=len({key for m in structural if (key := _structural_driver_key(m)) is not None}),
+            inspected_assignment_count=budget.inspected_assignment_count,
+            assignment_limit=budget.assignment_limit,
+            evidence_limit=budget.evidence_limit,
+            assignment_truncated=budget.assignment_truncated,
+            evidence_truncated=budget.evidence_truncated,
+            bit_resolutions=bit_resolutions,
         )
 
 
@@ -1755,6 +1910,29 @@ def _relevant_gaps(
     )
 
 
+def _gap_affects_selection(gap: CoverageGap, selected: SignalSelection) -> bool:
+    if gap.affects(selected.path()):
+        return True
+    for scope in gap.scopes:
+        prefix = selected.path() + "["
+        if scope.startswith(prefix) and scope.endswith("]"):
+            indices = scope[len(prefix):-1].split(",")
+            if len(indices) > 1:
+                if all(re.fullmatch(r"-?\d+", item) for item in indices):
+                    if set(map(int, indices)).intersection(selected.bits):
+                        return True
+                    continue
+                return True  # an unmodeled selection cannot exclude a writer
+        match = _TRAILING_SELECT_RE.fullmatch(scope)
+        if not match or match.group("base") != selected.path() or match.group("left") is None:
+            continue
+        left = int(match.group("left"))
+        right = int(match.group("right") or left)
+        if any(min(left, right) <= bit <= max(left, right) for bit in selected.bits):
+            return True
+    return False
+
+
 def _query_coverage(
     report: CoverageReport,
     gaps: tuple[CoverageGap, ...],
@@ -1780,6 +1958,16 @@ def _query_coverage(
     if report.status is CoverageStatus.PARTIAL:
         return CoverageStatus.PARTIAL
     return CoverageStatus.COMPLETE
+
+
+def _structural_driver_key(match: QueryMatch) -> tuple[str, str] | None:
+    if match.structural_driver_id:
+        return match.instance_path, match.structural_driver_id
+    # Continuous assignments and constant bindings are independent sources by
+    # construction. A missing procedural identity cannot prove independence.
+    if match.kind in {EdgeKind.CONTINUOUS_ASSIGN, EdgeKind.CONSTANT_DRIVER}:
+        return match.instance_path, match.fact_id
+    return None
 
 
 def _query_match_key(match: QueryMatch) -> tuple[Any, ...]:
@@ -1833,6 +2021,8 @@ def _with_confidence(match: QueryMatch, confidence: QueryConfidence) -> QueryMat
         confidence=confidence,
         constant_bits=match.constant_bits,
         positive_fact_confidence=(match.positive_fact_confidence or match.confidence),
+        structural_driver_id=match.structural_driver_id,
+        selected_target=match.selected_target,
     )
 
 

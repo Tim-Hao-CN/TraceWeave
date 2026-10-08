@@ -50,7 +50,7 @@ class EvidenceOutputOptions(SchemaModel):
 
 
 # Only inspected result families opt into the shared presentation contract.
-COMPACT_OUTPUT_TOOLS = frozenset({
+LEGACY_COMPACT_OUTPUT_TOOLS = frozenset({
     "get_waveform_summary", "get_signal_at_time", "get_signal_transitions",
     "get_signals_around_time", "get_signals_by_cycle", "inspect_handshake",
     "inspect_tlul", "reconstruct_transactions", "resolve_packed_fields",
@@ -58,6 +58,24 @@ COMPACT_OUTPUT_TOOLS = frozenset({
     "diff_first_divergence", "trace_divergence", "trace_x_source",
     "scan_structural_risks", "get_diagnostic_snapshot",
 })
+COMPACT_OUTPUT_TOOLS = LEGACY_COMPACT_OUTPUT_TOOLS | {"explain_signal_driver"}
+
+
+class DriverEvidenceOutputOptions(SchemaModel):
+    output_format: Literal["full", "compact"] = Field(
+        default="compact",
+        description=(
+            "compact (default) delivers all retained evidence in a self-contained "
+            "traceweave.driver.compact.v1 response with typed evidence_tables. "
+            "Refs are response-local table indices. full preserves the original "
+            "driver JSON shape and indentation for legacy consumers."
+        ),
+    )
+
+
+def output_options_for_tool(name: str) -> type[SchemaModel]:
+    """One source for catalog defaults and actual call_tool argument parsing."""
+    return DriverEvidenceOutputOptions if name == "explain_signal_driver" else EvidenceOutputOptions
 
 
 class SelectionEvidenceReference(SchemaModel):
@@ -78,7 +96,7 @@ class CompactEvidenceResult(SchemaModel):
 
     @model_validator(mode="after")
     def validate_references(self):
-        if self.tool not in COMPACT_OUTPUT_TOOLS:
+        if self.tool not in LEGACY_COMPACT_OUTPUT_TOOLS:
             raise ValueError("compact_output_tool_unsupported")
         seen = set()
         for ref in self.references:
@@ -148,6 +166,15 @@ class NextRequiredStep(SchemaModel):
     reason: str
 
 
+class FstRuntimeInfo(SchemaModel):
+    enabled: bool
+    dependency: Literal["pylibfst"]
+    required_version: str
+    installed_version: str | None = None
+    status: Literal["platform_unsupported", "dependency_missing", "version_unsupported", "candidate_ready_unloaded"]
+    message: str
+
+
 class SimPathsResult(SchemaModel):
     verif_root: str
     case_name: str | None = None
@@ -157,6 +184,7 @@ class SimPathsResult(SchemaModel):
     case_dir: str | None = None
     simulator: str | None = None
     fsdb_runtime: dict[str, Any] = Field(default_factory=dict)
+    fst_runtime: FstRuntimeInfo | None = None
     compile_logs: list[FileEntry] = Field(default_factory=list)
     sim_logs: list[FileEntry] = Field(default_factory=list)
     wave_files: list[FileEntry] = Field(default_factory=list)
@@ -243,6 +271,7 @@ class BuildTbHierarchyResult(SchemaModel):
     """
 
     hierarchy_handle: str = ""
+    handle_lifetime: Literal["process"] = "process"
     build_status: Literal["completed", "blocked"] = "completed"
     blocker: dict[str, Any] | None = None
     project: dict[str, Any] = Field(default_factory=dict)
@@ -491,6 +520,7 @@ class SuggestedToolCall(SchemaModel):
 
 
 class ParseSimLogResult(TruncatableResult):
+    native_time_unit: Literal["fs", "ps", "ns", "us", "ms", "s"] | None = None
     log_file: str
     # Generic, boundary-safe pointer set when a scoreboard/compare-style failure
     # is detected: such failures are often a SYMPTOM of a lower-level bus-protocol
@@ -594,6 +624,36 @@ class DiffResult(SchemaModel):
     convergence_summary: str | None = None
 
 
+class FstRecordingGap(SchemaModel):
+    start_fs: int
+    end_fs: int
+    start_inclusive: bool
+    end_inclusive: bool
+    reason: Literal["outside_recorded_range", "unrecorded", "dump_inactive",
+                    "unrecorded_after_dump_resume", "read_limit"]
+
+
+class FstReading(SchemaModel):
+    mode: Literal["isolated_libfst_v1"]
+    coverage_status: Literal["complete", "partial"]
+    recorded_start_fs: int
+    recorded_end_fs: int
+    gaps: list[FstRecordingGap]
+    time_labels: Literal["ceil_ps"]
+    native_memory_limit_bytes: int
+
+
+class FstBackend(SchemaModel):
+    dependency: Literal["pylibfst"]
+    version: str
+    native_path: str
+    native_sha256: str
+    storage_count: int
+    supported_tools: list[str]
+    analysis_status: Literal["not_run"]
+    observation_scope: Literal["recorded_digital_values_only"]
+
+
 class WaveformSummaryResult(SchemaModel):
     file: str
     format: str
@@ -610,11 +670,13 @@ class WaveformSummaryResult(SchemaModel):
     total_signals: int
     top_modules: list[str] | None = None
     sample_signals: list[str] | None = None
-    metadata_query_mode: Literal["native_v1", "legacy_search"] | None = None
+    metadata_query_mode: Literal["native_v1", "legacy_search", "fst_isolated_v1"] | None = None
     sample_signals_order: Literal["lexical", "legacy_ranked"] | None = None
     top_modules_complete: bool | None = None
     producer_hint: str | None = None
     producer_evidence: str | None = None
+    fst_backend: FstBackend | None = None
+    fst_reading: FstReading | None = None
 
 
 class SearchSignalsResult(SchemaModel):
@@ -810,6 +872,9 @@ class SignalAtTimeResult(SchemaModel):
     time_ps: int
     time_ns: float
     value: dict[str, Any] | None = None
+    value_status: Literal["recorded", "outside_recorded_range", "unrecorded", "dump_inactive",
+                          "unrecorded_after_dump_resume", "read_incomplete"] | None = None
+    fst_reading: FstReading | None = None
     # Set when a bare bus name was auto-completed to name[msb:lsb]; carries the
     # original input so the caller sees the path was resolved.
     resolved_from: str | None = None
@@ -829,6 +894,8 @@ class SignalTransitionsResult(SchemaModel):
     # remains a strict closed-window list while clock samplers can classify the
     # first in-window edge without rereading the waveform.
     predecessor: dict[str, Any] | None = None
+    initial_state: dict[str, Any] | None = None
+    fst_reading: FstReading | None = None
     predecessor_kind: Literal["declaration_anchor", "dependency_anchor"] | None = None
     truncated: bool = False
     transition_count_is_lower_bound: bool = False
@@ -862,10 +929,15 @@ class CycleEntry(SchemaModel):
     cycle: int
     time_ps: int
     time_ns: float
+    time_fs: int | None = None
+    sample_time_fs: int | None = None
     signals: dict[str, SignalValue] = Field(default_factory=dict)
 
 
 class GetSignalsByCycleResult(SchemaModel):
+    cycle_index_origin: Literal["global", "window"] = "global"
+    local_coverage: dict[str, Any] | None = None
+    reading: dict[str, Any] | None = None
     selections: list[WaveformSelectionReceipt] = Field(default_factory=list)
     expressions: list[WaveformExpressionReceipt] = Field(default_factory=list)
     transition_data_truncated: bool = False
@@ -875,6 +947,7 @@ class GetSignalsByCycleResult(SchemaModel):
     sample_phase: Literal["after", "before"] = "after"
     sample_offset_ps: int = 1
     clock_period_ps: int | None = None
+    clock_period_fs: int | None = None
     total_edges_found: int
     clock_edges_complete: bool = True
     start_cycle: int
@@ -1003,7 +1076,22 @@ class DiagnosticSnapshot(SchemaModel):
     missing_steps: list[dict[str, Any]] | None = None
 
 
-class DriverChainHop(SchemaModel):
+class DriverStatementEvidence(SchemaModel):
+    source_line: int = Field(ge=1)
+    source_column: int | None = Field(default=None, ge=0)
+    evidence_index: int = Field(ge=0)
+
+
+class DriverEvidenceGroup(SchemaModel):
+    structural_driver_id: str | None = None
+    statement_semantics: dict[str, Any] | None = None
+    source_column: int | None = None
+    statement_count: int | None = Field(default=None, ge=0)
+    statement_evidence: list[DriverStatementEvidence] | None = None
+    evidence_index: int | None = None
+
+
+class DriverChainHop(DriverEvidenceGroup):
     depth: int
     signal_path: str
     resolved_module: str | None = None
@@ -1047,10 +1135,14 @@ class DriverLoadCrossCheck(SchemaModel):
     note: str | None = None
 
 
-class DriverBitProvenanceSegment(SchemaModel):
+class DriverBitProvenanceSegment(DriverEvidenceGroup):
     """Per-bit-range source provenance for a segmented driver result."""
 
     target_path: str
+    target_bits: list[int] = Field(default_factory=list)
+    resolution: Literal["found", "proved_no_driver", "unknown"] | None = None
+    reason_codes: list[str] = Field(default_factory=list)
+    driver_set_complete: bool | None = None
     source_kind: Literal["signal", "constant", "unresolved"]
     source_path: str | None = None
     terminal_path: str | None = None
@@ -1084,6 +1176,15 @@ class DriverTraversalReceipt(SchemaModel):
         ]
     ] = Field(default_factory=list)
     continuation_supported: Literal[False] = False
+    structural_driver_count: int | None = Field(default=None, ge=0)
+    structural_driver_limit: int | None = Field(default=None, ge=1)
+    driver_limit_truncated: bool = False
+    inspected_assignment_count: int | None = Field(default=None, ge=0)
+    assignment_limit: int | None = Field(default=None, ge=1)
+    assignment_truncated: bool = False
+    retained_evidence_count: int | None = Field(default=None, ge=0)
+    evidence_limit: int | None = Field(default=None, ge=1)
+    evidence_truncated: bool = False
 
 
 class SourceGraphClaimSemanticsReceipt(SchemaModel):
@@ -1103,12 +1204,35 @@ class SourceGraphClaimSemanticsReceipt(SchemaModel):
     negative_claim_allowed: bool
 
 
+class HierarchyRecoveryReceipt(SchemaModel):
+    status: Literal["hit_existing", "rebuilt", "blocked"]
+    attempted: bool = False
+    coalesced: bool = False
+    hierarchy_handle: str | None = None
+    handle_lifetime: Literal["process"] = "process"
+    identity_basis: Literal["validated_historical_source", "current_sources"] | None = None
+    compile_context: dict[str, Any] | None = None
+    blocker: str | None = None
+    timeout_sec: float | None = None
+    max_source_files: int | None = None
+    max_source_bytes: int | None = None
+    source_files_read: int | None = None
+    source_bytes_read: int | None = None
+    wall_time_ms: float = 0
+    structural_scan_performed: Literal[False] = False
+    note: str | None = None
+
+
 class ExplainDriverResult(SchemaModel):
+    hierarchy_recovery: HierarchyRecoveryReceipt | None = None
+    dependency_context: dict[str, Any] | None = None
+    wave_design_binding: dict[str, Any] | None = None
     signal_path: str
     wave_path: str
     resolved_rtl_name: str
     resolved_module: str | None = None
     resolved_instance_path: str | None = None
+    query_instance_path: str | None = None
     driver_status: str
     driver_kind: str | None = None
     source_file: str | None = None
@@ -1135,6 +1259,100 @@ class ExplainDriverResult(SchemaModel):
 
 
 ExplainSignalDriverResult = ExplainDriverResult
+
+
+class DriverEvidenceReferences(SchemaModel):
+    """Only these two fields can reference response-local driver tables."""
+
+    statement_semantics_ref: StrictInt | None = Field(default=None, ge=0)
+    statement_evidence_ref: StrictInt | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def exclusive_references(self):
+        for field in ("statement_semantics", "statement_evidence"):
+            ref = field + "_ref"
+            if ref in self.model_fields_set:
+                if getattr(self, ref) is None or field in self.model_fields_set:
+                    raise ValueError("driver_compact_reference_invalid")
+        return self
+
+
+class CompactDriverChainHop(DriverEvidenceReferences, DriverChainHop):
+    pass
+
+
+class CompactDriverBitProvenanceSegment(DriverEvidenceReferences, DriverBitProvenanceSegment):
+    pass
+
+
+class CompactDriverPayload(ExplainDriverResult):
+    driver_chain: list[CompactDriverChainHop] | None = None
+    bit_provenance: list[CompactDriverBitProvenanceSegment] | None = None
+
+
+class DriverLocationTable(SchemaModel):
+    columns: list[Literal["source_line", "source_column"]]
+    rows: list[list[StrictInt | None]]
+
+    @model_validator(mode="after")
+    def typed_columns(self):
+        from .cancellation import check_cancelled
+        if self.columns != ["source_line", "source_column"]:
+            raise ValueError("driver_compact_columns_invalid")
+        for index, row in enumerate(self.rows):
+            if index % 256 == 0:
+                check_cancelled()
+            if (len(row) != 2 or type(row[0]) is not int or row[0] < 1
+                    or (row[1] is not None and (type(row[1]) is not int or row[1] < 0))):
+                raise ValueError("driver_compact_location_invalid")
+        return self
+
+
+class DriverStatementReference(SchemaModel):
+    locations_ref: StrictInt = Field(ge=0)
+    evidence_indices_ref: StrictInt = Field(ge=0)
+
+
+class DriverEvidenceTables(SchemaModel):
+    statement_semantics: list[dict[str, Any]]
+    statement_evidence: list[DriverStatementReference]
+    locations: list[DriverLocationTable]
+    evidence_indices: list[list[Annotated[StrictInt, Field(ge=0)]]]
+
+
+class DriverCompactEvidenceResult(SchemaModel):
+    """Wire-only; canonical analysis and direct dispatch keep ExplainDriverResult."""
+
+    format: Literal["traceweave.driver.compact.v1"]
+    tool: Literal["explain_signal_driver"]
+    result: CompactDriverPayload
+    evidence_tables: DriverEvidenceTables
+
+    @model_validator(mode="after")
+    def reference_closure(self):
+        from .cancellation import check_cancelled
+        tables = self.evidence_tables
+        for pair in tables.statement_evidence:
+            check_cancelled()
+            if (pair.locations_ref >= len(tables.locations)
+                    or pair.evidence_indices_ref >= len(tables.evidence_indices)):
+                raise ValueError("driver_compact_reference_out_of_range")
+            if len(tables.locations[pair.locations_ref].rows) != len(tables.evidence_indices[pair.evidence_indices_ref]):
+                raise ValueError("driver_compact_evidence_length_mismatch")
+        for section in (self.result.driver_chain, self.result.bit_provenance):
+            for group in section or ():
+                check_cancelled()
+                sem = group.statement_semantics_ref
+                evidence = group.statement_evidence_ref
+                if sem is not None and sem >= len(tables.statement_semantics):
+                    raise ValueError("driver_compact_reference_out_of_range")
+                if evidence is not None:
+                    if evidence >= len(tables.statement_evidence):
+                        raise ValueError("driver_compact_reference_out_of_range")
+                    pair = tables.statement_evidence[evidence]
+                    if group.statement_count != len(tables.locations[pair.locations_ref].rows):
+                        raise ValueError("driver_compact_statement_count_mismatch")
+        return self
 
 
 class BackendAttemptReceipt(SchemaModel):
@@ -1345,6 +1563,13 @@ class SourceGraphBackendReceipt(SchemaModel):
     traversed_binding_edges: int = 0
     max_depth: int | None = None
     inspected_edge_count: int = 0
+    structural_driver_count: int | None = None
+    inspected_assignment_count: int | None = None
+    retained_evidence_count: int | None = None
+    assignment_limit: int | None = None
+    evidence_limit: int | None = None
+    assignment_truncated: bool = False
+    evidence_truncated: bool = False
     state_limit: int | None = None
     edge_limit: int | None = None
     match_limit: int | None = None
@@ -1426,7 +1651,7 @@ class SourceGraphBackendReceipt(SchemaModel):
 
 
 class BackendStatus(SchemaModel):
-    simulator: Literal["vcs", "xcelium", "unknown"] = "unknown"
+    simulator: Literal["vcs", "xcelium", "verilator", "unknown"] = "unknown"
     # ``backend`` retains its legacy meaning (policy-selected backend).  The
     # additive fields make a multi-attempt NPI -> Source Graph -> Static route
     # explicit without changing existing callers.
@@ -1549,6 +1774,7 @@ class LoadEnumerationReceipt(SchemaModel):
 
 
 class FindSignalLoadsResult(SchemaModel):
+    wave_design_binding: dict[str, Any] | None = None
     signal_path: str
     resolved_rtl_name: str
     resolved_module: str | None = None
@@ -1595,6 +1821,7 @@ _TRACE_SIGNAL_PATH_DIRECTION_NOTE = (
 
 
 class TraceSignalPathResult(SchemaModel):
+    wave_design_binding: dict[str, Any] | None = None
     from_signal: str
     to_signal: str
     found: bool
@@ -1621,6 +1848,8 @@ class TraceSignalPathResult(SchemaModel):
 
 
 class TraceChainNode(SchemaModel):
+    value_status: str | None = None
+    fst_reading: FstReading | None = None
     depth: int
     signal_path: str
     value_at_time: str | None = None
@@ -1672,6 +1901,7 @@ class XHistoryEvidence(SchemaModel):
 
 
 class TraceXSourceResult(SchemaModel):
+    wave_design_binding: dict[str, Any] | None = None
     start_signal: str
     start_time_ps: int
     trace_status: str
@@ -1693,13 +1923,22 @@ class PrerequisiteBlockResult(SchemaModel):
     required_before: str
     reason: str
     suggested_call: dict[str, Any] = Field(default_factory=dict)
+    hierarchy_recovery: HierarchyRecoveryReceipt | None = None
 
 
 class ToolErrorResult(SchemaModel):
     error: str
     error_code: str | None = None
     fsdb_runtime: dict[str, Any] | None = None
+    fst_runtime: FstRuntimeInfo | None = None
     fallback: dict[str, Any] | None = None
+
+
+class FstCapabilityErrorResult(ToolErrorResult):
+    error_code: Literal["fst_analysis_not_validated"] = "fst_analysis_not_validated"
+    analysis_status: Literal["not_run"] = "not_run"
+    supported_tools: list[str]
+    suggested_call: dict[str, Any]
 
 
 class KeywordLimitErrorResult(ToolErrorResult):
@@ -1764,7 +2003,7 @@ class CursorDeleteResult(SchemaModel):
 
 class DivergenceContext(SchemaModel):
     compile_log: str = Field(min_length=1)
-    simulator: Literal["auto", "vcs", "xcelium"] = "auto"
+    simulator: Literal["auto", "vcs", "xcelium", "verilator"] = "auto"
     supplementary_compile_logs: list[str] = Field(default_factory=list, max_length=16)
     top_hint: str | None = None
     hierarchy_handle: str | None = None
@@ -1785,8 +2024,8 @@ class DivergenceNextAction(SchemaModel):
 
 
 class ComparisonReading(SchemaModel):
-    mode_a: Literal['native_event_pages_v1', 'vcd_index_pages', 'legacy_materialized', 'event_pages_failed', 'expression_time_groups']
-    mode_b: Literal['native_event_pages_v1', 'vcd_index_pages', 'legacy_materialized', 'event_pages_failed', 'expression_time_groups']
+    mode_a: Literal['native_event_pages_v1', 'vcd_index_pages', 'fst_spool_pages_v1', 'legacy_materialized', 'event_pages_failed', 'expression_time_groups']
+    mode_b: Literal['native_event_pages_v1', 'vcd_index_pages', 'fst_spool_pages_v1', 'legacy_materialized', 'event_pages_failed', 'expression_time_groups']
     events_read: int = Field(default=0, ge=0)
     pages_read: int = Field(default=0, ge=0)
     native_read_calls: int | None = Field(default=None, ge=0)
@@ -2010,7 +2249,7 @@ class SignalDiscoveryCoverage(SchemaModel):
     signal_limit: int = 65_536
     signals_returned: int = 0
     reasons: list[str] = Field(default_factory=list)
-    mode: Literal["paged", "native_scope_v1", "vcd_scope_v1", "legacy_search"] | None = None
+    mode: Literal["paged", "native_scope_v1", "vcd_scope_v1", "fst_scope_v1", "legacy_search"] | None = None
     pages_read: int | None = None
     signals_scanned: int | None = None
     scan_limit: int | None = None

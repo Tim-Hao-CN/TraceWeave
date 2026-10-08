@@ -44,9 +44,50 @@ Use it with Claude Code, Codex, Copilot, or another MCP client. Describe the pro
 | A deep SoC hierarchy with many modules and interfaces | Browse hierarchy on demand, locate instances and source files, and follow drivers, consumers, and connectivity paths |
 | A debugging hypothesis needs evidence | Sample by cycle and check timing conditions, handshake stability, and transaction completion |
 
-Supports VCS / Xcelium simulation logs and VCD / FSDB waveforms. Exported formal waveforms can also be queried; automatic artifact discovery currently supports JasperGold.
+Supports VCS / Xcelium / Verilator simulation logs and VCD / FSDB / FST waveforms. Exported formal waveforms can also be queried; automatic artifact discovery currently supports JasperGold.
+
+Optional FST support on Linux provides discovery, basic reads, fixed bit selections, expressions, cycle sampling, protocol and transaction analysis, cross-format comparison and X history. The summary lists the currently accepted tools.
 
 Signal tracing (driver, load, and connectivity path queries) follows **Verdi NPI → Source Graph → basic static analysis (Legacy Static)** by default. It first queries the elaborated KDB; when NPI is unavailable or cannot provide a trustworthy result, it tries Source Graph without a commercial license, then falls back to basic static analysis where supported.
+
+Source Graph counts independent structural writers separately from assignment
+statements. All retained branch evidence remains available; `traversal` reports
+writer, assignment inspection, and evidence limits separately. Overlapping
+writers are structural evidence, not proof of an observed value conflict.
+Bit provenance explicitly distinguishes `found`, `proved_no_driver`, and
+`unknown`, with reason codes and `driver_set_complete`. A budget or unsupported
+write never proves absence. If Static also cannot handle an inconclusive
+Source Graph query, the bounded Source Graph evidence and both attempts remain
+visible.
+Driver-chain and provenance rows share identical metadata within a writer;
+`statement_evidence` retains every source line and column. The legacy
+`source_line` names the first entry. `query_instance_path` names the queried
+instance, while `resolved_instance_path` keeps its historical head-driver meaning.
+VCD searches explain that `direction=null` means unavailable metadata.
+
+**Driver output migration:** `explain_signal_driver` now defaults to
+`traceweave.driver.compact.v1`. Each response contains all retained evidence,
+with identical statement semantics and ordered locations/indices shared in
+typed `evidence_tables`. Legacy scripts should request `output_format="full"`
+to retain the original JSON shape and indentation, or decode the response:
+
+```python
+from src.evidence_output import expand_compact_result
+driver = expand_compact_result(text_content.text)
+print(driver["driver_chain"])
+```
+
+Reading only `response["result"]` does not expand its references. Table entries
+and location occurrences are not writer counts. Other tools keep their defaults
+and `traceweave.compact.v1` contract. Distinct evidence can still produce large
+responses; this format does not guarantee inline delivery by every client.
+
+Hierarchy handles live only in the server process. An explicit driver
+`compile_context` can recover a missing handle once under a 30-second,
+4,096-source-file, 128-MiB read budget (stricter hierarchy settings apply).
+`hierarchy_recovery` reports reuse, rebuilding or a blocker. Supplied identity
+tokens are revalidated; without a historical source fingerprint, recovery
+establishes current sources only. Structural scanning remains a separate step.
 
 Capabilities for large designs, with selected examples of validated scale:
 
@@ -88,6 +129,17 @@ traceweave-mcp --doctor
 ```
 
 For logs, VCD, and basic static analysis only, install `traceweave-mcp` without `[source-graph]`. The PyPI package does not include the FSDB reader; use the repository installation for FSDB.
+
+### Optional FST reads
+
+Install the extra in the MCP server's Python environment: `python3.11 -m pip install "traceweave-mcp[fst]"`. For a repository installation, use `.venv/bin/python -m pip install "pylibfst==0.2.1"`. Reconnect the server, then check `traceweave-mcp --doctor` or `get_sim_paths`. Existing VCD/FSDB users do not need this dependency.
+
+For example, ask: “Find the FST waveform under `/path/to/run`, show its summary, find `top.data`, and read its transitions from 10 ns to 20 ns.” The basic tools preserve X/Z and distinguish missing recording intervals from observed values. Nonzero time offsets, real/string signals, external hierarchy files, and whole-file gzip containers are currently unsupported. Reads exceeding the bounded index, native memory, result, or time limits stop explicitly; narrow the query or use a smaller dump. See [FST boundaries and resource limits](docs/architecture.md#fst-basic-reading).
+
+Use the same analysis tools to inspect FST handshakes, reconstruct transactions,
+compare an FST signal against VCD/FSDB, or trace an earlier X after its input has
+recovered. Source-based analysis keeps its usual compile-context prerequisites.
+Recording gaps and incomplete clock history remain partial evidence.
 
 ## Client Setup
 
@@ -176,11 +228,51 @@ For TL-UL interfaces, once the assistant confirms the field mapping and clock, i
 
 Results state which checks ran and what information is missing. A request still outstanding at the end of the window is not automatically a deadlock, and these checks do not replace full TL-UL protocol verification.
 
-For a long debugging conversation, ask for compact evidence output. Repeated field mappings are shown once, while checked scope, missing evidence, time boundaries and next steps remain available. Existing clients keep their usual output by default. See [compact evidence output](docs/architecture.md#compact-evidence-output) for examples and client integration.
+For a long debugging conversation, ask for compact evidence output. Repeated field mappings are shown once, while checked scope, missing evidence, time boundaries and next steps remain available. These waveform tools keep their usual output by default; driver output follows the migration above. See [compact evidence output](docs/architecture.md#compact-evidence-output) for examples and client integration.
 
 See [bus fields and TL-UL](https://github.com/gokeshenzhen/TraceWeave/blob/main/docs/architecture.md#packed-waveform-selections-and-tl-ul) for field configuration and detailed support limits.
 
 ### Custom Runtime Error Formats
+
+### Verilator runtime logs
+
+`parse_sim_log(log_path=..., simulator="verilator")` recognizes native runtime
+assertions / `$error` / `$fatal` / `$stop`, cocotb test failures with bounded Python
+tracebacks, X-HEEP `example_dma` comparisons and software exit values, and
+OpenTitan software comparisons / status failures. Compiler warnings and errors,
+`ERROR:cocotb:` logger wrappers, source echoes, normal `$finish`, and software
+exit zero are excluded. Other custom TB text needs explicit custom patterns.
+
+Bare native timestamps stay `time_ps=None` unless `native_time_unit="ps"` (or
+fs/ns/us/ms/s) is supplied with independently verified TB/context evidence.
+This setting applies only to native/custom/UVM bare simulation timestamps.
+Explicit units take precedence. Conversion uses exact decimal arithmetic and
+rounds up sub-ps time to integer ps. Cycle counts, UART rows, and host wallclock
+time do not acquire waveform timestamps. Optional TraceWeave acceptance
+observers provide software-exit or termination anchors, not the first bad RTL
+transaction. Detection source locations are checker locations, not root causes.
+Use the same verified unit setting in analysis and snapshot/log diff calls;
+snapshots with different settings cannot be compared. Unknown-time analysis
+returns log context without querying 0ps.
+
+Verilator discovery reads bounded head/tail log samples, including delayed cocotb
+banners. Hierarchy and structural analysis require a real HDL invocation
+(`verilator --cc/--xml-only ...`) with an explicit `--top-module`, the execution
+cwd (for example Make's entering-directory line), and available ordered
+`-f`/`-F` inputs. Include paths, macros, and top parameter overrides are replayed
+into the existing Source Graph frontend; C++ files and `.vlt` controls are not
+HDL. Waiver/trace/optimizer controls are fingerprinted support inputs; unmodeled
+controls stay explicit coverage exclusions. Missing HDL commands, filelists,
+or tops remain gaps. A C++ build log alone does not provide HDL context; there
+is no automatic unrelated-sidecar or vendor-tree recovery.
+
+Run `get_sim_paths`, then `build_tb_hierarchy` and `scan_structural_risks` in
+parallel on that same compile log before parsing/analyzing the run. Failed runs
+with waveforms require `sweep_handshakes`; zero/partial coverage does not exclude
+OBI failures. Source queries use the actual elaborated HDL top path: Verilator's
+synthetic waveform `TOP.` prefix is not an HDL instance (remove it only after
+confirming the following segment is the compiled top). Static/Source Graph
+coverage remains bounded; no Verilator NPI/KDB backend is introduced.
 
 `parse_sim_log` already recognizes standard `UVM_ERROR` / `UVM_FATAL` messages and VCS / Xcelium assertion failures, with a generic `ERROR` fallback. For project-specific checker, scoreboard, or `$display` output, add Python regular expressions to [custom_patterns.yaml](https://github.com/gokeshenzhen/TraceWeave/blob/main/custom_patterns.yaml). Custom messages do not need to contain `UVM_ERROR` or even `ERROR`; no Python changes are required.
 

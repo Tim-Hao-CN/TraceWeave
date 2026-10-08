@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Sequence
 from .dynamic_evidence import Expr, TRUE, Assignment as DynamicAssignment
 from . import slang_dynamic
+from .cancellation import check_cancelled
 
 from .connectivity_ir import (
     AssignmentFact,
@@ -58,6 +59,8 @@ from .connectivity_ir import (
 SLANG_FRONTEND_NAME = "Slang/pyslang"
 SLANG_FRONTEND_VERSION = "11.0.0"
 MAX_RECORDED_PROJECTION_GAPS = 256
+MAX_PACKED_ALIASES = 1024
+MAX_PACKED_ALIAS_BITS = 65536
 
 
 class SlangProjectionError(RuntimeError):
@@ -327,10 +330,31 @@ class SlangConnectivityProjector:
     def project(self, root: Any) -> SlangProjection:
         self._seed_declared_gaps()
         self._collect_hierarchy(root)
-        definitions = tuple(
-            self._project_definition(record)
-            for _, record in sorted(self._definition_representatives.items())
-        )
+        definitions = []
+        aliases: dict[str, list[str]] = {}
+        for record in self._records:
+            aliases.setdefault(record.definition_id, []).append(record.path)
+        for _, record in sorted(self._definition_representatives.items()):
+            check_cancelled()
+            first_gap = len(self._gaps._items)
+            definitions.append(self._project_definition(record))
+            # Statements are shared by definition. Their objective exclusions
+            # must follow every instance too, or a sibling could falsely claim
+            # exhaustive coverage of exactly the same unsupported body.
+            template_gaps = tuple(self._gaps._items[first_gap:])
+            for path in aliases[record.definition_id]:
+                check_cancelled()
+                if path == record.path:
+                    continue
+                for gap in template_gaps:
+                    scopes = tuple(path + scope[len(record.path):]
+                        if scope == record.path or scope.startswith(record.path + ".") else scope
+                        for scope in gap.scopes)
+                    if scopes != gap.scopes:
+                        self._gaps.add(code=gap.code, message=gap.message,
+                            impact=gap.impact, constructs=gap.constructs,
+                            scopes=scopes, location=gap.location)
+        definitions = tuple(definitions)
         instances = tuple(self._project_instance(record) for record in self._records)
         bindings: list[PortBinding] = []
         for record in self._records:
@@ -660,8 +684,22 @@ class SlangConnectivityProjector:
         modports: list[ModportDecl] = []
         assignments: list[AssignmentFact] = []
         assignment_keys: set[tuple[Any, ...]] = set()
-        for member, generate_scope in _template_members(instance.body, record.path):
+        for member_index, (member, generate_scope) in enumerate(
+            _template_members(instance.body, record.path)
+        ):
             kind = _kind_name(member)
+            # The member ordinal distinguishes blocks even at identical macro
+            # source locations. Generate scope distinguishes elaborated copies;
+            # definition identity distinguishes specializations. Instances bind
+            # this template-local identity later, without copying statements.
+            material = f"{record.definition_id}|{member_index}|{generate_scope}|{kind}"
+            driver_id = "driver_" + hashlib.sha256(material.encode()).hexdigest()[:20]
+
+            def identify(facts):
+                return [replace(fact, structural_driver_id=driver_id,
+                    assignment_id="assign_" + hashlib.sha256(
+                        f"{driver_id}|{fact.assignment_id}".encode()).hexdigest()[:20])
+                    for fact in facts]
             if kind in {"Variable", "Net"}:
                 absolute_path = str(member.hierarchicalPath)
                 # A net declaration initializer is a continuous assignment;
@@ -678,7 +716,7 @@ class SlangConnectivityProjector:
                                                  bits=packed_range.indices),),
                         dynamic=slang_dynamic.assignment(self,assignment,record,aliases,
                                                         process=str(member.location)))
-                    _extend_unique_assignments(assignments,facts,assignment_keys)
+                    _extend_unique_assignments(assignments,identify(facts),assignment_keys)
                 if absolute_path in port_internal_paths:
                     continue
                 location = self._location(member.location)
@@ -729,7 +767,7 @@ class SlangConnectivityProjector:
                     aliases,
                     generate_scope,
                 )
-                _extend_unique_assignments(assignments, facts, assignment_keys)
+                _extend_unique_assignments(assignments, identify(facts), assignment_keys)
             elif kind == "ProceduralBlock":
                 facts = self._project_procedural_block(
                     member,
@@ -737,7 +775,7 @@ class SlangConnectivityProjector:
                     aliases,
                     generate_scope,
                 )
-                _extend_unique_assignments(assignments, facts, assignment_keys)
+                _extend_unique_assignments(assignments, identify(facts), assignment_keys)
         return DefinitionTemplate(
             definition_id=record.definition_id,
             name=str(definition.name),
@@ -834,12 +872,61 @@ class SlangConnectivityProjector:
         fallback_location: SourceLocation,
         scope: str,
     ) -> list[PackedMemberDecl]:
-        """Flatten packed struct/union fields onto one root aggregate."""
+        """Map bounded, typed packed members and constant array elements.
+
+        Array indices are storage coordinates from the elaborated type, never
+        guessed from a dump spelling. Unpacked and dynamic arrays stay gaps.
+        """
 
         projected: list[PackedMemberDecl] = []
+        alias_bits = 0
+
+        def admit(name, packed_range, bits, location):
+            nonlocal alias_bits
+            if (len(projected) >= MAX_PACKED_ALIASES or
+                    alias_bits + len(bits) > MAX_PACKED_ALIAS_BITS):
+                self._gaps.add(
+                    code="packed_members_budget_exceeded",
+                    message="bounded packed member projection stopped",
+                    impact=CoverageStatus.PARTIAL,
+                    constructs=("packed_aggregate",),
+                    scopes=(f"{scope}.{aggregate}",),
+                    location=fallback_location,
+                )
+                return False
+            projected.append(PackedMemberDecl(
+                name=name, aggregate=aggregate, packed_range=packed_range,
+                aggregate_bits=bits, location=location))
+            alias_bits += len(bits)
+            return True
 
         def walk(value_type: Any, prefix: str, container_bits: tuple[int, ...]) -> None:
             canonical = getattr(value_type, "canonicalType", value_type)
+            if _kind_name(canonical) == "PackedArrayType":
+                element = canonical.elementType.canonicalType
+                # Plain vectors already have exact packed bit selection. Only
+                # aggregate arrays need named aliases (including nested arrays).
+                leaf = element
+                while _kind_name(leaf) == "PackedArrayType":
+                    leaf = leaf.elementType.canonicalType
+                if not (bool(getattr(leaf, "isStruct", False)) or
+                        bool(getattr(leaf, "isPackedUnion", False))):
+                    return
+                bounds = canonical.fixedRange
+                indices = range(int(bounds.left), int(bounds.right) +
+                                (-1 if bounds.left > bounds.right else 1),
+                                -1 if bounds.left > bounds.right else 1)
+                width = int(element.bitWidth)
+                if width < 1 or width * len(indices) != len(container_bits):
+                    return
+                element_range = _packed_range(SimpleNamespace(type=element))
+                for offset, index in enumerate(indices):
+                    bits = container_bits[offset * width:(offset + 1) * width]
+                    name = f"{prefix}[{index}]"
+                    if not admit(name, element_range, bits, fallback_location):
+                        return
+                    walk(element, name, bits)
+                return
             if not (
                 bool(getattr(canonical, "isStruct", False))
                 or bool(getattr(canonical, "isPackedUnion", False))
@@ -883,15 +970,8 @@ class SlangConnectivityProjector:
                         location=location,
                     )
                     continue
-                projected.append(
-                    PackedMemberDecl(
-                        name=name,
-                        aggregate=aggregate,
-                        packed_range=field_range,
-                        aggregate_bits=field_bits,
-                        location=location,
-                    )
-                )
+                if not admit(name, field_range, field_bits, location):
+                    return
                 walk(field.type, name, field_bits)
 
         walk(getattr(symbol, "type", None), aggregate, aggregate_bits)
@@ -1436,6 +1516,7 @@ class SlangConnectivityProjector:
                 location,
                 target,
                 target_index,
+                generate_scope,
             )
             facts.append(
                 AssignmentFact(
@@ -2619,10 +2700,11 @@ def _assignment_id(
     location: SourceLocation,
     target: SignalSelection,
     target_index: int,
+    generate_scope: str | None = None,
 ) -> str:
     material = (
         f"{definition_id}|{kind.value}|{location.file}|{location.line}|"
-        f"{location.column}|{target.symbol}|{target.bits}|{target_index}"
+        f"{location.column}|{target.symbol}|{target.bits}|{target_index}|{generate_scope}"
     ).encode("utf-8")
     return f"assign_{hashlib.sha256(material).hexdigest()[:20]}"
 

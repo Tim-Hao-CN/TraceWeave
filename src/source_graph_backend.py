@@ -7,7 +7,7 @@ does not invoke NPI or Legacy Static, so a returned result has one provenance.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 import re
 from typing import Any
 
@@ -22,6 +22,7 @@ from .connectivity_query import (
     SignalResolutionError,
 )
 from .source_graph_runtime import SourceGraphCacheEntry
+from .driver_evidence import group_driver_evidence
 
 
 _DISPLAY_SIGNAL_RE = re.compile(r"^(?P<base>.+?)(?:\[-?\d+(?::-?\d+)?\])?$")
@@ -145,9 +146,10 @@ def _driver_traversal_receipt(
 ) -> dict[str, Any]:
     gap_codes = set(_gap_codes(result))
     reasons: list[str] = []
-    if result.match_truncated:
+    if result.evidence_truncated or result.match_truncated:
         reasons.append("output_limit")
-    if result.state_truncated or result.edge_truncated or result.frontier_truncated:
+    if (result.state_truncated or result.edge_truncated or result.frontier_truncated
+            or result.assignment_truncated or result.match_truncated):
         reasons.append("work_limit")
     if "query_depth_limit" in gap_codes:
         reasons.append("depth_limit")
@@ -155,14 +157,25 @@ def _driver_traversal_receipt(
         reasons.append("coverage_incomplete")
     return {
         "returned_fact_count": len(result.matches),
-        "output_limit": result.match_limit,
-        "output_truncated": result.match_truncated,
+        "output_limit": result.evidence_limit,
+        "output_truncated": result.evidence_truncated or result.match_truncated,
+        "structural_driver_count": result.structural_driver_count,
+        "structural_driver_limit": result.match_limit,
+        "driver_limit_truncated": result.match_truncated,
+        "inspected_assignment_count": result.inspected_assignment_count,
+        "assignment_limit": result.assignment_limit,
+        "assignment_truncated": result.assignment_truncated,
+        "retained_evidence_count": len(result.matches),
+        "evidence_limit": result.evidence_limit,
+        "evidence_truncated": result.evidence_truncated,
         "visited_state_count": result.visited_state_count,
         "state_limit": result.state_limit,
         "state_truncated": bool(
             result.state_truncated
             or result.edge_truncated
             or result.frontier_truncated
+            or result.assignment_truncated
+            or result.match_truncated
         ),
         "search_exhaustive": bool(
             claim_semantics["exhaustive_search"] and not reasons
@@ -196,6 +209,13 @@ def _query_receipt(
         "match_truncated": result.match_truncated,
         "frontier_truncated": result.frontier_truncated,
         "query_truncated": result.truncated,
+        "structural_driver_count": result.structural_driver_count,
+        "inspected_assignment_count": result.inspected_assignment_count,
+        "retained_evidence_count": len(result.matches),
+        "assignment_limit": result.assignment_limit,
+        "evidence_limit": result.evidence_limit,
+        "assignment_truncated": result.assignment_truncated,
+        "evidence_truncated": result.evidence_truncated,
         "queried_bit_count": result.signal.width,
         "resolved_bit_count": len(result.resolved_bits),
         "unresolved_bit_count": len(result.unresolved_bits),
@@ -214,41 +234,91 @@ def _constant_text(bits: tuple[str, ...]) -> str:
     return f"{len(bits)}'b{''.join(bits)}"
 
 
-def _driver_bit_provenance(result: ConnectivityQueryResult) -> list[dict[str, Any]]:
+def _statement_metadata(match: QueryMatch, cache: dict) -> dict:
+    """Share semantic fields without hiding differences behind a process ID."""
+    from .connectivity_query import _structural_driver_key
+    writer = _structural_driver_key(match)
+    signature = replace(match, fact_id="" if writer else match.fact_id,
+        structural_driver_id=writer[1] if writer else None,
+        evidence=replace(match.evidence, location=replace(match.evidence.location, line=1, column=0)))
+    if signature not in cache:
+        semantics = asdict(signature)
+        del semantics["fact_id"], semantics["structural_driver_id"]
+        del semantics["evidence"]["location"]
+        cache[signature] = {
+            "structural_driver_id": ":".join(writer) if writer else None,
+            "statement_semantics": semantics,
+        }
+    return {**cache[signature], "source_column": match.evidence.location.column}
+
+
+def _driver_bit_provenance(result: ConnectivityQueryResult, metadata_cache=None) -> list[dict[str, Any]]:
+    metadata_cache = {} if metadata_cache is None else metadata_cache
     multiple = set(result.multi_driver_bits)
+    resolutions = {item.bit: item for item in result.bit_resolutions}
     segments: list[dict[str, Any]] = []
-    for match in result.matches:
+    evidence_keys = {(m.instance_path, m.structural_driver_id or m.fact_id,
+                      m.covered_signal.bits) for m in result.matches}
+    rows = [(m, True) for m in result.matches]
+    # Evidence display saturation cannot hide later structural positives. These
+    # rows intentionally carry no statement location or statement confidence.
+    rows.extend((m, False) for m in result.structural_matches
+                if (m.instance_path, m.structural_driver_id or m.fact_id,
+                    m.covered_signal.bits) not in evidence_keys)
+    for match, has_evidence in rows:
         is_constant = match.kind is EdgeKind.CONSTANT_DRIVER
         source_path = None
         if not is_constant and match.traversal:
             source_path = match.traversal[0].source.path(include_bits=True)
-        segments.append(
-            {
-                "target_path": match.covered_signal.path(include_bits=True),
+        groups: dict[tuple, list[int]] = {}
+        for bit in match.covered_signal.bits:
+            state = resolutions[bit]
+            key = (state.resolution, state.reason_codes, state.driver_set_complete, bit in multiple)
+            groups.setdefault(key, []).append(bit)
+        for (resolution, reasons, complete, overlap), bits in groups.items():
+            target = SignalSelection(result.signal.symbol, tuple(bits), result.signal.instance_path)
+            if not is_constant and match.traversal:
+                first = match.traversal[0]
+                mapping = dict(zip(first.target.bits, first.source.bits))
+                if all(bit in mapping for bit in bits):
+                    source_path = SignalSelection(first.source.symbol,
+                        tuple(mapping[bit] for bit in bits), first.source.instance_path).path(include_bits=True)
+            terminal = match.selected_target or match.target
+            if terminal.width == match.covered_signal.width:
+                mapping = dict(zip(match.covered_signal.bits, terminal.bits))
+                terminal = SignalSelection(terminal.symbol, tuple(mapping[b] for b in bits), terminal.instance_path)
+            segments.append({
+                **(_statement_metadata(match, metadata_cache) if has_evidence else {}),
+                "target_path": target.path(include_bits=True),
+                "target_bits": bits,
+                "resolution": resolution,
+                "reason_codes": list(reasons),
+                "driver_set_complete": complete,
                 "source_kind": "constant" if is_constant else "signal",
                 "source_path": source_path,
-                "terminal_path": match.target.path(include_bits=True),
+                "terminal_path": terminal.path(include_bits=True),
                 "constant_value": (
-                    _constant_text(match.constant_bits) if is_constant else None
+                    _constant_text(tuple(dict(zip(match.covered_signal.bits, match.constant_bits))[b] for b in bits)) if is_constant else None
                 ),
                 "driver_kind": match.kind.value,
-                "source_file": match.evidence.location.file,
-                "source_line": match.evidence.location.line,
-                "confidence": _public_confidence(match.confidence),
-                "multiple_driver": bool(
-                    multiple.intersection(match.covered_signal.bits)
-                ),
-            }
-        )
+                "source_file": match.evidence.location.file if has_evidence else None,
+                "source_line": match.evidence.location.line if has_evidence else None,
+                "confidence": _public_confidence(match.confidence) if has_evidence else "partial",
+                "multiple_driver": overlap,
+            })
     if result.unresolved_bits:
-        unresolved = SignalSelection(
-            instance_path=result.signal.instance_path,
-            symbol=result.signal.symbol,
-            bits=result.unresolved_bits,
-        )
-        segments.append(
-            {
+        groups = {}
+        for bit in result.unresolved_bits:
+            state = resolutions[bit]
+            groups.setdefault((state.resolution, state.reason_codes, state.driver_set_complete), []).append(bit)
+        for (resolution, reasons, complete), bits in groups.items():
+            unresolved = SignalSelection(result.signal.symbol, tuple(bits), result.signal.instance_path)
+            segments.append({
                 "target_path": unresolved.path(include_bits=True),
+                "target_bits": bits,
+                "resolution": resolution,
+                "reason_codes": list(reasons),
+                "driver_set_complete": complete,
                 "source_kind": "unresolved",
                 "source_path": None,
                 "terminal_path": None,
@@ -258,9 +328,8 @@ def _driver_bit_provenance(result: ConnectivityQueryResult) -> list[dict[str, An
                 "source_line": None,
                 "confidence": "partial",
                 "multiple_driver": False,
-            }
-        )
-    return segments
+            })
+    return group_driver_evidence(segments)
 
 
 def _requested_symbol(signal_path: str, instance_path: str | None) -> str:
@@ -628,7 +697,8 @@ class SourceGraphConnectivityBackend:
                 for dependency in match.dependencies
             }
         )
-        bit_provenance = _driver_bit_provenance(query) if matches else None
+        metadata_cache = {}
+        bit_provenance = _driver_bit_provenance(query, metadata_cache)
         if driver_kind == "constant" and head is not None:
             expression_summary = f"constant {_constant_text(head.constant_bits)}"
         elif driver_kind == "composite_port_binding":
@@ -647,6 +717,7 @@ class SourceGraphConnectivityBackend:
                 self._definition_name(instance_path) if instance_path else None
             ),
             "resolved_instance_path": instance_path,
+            "query_instance_path": query.signal.instance_path,
             "driver_status": driver_status,
             "driver_kind": driver_kind,
             "source_file": (head.evidence.location.file if head is not None else None),
@@ -677,6 +748,7 @@ class SourceGraphConnectivityBackend:
         if matches and (recursive or len(matches) > 1):
             result["driver_chain"] = [
                 {
+                    **_statement_metadata(match, metadata_cache),
                     "depth": len(match.traversal),
                     "signal_path": match.target.path(),
                     "resolved_module": self._definition_name(match.instance_path),
@@ -701,7 +773,13 @@ class SourceGraphConnectivityBackend:
                 }
                 for match in matches
             ]
-            result["chain_summary"] = f"{len(matches)} Source Graph assignment fact(s)"
+            result["driver_chain"] = group_driver_evidence(result["driver_chain"])
+            result["traversal"]["returned_fact_count"] = len(result["driver_chain"])
+            result["chain_summary"] = (
+                f"{len(result['driver_chain'])} Source Graph evidence group(s); "
+                f"{query.structural_driver_count} known structural writer(s); "
+                f"{len(matches)} retained statement mapping(s); see traversal for limits"
+            )
         return result
 
     def _map_loads(

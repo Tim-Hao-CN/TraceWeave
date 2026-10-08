@@ -24,6 +24,7 @@ from config import (
     WORK_CONTAINER_NAMES,
 )
 from src.compile_log_parser import detect_simulator
+from src.fst_runtime import fst_runtime_info
 
 
 # Depth bound for basename recovery of a mis-specified explicit path: artifacts
@@ -446,8 +447,16 @@ def _build_discovery_result(
 ) -> dict[str, Any]:
     simulator = _detect_simulator_from_logs(compile_logs, sim_logs)
     fsdb_runtime = get_fsdb_runtime_info()
+    fst_runtime = fst_runtime_info()
     merged_hints = list(hints)
     merged_hints.extend(_generate_hints(request_root, case_name, compile_logs, sim_logs, wave_files, fsdb_runtime))
+    if any(entry.get("format") == "fst" for entry in wave_files):
+        merged_hints.append(fst_runtime["message"])
+        merged_hints.append(
+            "FST: start with get_waveform_summary, then search_signals and basic point/transition/window reads. "
+            "Cycles, expressions, protocols, transactions, comparisons and X history share the analysis tools. "
+            "Wave files retain newest-first/path ordering; choose the format explicitly."
+        )
     merged_hints = list(dict.fromkeys(merged_hints))
     result = {
         "verif_root": str(request_root),
@@ -458,6 +467,7 @@ def _build_discovery_result(
         "case_dir": str(target_case_dir) if target_case_dir else None,
         "simulator": simulator,
         "fsdb_runtime": fsdb_runtime,
+        "fst_runtime": fst_runtime,
         "compile_logs": _strip_sort_fields(compile_logs),
         "sim_logs": _strip_sort_fields(sim_logs),
         "wave_files": _strip_sort_fields(wave_files),
@@ -647,7 +657,7 @@ def _search_files(dirs: list[Path], patterns: list[str], max_depth: int) -> list
             info = _collect_file_info(path)
             if patterns == COMPILE_LOG_PATTERNS:
                 info["phase"] = _detect_log_phase(path)
-            elif path.suffix.lower() in {".fsdb", ".vcd"}:
+            elif path.suffix.lower() in {".fsdb", ".vcd", ".fst"}:
                 info["format"] = path.suffix.lstrip(".").lower()
             results.append(info)
     return _dedupe_sorted(results)
@@ -672,6 +682,9 @@ def _scan_log_phase(log_path: Path) -> str:
     except OSError:
         return "unknown"
 
+    from .verilator_compile import invocation
+    if any(invocation(sample.decode("utf-8", errors="replace"), str(log_path.parent))[0] for sample in samples):
+        return "elaborate"
     lowered_samples = [sample.lower() for sample in samples]
     if any(
         keyword.encode("ascii") in sample
