@@ -57,7 +57,10 @@ def instrument_parse(module, probes):
         if isinstance(statement, ast.With):
             label = 'file_read'
         elif isinstance(statement, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'tokens' for t in statement.targets):
-            label = 'token_split'
+            value = statement.value
+            label = ('token_split' if isinstance(value, ast.Call)
+                     and isinstance(value.func, ast.Attribute) and value.func.attr == 'split'
+                     else 'token_iterator_setup')
         elif isinstance(statement, (ast.While, ast.For)):
             label = 'aliases' if saw_loop else 'event_materialization'
             saw_loop = True
