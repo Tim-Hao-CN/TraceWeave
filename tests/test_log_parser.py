@@ -1118,3 +1118,57 @@ def test_protocol_symptom_hint_none_for_non_protocol_failure():
 
 def test_protocol_symptom_hint_none_for_clean_run():
     assert log_parser_module._protocol_symptom_hint([]) is None
+
+
+@pytest.fixture
+def custom_outcome_pattern(tmp_path, monkeypatch):
+    config = tmp_path / "custom_patterns.yaml"
+    config.write_text(
+        "patterns:\n  - name: outcome\n    severity: ERROR\n"
+        "    regex: '^(?P<message>RESULT: FAIL .+)$'\n"
+    )
+    monkeypatch.setattr(log_parser_module, "CUSTOM_PATTERNS_FILE", str(config))
+
+
+@pytest.mark.parametrize("simulator", ["vcs", "xcelium", "verilator"])
+@pytest.mark.parametrize(
+    ("message", "mechanism"),
+    [(message, "unknown") for message in [
+        "request address changed before grant", "changed", "exchanged",
+        "installation", "unchanged", "interchange", "hangover", "stallion",
+    ]] + [(message, "deadlock") for message in [
+        "deadlock", "deadlocks", "deadlocked", "deadlocking", "hang", "hangs",
+        "hanging", "hanged", "hung", "stuck", "stall", "stalls", "stalled",
+        "stalling", "pipeline (STALLED).",
+    ]] + [
+        ("watchdog timeout while stalled", "timeout"),
+        ("deadlock expected=0x1 actual=0x2", "mismatch"),
+        ("unknown value during stall", "xprop"),
+    ],
+)
+def test_deadlock_keywords_require_complete_words(
+    tmp_path, custom_outcome_pattern, simulator, message, mechanism
+):
+    log = tmp_path / "simulation.log"
+    log.write_text(f"RESULT: FAIL {message}\n")
+
+    parser = SimLogParser(str(log), simulator)
+    assert parser.parse()["runtime_total_errors"] == 1
+    event, = parser.parse_failure_events()
+    assert event["failure_mechanism"] == mechanism
+    assert event["message_text"] == f"RESULT: FAIL {message}"
+    assert event["time_ps"] is None and event["source_file"] is None
+    assert event["instance_path"] is None
+    assert compute_problem_hints_from_events([event]).error_pattern == mechanism
+
+
+@pytest.mark.parametrize("simulator", ["vcs", "xcelium", "verilator"])
+def test_deadlock_aggregate_hint_does_not_relabel_other_events(
+    tmp_path, custom_outcome_pattern, simulator
+):
+    log = tmp_path / "simulation.log"
+    log.write_text("RESULT: FAIL request address changed before grant\nRESULT: FAIL simulation hung\n")
+    events = SimLogParser(str(log), simulator).parse_failure_events()
+
+    assert [event["failure_mechanism"] for event in events] == ["unknown", "deadlock"]
+    assert compute_problem_hints_from_events(events).error_pattern == "deadlock"
