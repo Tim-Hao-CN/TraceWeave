@@ -5,6 +5,7 @@ is unfinished when next_time equals its timestamp. Readers retain their cursor
 until close, and must remain inside the caller's waveform lock/group.
 """
 from dataclasses import dataclass
+import sys
 import time
 
 from .cancellation import check_cancelled
@@ -227,11 +228,13 @@ class FsdbEventReader:
         self.width = parser.get_signal_width(path)
         raw_end = ctypes.c_uint64()
         rc = parser._lib.fsdb_event_end_tick_v1(self.handle, ctypes.byref(raw_end))
+        parser._check_native_cleanup(rc, "event-duration")
         self.end_fs = raw_end.value * parser._scale_fs if rc == 0 else None
         started = time.perf_counter()
         rc = parser._lib.fsdb_event_open_v1(self.handle, path.encode(), start,
             0xffffffffffffffff if end == -1 else end, ctypes.byref(self.cursor))
         operation_metrics.record_sweep_native_event("open", (time.perf_counter() - started) * 1000)
+        parser._check_native_cleanup(rc, "event-open")
         if rc == -2:
             raise KeyError(path)
         if rc < 0:
@@ -252,6 +255,13 @@ class FsdbEventReader:
         finally:
             operation_metrics.record_sweep_native_event("page", (time.perf_counter() - started) * 1000,
                 transitions=receipt.events, output_bytes=receipt.output_bytes, truncated=bool(receipt.truncated))
+        try:
+            self.parser._check_native_cleanup(rc, "event-page")
+        except RuntimeError:
+            # Invalidate a poisoned reader even when native return and request
+            # cancellation coincide, then preserve the cancellation exception.
+            check_cancelled()
+            raise
         check_cancelled()
         self.parser._check_metadata_identity(self.identity)
         if rc < 0:
@@ -269,11 +279,23 @@ class FsdbEventReader:
             bool(receipt.complete), bool(receipt.truncated), receipt.output_bytes)
 
     def close(self):
-        if self.cursor.value and self.parser._handle == self.handle and self.epoch is self.parser._scope_epoch:
-            started = time.perf_counter()
-            try:
-                self.parser._lib.fsdb_event_close_v1(self.handle, self.cursor)
-            finally:
-                operation_metrics.record_sweep_native_event("close", (time.perf_counter() - started) * 1000)
-        self.cursor.value = 0
-        self.buffer = None
+        unwinding = sys.exc_info()[0] is not None
+        try:
+            if self.cursor.value and self.parser._handle == self.handle and self.epoch is self.parser._scope_epoch:
+                started = time.perf_counter()
+                try:
+                    rc = self.parser._lib.fsdb_event_close_v1(self.handle, self.cursor)
+                    self.parser._check_native_cleanup(rc, "event-close")
+                    if rc < 0:
+                        self.parser.close()
+                        raise RuntimeError('FSDB event cursor cleanup failed; reader closed for recovery')
+                finally:
+                    operation_metrics.record_sweep_native_event("close", (time.perf_counter() - started) * 1000)
+        except Exception:
+            # Resource release must run during cancellation, but a cleanup
+            # failure cannot replace the body/cancellation exception.
+            if not unwinding:
+                raise
+        finally:
+            self.cursor.value = 0
+            self.buffer = None

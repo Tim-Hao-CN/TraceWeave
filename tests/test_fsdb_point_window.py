@@ -29,7 +29,10 @@ def native_lifecycle_probe(tmp_path_factory):
 
 @pytest.mark.parametrize("scenario", ["success", "resident", "bounds", "disabled", "before", "after",
                                       "set", "unsupported", "add", "load", "create", "throw_load", "throw_body",
-                                      "restore", "unload"])
+                                      "restore", "unload", "throw_add", "throw_create", "throw_free",
+                                      "throw_unload", "throw_restore", "reset_initial", "reset_cleanup",
+                                      "throw_reset_initial", "throw_reset_cleanup",
+                                      "selection_dedup", "selection_transfer"])
 def test_native_point_resource_lifecycle(native_lifecycle_probe, scenario):
     subprocess.run([str(native_lifecycle_probe), scenario], check=True, timeout=10)
 
@@ -74,14 +77,13 @@ def test_multiblock_points_preserve_following_reads():
         parser.close()
 
 
-@pytest.mark.eda_integration
-def test_real_reader_restores_an_existing_view(tmp_path, monkeypatch):
-    """Expose test-only bounds access; production keeps its native ABI."""
-    wave = os.environ.get("TW_POINT_READ_FSDB")
+@pytest.fixture(scope="module")
+def native_reader_probe(tmp_path_factory):
+    """Use real FFR selection/residency observations without changing public ABI."""
     verdi = os.environ.get("VERDI_HOME")
-    if not wave or not verdi or not shutil.which("g++"):
+    if not os.environ.get("TW_POINT_READ_FSDB") or not verdi or not shutil.which("g++"):
         pytest.skip("requires TW_POINT_READ_FSDB, VERDI_HOME and g++")
-    from src import fsdb_parser
+    tmp_path = tmp_path_factory.mktemp("reader_probe")
     sdk = Path(verdi) / "share/FsdbReader"
     source = (NATIVE_FSDB / "fsdb_wrapper.cpp").read_text() + r'''
 extern "C" int test_view(void *p, unsigned long long start, unsigned long long end) {
@@ -108,6 +110,15 @@ extern "C" int test_session_boundaries(void *p, unsigned long long *out, int cap
     }
     return n;
 }
+extern "C" int test_signal_state(void *p, const char *path, unsigned long long *out) {
+    FsdbCtx *ctx = (FsdbCtx*)p;
+    auto found = ctx->path_to_sig.find(path);
+    if (found == ctx->path_to_sig.end()) return -1;
+    fsdbVarIdcode id = found->second.idcode;
+    out[0] = ctx->obj->ffrIsInSignalList(id) ? 1 : 0;
+    out[1] = ctx->obj->ffrGetVCCount(id);
+    return 0;
+}
 '''
     cpp, library = tmp_path / "probe.cpp", tmp_path / "probe.so"
     cpp.write_text(source)
@@ -115,6 +126,15 @@ extern "C" int test_session_boundaries(void *p, unsigned long long *out, int cap
                     "-I" + str(sdk), str(cpp), "-o", str(library),
                     "-L" + str(sdk / "linux64"), "-lnffr", "-lnsys", "-lz",
                     "-Wl,-rpath," + str(sdk / "linux64")], check=True, capture_output=True)
+    return library
+
+
+@pytest.mark.eda_integration
+def test_real_reader_restores_an_existing_view(native_reader_probe, monkeypatch):
+    """Point reads preserve an existing view and session-boundary values."""
+    wave = os.environ["TW_POINT_READ_FSDB"]
+    from src import fsdb_parser
+    library = native_reader_probe
     monkeypatch.setattr(fsdb_parser, "_WRAPPER_SO", str(library))
     parser = FSDBParser(wave)
     try:
@@ -147,3 +167,88 @@ extern "C" int test_session_boundaries(void *p, unsigned long long *out, int cap
         assert list(bounds) == [0, 10_000_000]
     finally:
         parser.close()
+
+
+@pytest.mark.eda_integration
+@pytest.mark.parametrize("first_read", ["point", "transitions", "around", "group"])
+def test_interleaved_reads_release_selection_and_residency(native_reader_probe, monkeypatch, first_read):
+    """Dense A must not become a hidden dependency of subsequent sparse B reads."""
+    from src import fsdb_parser
+    monkeypatch.setattr(fsdb_parser, "_WRAPPER_SO", str(native_reader_probe))
+    parser = FSDBParser(os.environ["TW_POINT_READ_FSDB"])
+    fresh = FSDBParser(parser.file_path)
+    dense, sparse = "top.data", "top.sparse"
+
+    def state(path):
+        out = (ctypes.c_uint64 * 2)()
+        assert parser._lib.test_signal_state(parser._handle, path.encode(), out) == 0
+        return tuple(out)
+
+    def clean():
+        assert state(dense) == (0, 0)
+        assert state(sparse) == (0, 0)
+
+    try:
+        expected_transition = fresh.get_transitions(sparse, 3_000_000, 3_000_050)
+        expected_point = fresh.get_value_at_time(sparse, 3_000_033)
+        expected_around = fresh.get_signals_around_time([sparse], 3_000_033, 30, 5)
+        fresh.close()
+        parser._open()
+        parser._lib.test_signal_state.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                                  ctypes.POINTER(ctypes.c_uint64)]
+        if first_read == "point":
+            parser.get_value_at_time(dense, 7_000_033)
+        elif first_read == "transitions":
+            parser.get_transitions(dense, 7_000_000, 7_000_050)
+        elif first_read == "around":
+            parser.get_signals_around_time([dense], 7_000_033, 30, 5)
+        else:
+            with parser.transition_group([dense]) as active:
+                assert active
+                parser.get_transitions(dense, 7_000_000, 7_000_050)
+                assert state(dense)[0] == 1 and state(dense)[1] > 0
+        clean()
+        assert parser.get_transitions(sparse, 3_000_000, 3_000_050) == expected_transition
+        clean()
+        assert parser.get_value_at_time(sparse, 3_000_033) == expected_point
+        clean()
+        assert parser.get_signals_around_time([sparse], 3_000_033, 30, 5) == expected_around
+        clean()
+        with parser.transition_group([sparse, sparse]) as active:
+            assert active
+            group_state = state(sparse)
+            assert group_state[0] == 1 and group_state[1] > 0
+            assert state(dense) == (0, 0)
+            assert parser.get_value_at_time(sparse, 3_000_033) == expected_point
+            assert parser.get_transitions(sparse, 3_000_000, 3_000_050) == expected_transition
+            assert parser.get_signals_around_time([sparse], 3_000_033, 30, 5) == expected_around
+            assert state(sparse) == group_state
+            for outside_read in (
+                lambda: parser.get_value_at_time(dense, 3_000_033),
+                lambda: parser.get_transitions(dense, 3_000_000, 3_000_050),
+                lambda: parser.get_signals_around_time([sparse, dense], 3_000_033, 30, 5),
+            ):
+                with pytest.raises(RuntimeError, match="rc=-5"):
+                    outside_read()
+                assert state(sparse) == group_state
+                assert state(dense) == (0, 0)
+            with parser._event_pages(sparse, 3_000_000, 3_000_050) as reader:
+                page = reader.read_page()
+                assert page.complete
+                assert page.predecessor.value == expected_transition["predecessor"]["value"]["bin"]
+            assert state(sparse) == group_state
+            assert state(dense) == (0, 0)
+        clean()
+        # An exceptional group body must still release selection and residency.
+        with pytest.raises(RuntimeError, match="injected group interruption"):
+            with parser.transition_group([dense, sparse]) as active:
+                assert active
+                with parser._event_pages(dense, 100, 200, max_events=2) as reader:
+                    reader.read_page()
+                    raise RuntimeError("injected group interruption")
+        clean()
+        assert parser.get_transitions(sparse, 3_000_000, 3_000_050) == expected_transition
+        clean()
+    finally:
+        parser.close()
+        fresh.close()

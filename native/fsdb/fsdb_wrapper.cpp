@@ -76,12 +76,96 @@ struct FsdbCtx {
     std::set<fsdbVarIdcode>           transition_group_ids;
     std::map<unsigned long long, FsdbEventCursor> event_cursors;
     unsigned long long next_event_cursor = 0;
+    bool cleanup_failed = false;
 };
 
-static void _CloseEventCursors(FsdbCtx *ctx) {
-    for (auto &entry : ctx->event_cursors) entry.second.hdl->ffrFree();
+static bool _CloseEventCursors(FsdbCtx *ctx) {
+    for (auto &entry : ctx->event_cursors) {
+        try { entry.second.hdl->ffrFree(); }
+        catch (...) { ctx->cleanup_failed = true; }
+    }
     ctx->event_cursors.clear();
+    return !ctx->cleanup_failed;
 }
+
+static bool _FinishTransitionGroup(FsdbCtx *ctx) {
+    _CloseEventCursors(ctx);
+    if (ctx->transition_group_active) {
+        for (fsdbVarIdcode id : ctx->transition_group_ids) {
+            try {
+                if (ctx->obj->ffrUnloadSignals(id) != FSDB_RC_SUCCESS)
+                    ctx->cleanup_failed = true;
+            } catch (...) { ctx->cleanup_failed = true; }
+        }
+        try {
+            if (ctx->obj->ffrResetSignalList() != FSDB_RC_SUCCESS)
+                ctx->cleanup_failed = true;
+        } catch (...) { ctx->cleanup_failed = true; }
+        ctx->transition_group_active = false;
+        ctx->transition_group_ids.clear();
+    }
+    return !ctx->cleanup_failed;
+}
+
+/* One owner per standalone call. Borrowed group reads only create/free their
+ * own handles; group selection and resident data live until group end. */
+class FsdbReadScope {
+    FsdbCtx *ctx_;
+    FsdbSignalSelection<ffrObject> selection_;
+    ffrVCTrvsHdl handle_ = nullptr;
+    ffrTimeBasedVCTrvsHdl time_handle_ = nullptr;
+public:
+    explicit FsdbReadScope(FsdbCtx *ctx) : ctx_(ctx), selection_(ctx->obj) {}
+    ~FsdbReadScope() { Finish(); }
+    int Begin(const std::vector<fsdbVarIdcode>& ids) {
+        if (ctx_->cleanup_failed) return -6;
+        if (ctx_->transition_group_active) {
+            for (fsdbVarIdcode id : ids)
+                if (!ctx_->transition_group_ids.count(id)) return -5;
+            return 0;
+        }
+        if (!ctx_->event_cursors.empty()) return -5;
+        int rc = selection_.Begin();
+        if (rc) return rc;
+        for (fsdbVarIdcode id : ids) {
+            rc = selection_.Add(id);
+            if (rc) return rc;
+        }
+        return 0;
+    }
+    int Load() {
+        return ctx_->transition_group_active ? 0 : selection_.Load();
+    }
+    ffrVCTrvsHdl Create(fsdbVarIdcode id) {
+        handle_ = ctx_->obj->ffrCreateVCTraverseHandle(id);
+        return handle_;
+    }
+    void ReleaseHandle() { handle_ = nullptr; }
+    ffrTimeBasedVCTrvsHdl CreateTime(std::vector<fsdbVarIdcode>& ids) {
+        time_handle_ = ctx_->obj->ffrCreateTimeBasedVCTrvsHdl(
+            (uint_T)ids.size(), ids.data());
+        return time_handle_;
+    }
+    bool FreeHandle() {
+        if (handle_) {
+            try { handle_->ffrFree(); }
+            catch (...) { ctx_->cleanup_failed = true; }
+            handle_ = nullptr;
+        }
+        if (time_handle_) {
+            try { time_handle_->ffrFree(); }
+            catch (...) { ctx_->cleanup_failed = true; }
+            time_handle_ = nullptr;
+        }
+        return !ctx_->cleanup_failed;
+    }
+    bool Finish() {
+        FreeHandle();
+        if (!selection_.Finish()) ctx_->cleanup_failed = true;
+        return !ctx_->cleanup_failed;
+    }
+    int Result(int rc) { return Finish() ? rc : -6; }
+};
 
 /* Optional profiling receipt for transition reads. All fields are numeric and
  * contain no path/value identity, so Python may safely aggregate them into
@@ -401,14 +485,14 @@ fsdb_close(void *handle)
 {
     if (!handle) return;
     FsdbCtx *ctx = (FsdbCtx*)handle;
-    _CloseEventCursors(ctx);
-    if (ctx->transition_group_active) {
-        ctx->obj->ffrUnloadSignals();
-        ctx->transition_group_active = false;
-        ctx->transition_group_ids.clear();
-    }
-    ctx->obj->ffrClose();
+    _FinishTransitionGroup(ctx);
+    try { ctx->obj->ffrClose(); } catch (...) {}
     delete ctx;
+}
+
+/* Optional status ABI also covers the unsigned legacy end-time function. */
+int fsdb_reader_status(void *handle) {
+    return !handle ? -1 : (((FsdbCtx*)handle)->cleanup_failed ? -6 : 0);
 }
 
 /* Optional metadata ABI v1. Exact lookups use the existing ordered map and
@@ -611,6 +695,7 @@ fsdb_get_value_at_time(void *handle, const char *signal_path,
 {
     if (!handle || !signal_path || !out_val || val_buf_size <= 0) return -1;
     FsdbCtx *ctx = (FsdbCtx*)handle;
+    if (ctx->cleanup_failed) return -6;
     if (ctx->scale_fs == 0) return FSDB_ERR_SCALE_UNKNOWN;
 
     auto it = ctx->path_to_sig.find(std::string(signal_path));
@@ -646,7 +731,10 @@ fsdb_get_value_at_time(void *handle, const char *signal_path,
             // releases the traversal/load and restores the previous view.
             rc = -3;
         }
-        if (!read.Finish()) return -6;
+        if (!read.Finish()) {
+            ctx->cleanup_failed = true;
+            return -6;
+        }
         if (rc != 0) return rc;
         if (found || !read.Narrowed()) break;
         // An empty/unsupported partial read cannot prove there is no prior
@@ -676,17 +764,21 @@ _GetTransitionsImpl(
 )
 {
     if (!ctx || !sig || !out_buf || buf_size <= 0) return -1;
-
+    FsdbReadScope read(ctx);
+    try {
     fsdbVarIdcode idcode = sig->idcode;
     if (already_loaded) {
         if (!ctx->transition_group_active ||
             ctx->transition_group_ids.find(idcode) == ctx->transition_group_ids.end())
             return -5;
-    } else {
+    }
+    {
         _ProfileClock::time_point begin = _ProfileClock::now();
-        ctx->obj->ffrAddToSignalList(idcode);
+        int rc = read.Begin({idcode});
+        if (rc) return read.Result(rc);
         _ProfileClock::time_point added = _ProfileClock::now();
-        ctx->obj->ffrLoadSignals();
+        rc = read.Load();
+        if (rc) return read.Result(rc);
         _ProfileClock::time_point loaded = _ProfileClock::now();
         if (profile) {
             profile->add_signal_ns = _ElapsedNs(begin, added);
@@ -695,17 +787,11 @@ _GetTransitionsImpl(
     }
 
     _ProfileClock::time_point create_begin = _ProfileClock::now();
-    ffrVCTrvsHdl hdl = ctx->obj->ffrCreateVCTraverseHandle(idcode);
+    ffrVCTrvsHdl hdl = read.Create(idcode);
     _ProfileClock::time_point create_end = _ProfileClock::now();
     if (profile) profile->create_handle_ns = _ElapsedNs(create_begin, create_end);
     if (!hdl) {
-        if (!already_loaded) {
-            _ProfileClock::time_point unload_begin = _ProfileClock::now();
-            ctx->obj->ffrUnloadSignals();
-            if (profile)
-                profile->unload_ns = _ElapsedNs(unload_begin, _ProfileClock::now());
-        }
-        return -3;
+        return read.Result(-3);
     }
 
     int   count     = 0;
@@ -770,12 +856,12 @@ _GetTransitionsImpl(
 
     out_buf[pos] = '\0';
     _ProfileClock::time_point free_begin = _ProfileClock::now();
-    hdl->ffrFree();
+    read.FreeHandle();
     _ProfileClock::time_point free_end = _ProfileClock::now();
     if (profile) profile->free_handle_ns = _ElapsedNs(free_begin, free_end);
     if (!already_loaded) {
         _ProfileClock::time_point unload_begin = _ProfileClock::now();
-        ctx->obj->ffrUnloadSignals();
+        read.Finish();
         if (profile)
             profile->unload_ns = _ElapsedNs(unload_begin, _ProfileClock::now());
     }
@@ -784,7 +870,8 @@ _GetTransitionsImpl(
         profile->output_bytes = (unsigned long long)pos;
         profile->truncated = truncated ? 1 : 0;
     }
-    return count;
+    return read.Result(count);
+    } catch (...) { return read.Result(-3); }
 }
 
 /* ── 获取信号所有跳变（start_ps ~ end_ps，-1 表示到结尾）────────────
@@ -802,6 +889,7 @@ fsdb_get_transitions_profiled(void *handle, const char *signal_path,
     if (profile) memset(profile, 0, sizeof(*profile));
     if (!handle || !signal_path || !out_buf || buf_size <= 0) return -1;
     FsdbCtx *ctx = (FsdbCtx*)handle;
+    if (ctx->cleanup_failed) return -6;
     if (ctx->scale_fs == 0) return FSDB_ERR_SCALE_UNKNOWN;
 
     _ProfileClock::time_point lookup_begin = _ProfileClock::now();
@@ -834,37 +922,46 @@ fsdb_begin_transition_group(void *handle, const char **signal_paths,
     if (profile) memset(profile, 0, sizeof(*profile));
     if (!handle || !signal_paths || signal_count <= 0) return -1;
     FsdbCtx *ctx = (FsdbCtx*)handle;
+    if (ctx->cleanup_failed) return -6;
     if (ctx->scale_fs == 0) return FSDB_ERR_SCALE_UNKNOWN;
-    if (ctx->transition_group_active) return -5;
-
-    std::vector<fsdbVarIdcode> ids;
-    ids.reserve((size_t)signal_count);
-    _ProfileClock::time_point lookup_begin = _ProfileClock::now();
-    for (int i = 0; i < signal_count; i++) {
-        if (!signal_paths[i]) return -1;
-        auto it = ctx->path_to_sig.find(std::string(signal_paths[i]));
-        if (it == ctx->path_to_sig.end()) return -2;
-        ids.push_back(it->second.idcode);
-    }
-    _ProfileClock::time_point lookup_end = _ProfileClock::now();
-
-    _ProfileClock::time_point add_begin = _ProfileClock::now();
-    for (size_t i = 0; i < ids.size(); i++)
-        ctx->obj->ffrAddToSignalList(ids[i]);
-    _ProfileClock::time_point add_end = _ProfileClock::now();
-    ctx->obj->ffrLoadSignals();
-    _ProfileClock::time_point load_end = _ProfileClock::now();
-
-    ctx->transition_group_ids.clear();
-    ctx->transition_group_ids.insert(ids.begin(), ids.end());
-    ctx->transition_group_active = true;
-    if (profile) {
-        profile->lookup_ns = _ElapsedNs(lookup_begin, lookup_end);
-        profile->add_signal_ns = _ElapsedNs(add_begin, add_end);
-        profile->load_ns = _ElapsedNs(add_end, load_end);
-        profile->signal_count = (unsigned long long)ids.size();
-    }
-    return signal_count;
+    if (ctx->transition_group_active || !ctx->event_cursors.empty()) return -5;
+    FsdbSignalSelection<ffrObject> selection(ctx->obj);
+    auto fail = [&](int rc) {
+        if (!selection.Finish()) ctx->cleanup_failed = true;
+        return ctx->cleanup_failed ? -6 : rc;
+    };
+    try {
+        std::set<fsdbVarIdcode> ids;
+        _ProfileClock::time_point lookup_begin = _ProfileClock::now();
+        for (int i = 0; i < signal_count; i++) {
+            if (!signal_paths[i]) return -1;
+            auto it = ctx->path_to_sig.find(std::string(signal_paths[i]));
+            if (it == ctx->path_to_sig.end()) return -2;
+            ids.insert(it->second.idcode);
+        }
+        _ProfileClock::time_point lookup_end = _ProfileClock::now();
+        _ProfileClock::time_point add_begin = _ProfileClock::now();
+        int rc = selection.Begin();
+        if (rc) return fail(rc);
+        for (fsdbVarIdcode id : ids) {
+            rc = selection.Add(id);
+            if (rc) return fail(rc);
+        }
+        _ProfileClock::time_point add_end = _ProfileClock::now();
+        rc = selection.Load();
+        if (rc) return fail(rc);
+        _ProfileClock::time_point load_end = _ProfileClock::now();
+        ctx->transition_group_ids.swap(ids);
+        ctx->transition_group_active = true;
+        selection.Release();
+        if (profile) {
+            profile->lookup_ns = _ElapsedNs(lookup_begin, lookup_end);
+            profile->add_signal_ns = _ElapsedNs(add_begin, add_end);
+            profile->load_ns = _ElapsedNs(add_end, load_end);
+            profile->signal_count = ctx->transition_group_ids.size();
+        }
+        return signal_count;
+    } catch (...) { return fail(-3); }
 }
 
 int
@@ -877,6 +974,7 @@ fsdb_get_loaded_transitions(void *handle, const char *signal_path,
     if (profile) memset(profile, 0, sizeof(*profile));
     if (!handle || !signal_path || !out_buf || buf_size <= 0) return -1;
     FsdbCtx *ctx = (FsdbCtx*)handle;
+    if (ctx->cleanup_failed) return -6;
     if (ctx->scale_fs == 0) return FSDB_ERR_SCALE_UNKNOWN;
 
     _ProfileClock::time_point lookup_begin = _ProfileClock::now();
@@ -895,16 +993,12 @@ fsdb_end_transition_group(void *handle,
     if (profile) memset(profile, 0, sizeof(*profile));
     if (!handle) return -1;
     FsdbCtx *ctx = (FsdbCtx*)handle;
-    if (!ctx->transition_group_active) return 0;
-    _CloseEventCursors(ctx);
     _ProfileClock::time_point unload_begin = _ProfileClock::now();
-    ctx->obj->ffrUnloadSignals();
+    bool ok = _FinishTransitionGroup(ctx);
     _ProfileClock::time_point unload_end = _ProfileClock::now();
-    ctx->transition_group_active = false;
-    ctx->transition_group_ids.clear();
     if (profile)
         profile->unload_ns = _ElapsedNs(unload_begin, unload_end);
-    return 0;
+    return ok ? 0 : -6;
 }
 
 /* Private bounded event ABI. Each row is P/T, public ps, exact raw tick, value.
@@ -922,11 +1016,14 @@ int fsdb_event_page_version() { return 1; }
 int fsdb_event_end_tick_v1(void *handle, unsigned long long *tick) {
     if (!handle || !tick) return -1;
     FsdbCtx *ctx = (FsdbCtx*)handle;
+    if (ctx->cleanup_failed) return -6;
     if (!ctx->scale_fs) return FSDB_ERR_SCALE_UNKNOWN;
+    try {
     fsdbTag64 tag;
     if (FSDB_RC_SUCCESS != ctx->obj->ffrGetMaxFsdbTag64(&tag)) return -3;
     _TagToPs(ctx, tag, tick);
     return 0;
+    } catch (...) { return -3; }
 }
 
 int fsdb_event_open_v1(void *handle, const char *path,
@@ -934,12 +1031,15 @@ int fsdb_event_open_v1(void *handle, const char *path,
                        unsigned long long *cursor) {
     if (!handle || !path || !cursor) return -1;
     FsdbCtx *ctx = (FsdbCtx*)handle;
+    if (ctx->cleanup_failed) return -6;
     if (!ctx->scale_fs) return FSDB_ERR_SCALE_UNKNOWN;
+    FsdbReadScope read(ctx);
+    try {
     auto it = ctx->path_to_sig.find(path);
     if (it == ctx->path_to_sig.end()) return -2;
     if (!ctx->transition_group_active || !ctx->transition_group_ids.count(it->second.idcode)
         || ctx->event_cursors.size() >= 256) return -5;
-    ffrVCTrvsHdl hdl = ctx->obj->ffrCreateVCTraverseHandle(it->second.idcode);
+    ffrVCTrvsHdl hdl = read.Create(it->second.idcode);
     if (!hdl) return -3;
     bool valid = hdl->ffrHasIncoreVC();
     if (valid) {
@@ -958,7 +1058,9 @@ int fsdb_event_open_v1(void *handle, const char *path,
     }
     *cursor = ++ctx->next_event_cursor;
     ctx->event_cursors.emplace(*cursor, FsdbEventCursor{hdl, &it->second, start_ps, end_ps, valid});
+    read.ReleaseHandle();
     return 0;
+    } catch (...) { return read.Result(-3); }
 }
 
 int fsdb_event_close_v1(void *handle, unsigned long long cursor) {
@@ -966,10 +1068,11 @@ int fsdb_event_close_v1(void *handle, unsigned long long cursor) {
     FsdbCtx *ctx = (FsdbCtx*)handle;
     auto it = ctx->event_cursors.find(cursor);
     if (it != ctx->event_cursors.end()) {
-        it->second.hdl->ffrFree();
+        try { it->second.hdl->ffrFree(); }
+        catch (...) { ctx->cleanup_failed = true; }
         ctx->event_cursors.erase(it);
     }
-    return 0;
+    return ctx->cleanup_failed ? -6 : 0;
 }
 
 int fsdb_event_page_v1(void *handle, unsigned long long cursor,
@@ -980,6 +1083,8 @@ int fsdb_event_page_v1(void *handle, unsigned long long cursor,
     memset(page, 0, sizeof(*page));
     out[0] = '\0';
     FsdbCtx *ctx = (FsdbCtx*)handle;
+    if (ctx->cleanup_failed) return -6;
+    try {
     auto found = ctx->event_cursors.find(cursor);
     if (!ctx->transition_group_active || found == ctx->event_cursors.end()) return -5;
     FsdbEventCursor &c = found->second;
@@ -1018,6 +1123,7 @@ int fsdb_event_page_v1(void *handle, unsigned long long cursor,
     page->complete = !c.valid;
     out[page->output_bytes] = '\0';
     return 0;
+    } catch (...) { return -3; }
 }
 
 int
@@ -1032,13 +1138,17 @@ fsdb_get_multi_signals_around_time(
     int buf_size
 )
 {
-    if (!handle || !signal_paths || signal_count < 0 || !out_buf) return -1;
+    if (!handle || !signal_paths || signal_count < 0 || !out_buf || buf_size <= 0) return -1;
     FsdbCtx *ctx = (FsdbCtx*)handle;
+    if (ctx->cleanup_failed) return -6;
     if (ctx->scale_fs == 0) return FSDB_ERR_SCALE_UNKNOWN;
     out_buf[0] = '\0';
+    FsdbReadScope read(ctx);
+    try {
 
     std::vector<SigInfo*> valid_sigs;
     valid_sigs.reserve(signal_count);
+    std::vector<fsdbVarIdcode> ids;
 
     int pos = 0;
     bool truncated = false;
@@ -1054,14 +1164,17 @@ fsdb_get_multi_signals_around_time(
             continue;
         }
         valid_sigs.push_back(&it->second);
-        ctx->obj->ffrAddToSignalList(it->second.idcode);
+        ids.push_back(it->second.idcode);
     }
 
     if (valid_sigs.empty() || truncated) {
         return success_count;
     }
 
-    ctx->obj->ffrLoadSignals();
+    int rc = read.Begin(ids);
+    if (rc) return read.Result(rc);
+    rc = read.Load();
+    if (rc) return read.Result(rc);
 
     unsigned long long start_ps = (center_ps > window_ps) ? (center_ps - window_ps) : 0;
     unsigned long long end_ps = center_ps + window_ps;
@@ -1072,7 +1185,7 @@ fsdb_get_multi_signals_around_time(
                              std::to_string(sig->bit_size) + "\n";
         if (!_AppendText(out_buf, buf_size, pos, header, truncated)) break;
 
-        ffrVCTrvsHdl hdl = ctx->obj->ffrCreateVCTraverseHandle(sig->idcode);
+        ffrVCTrvsHdl hdl = read.Create(sig->idcode);
         if (!hdl) {
             std::string err_line = std::string("@ERROR\t") + sig->full_path +
                                    "\tcreate_traverse_handle_failed\n";
@@ -1093,11 +1206,11 @@ fsdb_get_multi_signals_around_time(
 
         std::string value_line = std::string("#VALUE_AT_CENTER\t") + value_at_center + "\n";
         if (!_AppendText(out_buf, buf_size, pos, value_line, truncated)) {
-            hdl->ffrFree();
+            if (!read.FreeHandle()) return read.Result(-6);
             break;
         }
         if (!_AppendText(out_buf, buf_size, pos, "#WINDOW_TRANSITIONS\n", truncated)) {
-            hdl->ffrFree();
+            if (!read.FreeHandle()) return read.Result(-6);
             break;
         }
 
@@ -1120,12 +1233,12 @@ fsdb_get_multi_signals_around_time(
         }
 
         if (truncated) {
-            hdl->ffrFree();
+            if (!read.FreeHandle()) return read.Result(-6);
             break;
         }
 
         if (!_AppendText(out_buf, buf_size, pos, "#PRE_WINDOW_TRANSITIONS\n", truncated)) {
-            hdl->ffrFree();
+            if (!read.FreeHandle()) return read.Result(-6);
             break;
         }
 
@@ -1158,13 +1271,13 @@ fsdb_get_multi_signals_around_time(
             }
         }
 
-        hdl->ffrFree();
+        if (!read.FreeHandle()) return read.Result(-6);
         success_count++;
         if (truncated) break;
     }
 
-    ctx->obj->ffrUnloadSignals();
-    return success_count;
+    return read.Result(success_count);
+    } catch (...) { return read.Result(-3); }
 }
 
 /*
@@ -1201,8 +1314,11 @@ fsdb_batch_window_transitions(
 {
     if (!handle || !signal_paths || signal_count < 0 || !out_buf || buf_size <= 0) return -1;
     FsdbCtx *ctx = (FsdbCtx*)handle;
+    if (ctx->cleanup_failed) return -6;
     if (ctx->scale_fs == 0) return FSDB_ERR_SCALE_UNKNOWN;
     out_buf[0] = '\0';
+    FsdbReadScope read(ctx);
+    try {
     int pos = 0;
     bool truncated = false;
     int emitted = 0;
@@ -1225,7 +1341,7 @@ fsdb_batch_window_transitions(
         SigInfo *sig = &it->second;
         idcodes.push_back(sig->idcode);
         id_to_info[sig->idcode] = sig;
-        ctx->obj->ffrAddToSignalList(sig->idcode);
+
 
         std::string header = std::string("@SIGNAL\t") + sig->full_path + "\t" +
                              std::to_string(sig->bit_size) + "\n";
@@ -1235,15 +1351,17 @@ fsdb_batch_window_transitions(
 
     if (idcodes.empty()) return emitted;
 
-    ctx->obj->ffrLoadSignals();
+    int rc = read.Begin(idcodes);
+    if (rc) return read.Result(rc);
+    rc = read.Load();
+    if (rc) return read.Result(rc);
 
     ffrTimeBasedVCTrvsHdl thdl =
-        ctx->obj->ffrCreateTimeBasedVCTrvsHdl((uint_T)idcodes.size(), idcodes.data());
+        read.CreateTime(idcodes);
     if (!thdl) {
-        ctx->obj->ffrUnloadSignals();
         std::string err = "@ERROR\t*\tcreate_time_based_handle_failed\n";
         _AppendText(out_buf, buf_size, pos, err, truncated);
-        return emitted;
+        return read.Result(emitted);
     }
 
     /*
@@ -1275,9 +1393,8 @@ fsdb_batch_window_transitions(
         emitted++;
     }
 
-    thdl->ffrFree();
-    ctx->obj->ffrUnloadSignals();
-    return emitted;
+    return read.Result(emitted);
+    } catch (...) { return read.Result(-3); }
 }
 
 /* ── 获取仿真结束时间（ps）─────────────────────────────────────────
@@ -1293,7 +1410,9 @@ fsdb_get_end_time(void *handle)
     if (!handle) return 0;
     FsdbCtx *ctx = (FsdbCtx*)handle;
     /* 刻度未知无法换算；返回 0，Python 层依据 scale_unit=unknown 报警 */
-    if (ctx->scale_fs == 0) return 0;
+    if (ctx->scale_fs == 0 || ctx->cleanup_failed) return 0;
+    FsdbReadScope read(ctx);
+    try {
 
     /* 首选：文件级全局最大时间 */
     fsdbTag64 gmax;
@@ -1304,19 +1423,20 @@ fsdb_get_end_time(void *handle)
     fsdbVarIdcode max_id = ctx->obj->ffrGetMaxVarIdcode();
     if (max_id < FSDB_MIN_VAR_IDCODE) return 0;
 
-    ctx->obj->ffrAddToSignalList(max_id);
-    ctx->obj->ffrLoadSignals();
+    int rc = read.Begin({max_id});
+    if (rc) { read.Result(rc); return 0; }
+    rc = read.Load();
+    if (rc) { read.Result(rc); return 0; }
 
-    ffrVCTrvsHdl hdl = ctx->obj->ffrCreateVCTraverseHandle(max_id);
+    ffrVCTrvsHdl hdl = read.Create(max_id);
     unsigned long long end_ps = 0;
     if (hdl && hdl->ffrHasIncoreVC()) {
         fsdbTag64 time;
         if (FSDB_RC_SUCCESS == hdl->ffrGetMaxXTag((void*)&time))
             end_ps = _TagToPs(ctx, time);
-        hdl->ffrFree();
     }
-    ctx->obj->ffrUnloadSignals();
-    return end_ps;
+    return read.Finish() ? end_ps : 0;
+    } catch (...) { read.Result(-3); return 0; }
 }
 
 /* ── 获取信号总数 ───────────────────────────────────────────────── */

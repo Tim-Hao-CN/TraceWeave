@@ -303,3 +303,77 @@ def test_point_cleanup_failure_closes_reader_before_next_query():
     assert parser._lib.calls == ["close"]
     assert parser.get_value_at_time("top.clk", 5)["value"]["bin"] == "1"
     assert parser._lib.calls == ["close", "reopen"]
+
+
+@pytest.mark.parametrize("operation", ["transition", "around", "begin", "end", "duration", "batch"])
+def test_cleanup_failure_invalidates_reader(operation):
+    lib = _FakeGroupLib()
+    parser = _fake_group_parser(lib)
+    parser._buf = ctypes.create_string_buffer(64)
+    if operation == "transition":
+        lib.fsdb_get_transitions_profiled = lambda *args: -6
+        call = lambda: parser.get_transitions("top.clk")
+    elif operation == "around":
+        lib.fsdb_get_multi_signals_around_time = lambda *args: -6
+        call = lambda: parser.get_signals_around_time(["top.clk"], 5)
+    elif operation == "duration":
+        lib._traceweave_has_reader_status = True
+        lib.fsdb_get_end_time = lambda *args: 0
+        lib.fsdb_reader_status = lambda *args: -6
+        call = parser.get_header
+    elif operation == "batch":
+        from src.waveform_batch import FSDBBatchReader
+        lib.fsdb_batch_window_transitions = lambda *args: -6
+        call = lambda: FSDBBatchReader(parser).values_in_window(["top.clk"], 0, 10)
+    else:
+        setattr(lib, "fsdb_" + operation + "_transition_group", lambda *args: -6)
+        def call():
+            with parser.transition_group(["top.clk"]):
+                pass
+    with pytest.raises(RuntimeError, match="reader closed for recovery"):
+        call()
+    assert parser._handle is None
+    assert not parser._transition_group_active
+    assert lib.calls[-1] == "close"
+
+
+def test_group_cleanup_failure_preserves_cancellation():
+    from src.cancellation import OperationCancelled
+    parser = _fake_group_parser()
+    parser._lib.fsdb_end_transition_group = lambda *args: -6
+    with pytest.raises(OperationCancelled):
+        with parser.transition_group(["top.clk"]):
+            raise OperationCancelled()
+    assert parser._handle is None
+
+
+def test_failed_group_read_closes_once_and_skips_stale_finalizer():
+    parser = _fake_group_parser()
+    parser._lib.fsdb_get_loaded_transitions = lambda *args: -6
+    with pytest.raises(RuntimeError, match="reader closed for recovery"):
+        with parser.transition_group(["top.clk"]):
+            parser.get_transitions("top.clk")
+    assert parser._lib.calls == [("begin", ["top.clk"]), "end", "close"]
+
+
+def test_nested_group_cannot_unload_outer_group():
+    parser = _fake_group_parser()
+    with parser.transition_group(["top.clk"]):
+        with pytest.raises(RuntimeError, match="Nested"):
+            with parser.transition_group(["top.clk"]):
+                pass
+        assert parser.get_transitions("top.clk")["transition_count"] == 2
+    assert parser._lib.calls.count("end") == 1
+
+
+@pytest.mark.parametrize("metric", ["record_sweep_native_group_begin", "record_sweep_rss"])
+def test_group_releases_even_if_instrumentation_fails(monkeypatch, metric):
+    parser = _fake_group_parser()
+    def fail(*args, **kwargs):
+        raise RuntimeError("instrumentation")
+    monkeypatch.setattr(operation_metrics, metric, fail)
+    with pytest.raises(RuntimeError, match="instrumentation"):
+        with parser.transition_group(["top.clk"]):
+            pass
+    assert not parser._transition_group_active
+    assert parser._lib.calls[-1] == "end"

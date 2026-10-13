@@ -142,6 +142,13 @@ def _setup(lib):
     lib.fsdb_close.restype  = None
     lib.fsdb_close.argtypes = [ctypes.c_void_p]
 
+    try:
+        lib.fsdb_reader_status.restype = ctypes.c_int
+        lib.fsdb_reader_status.argtypes = [ctypes.c_void_p]
+        lib._traceweave_has_reader_status = True
+    except AttributeError:
+        lib._traceweave_has_reader_status = False
+
     lib._traceweave_has_event_pages_v1 = False
     try:
         lib.fsdb_event_page_version.restype = ctypes.c_int
@@ -325,6 +332,7 @@ class FSDBParser:
         self._scale_unit = None   # raw header string, e.g. "100fs"; "unknown" if unreadable
         self._scale_fs   = None   # fs per FSDB tick; 0 = unknown
         self._transition_group_active = False
+        self._transition_group_token = None
         self._file_identity = None
         self._header = None
         self._summary_paths = None
@@ -427,6 +435,7 @@ class FSDBParser:
                     self._handle, ctypes.byref(profile)
                 )
                 self._transition_group_active = False
+                self._transition_group_token = None
             self._lib.fsdb_close(self._handle)
             self._handle = None
 
@@ -438,6 +447,13 @@ class FSDBParser:
         if self._buf is None:
             self._buf = ctypes.create_string_buffer(_BUF_SIZE)
         return self._buf
+
+    def _check_native_cleanup(self, rc, operation):
+        if rc == -6:
+            # Unknown selection/view state must never survive into another
+            # query. Closing also discards file-bound clock/metadata caches.
+            self.close()
+            raise RuntimeError(f"FSDB {operation} cleanup failed; reader closed for recovery")
 
     def get_value_at_time(self, signal_path: str, time_ps: int) -> dict:
         self._open()
@@ -455,11 +471,7 @@ class FSDBParser:
             )
         if rc == -4:
             raise self._scale_unknown_error()
-        if rc == -6:
-            # Do not let a failed native view restoration poison later reads.
-            # A future call will open a fresh handle; close also drops indexes.
-            self.close()
-            raise RuntimeError("FSDB point-read cleanup failed; reader closed for recovery")
+        self._check_native_cleanup(rc, "point-read")
         if rc < 0:
             raise RuntimeError(f"fsdb_get_value_at_time failed, rc={rc}")
         return {
@@ -501,6 +513,7 @@ class FSDBParser:
             raise KeyError(f"Signal not found: '{signal_path}'")
         if rc == -4:
             raise self._scale_unknown_error()
+        self._check_native_cleanup(rc, "transition-read")
         if rc < 0:
             raise RuntimeError(f"fsdb_get_transitions failed, rc={rc}")
         text = buf.value.decode()
@@ -549,6 +562,8 @@ class FSDBParser:
         continue using ordinary ``get_transitions`` unchanged.
         """
         self._open()
+        if self._transition_group_active:
+            raise RuntimeError("Nested FSDB transition groups are not supported")
         paths = list(dict.fromkeys(str(path) for path in signal_paths if path))
         if not paths:
             yield False
@@ -577,6 +592,7 @@ class FSDBParser:
         rc = self._lib.fsdb_begin_transition_group(
             self._handle, c_paths, len(encoded), ctypes.byref(begin_profile)
         )
+        self._check_native_cleanup(rc, "group-begin")
         if rc < 0:
             operation_metrics.record_sweep_native_group_fallback(
                 "begin_error", signal_count=len(paths)
@@ -585,21 +601,35 @@ class FSDBParser:
             return
 
         self._transition_group_active = True
-        operation_metrics.record_sweep_native_group_begin(
-            _profile_dict(begin_profile)
-        )
-        operation_metrics.record_sweep_rss(phase="sample")
+        group_handle = self._handle
+        group_token = self._transition_group_token = object()
         try:
+            operation_metrics.record_sweep_native_group_begin(
+                _profile_dict(begin_profile)
+            )
+            operation_metrics.record_sweep_rss(phase="sample")
             yield True
         finally:
             # Capture the group's loaded high-water before FFR unload, then the
             # caller samples again after the context to observe retention.
-            operation_metrics.record_sweep_rss(phase="sample")
             end_profile = _NativeTransitionGroupProfileV1()
-            self._lib.fsdb_end_transition_group(
-                self._handle, ctypes.byref(end_profile)
-            )
-            self._transition_group_active = False
+            try:
+                operation_metrics.record_sweep_rss(phase="sample")
+            finally:
+                # A failed read may already have invalidated this reader. Never
+                # end an old group against a closed or reopened native handle.
+                if (self._handle == group_handle and self._transition_group_token is group_token
+                        and self._transition_group_active):
+                    rc = self._lib.fsdb_end_transition_group(
+                        self._handle, ctypes.byref(end_profile)
+                    )
+                    self._transition_group_active = False
+                    self._transition_group_token = None
+                    if rc < 0:
+                        self.close()
+                        # Keep the original cancellation/body exception visible.
+                        if sys.exc_info()[0] is None:
+                            raise RuntimeError("FSDB group-end cleanup failed; reader closed for recovery")
             operation_metrics.record_sweep_native_group_end(
                 _profile_dict(end_profile)
             )
@@ -634,6 +664,7 @@ class FSDBParser:
         )
         if rc == -4:
             raise self._scale_unknown_error()
+        self._check_native_cleanup(rc, "around-read")
         if rc < 0:
             raise RuntimeError(f"fsdb_get_multi_signals_around_time failed, rc={rc}")
         return _parse_multi_signal_buf(
@@ -685,6 +716,8 @@ class FSDBParser:
             return dict(self._header)
         identity = self._file_identity
         end_ps = int(self._lib.fsdb_get_end_time(self._handle))
+        if getattr(self._lib, "_traceweave_has_reader_status", False):
+            self._check_native_cleanup(self._lib.fsdb_reader_status(self._handle), "duration-read")
         count  = self._lib.fsdb_get_signal_count(self._handle)
         try:
             if end_ps <= 0 and self._scale_fs != 0:
