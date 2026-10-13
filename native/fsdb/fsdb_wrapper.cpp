@@ -11,6 +11,7 @@
 #endif
 
 #include "ffrAPI.h"
+#include "fsdb_event_cursor.h"
 #include "fsdb_point_read.h"
 #include <chrono>
 #include <ctype.h>
@@ -52,6 +53,11 @@ struct FsdbEventCursor {
     SigInfo *sig;
     unsigned long long start_ps, end_ps;
     bool valid;
+    FsdbEventPosition position;
+};
+
+struct FsdbEventReclaimProgress {
+    unsigned long long records = 0, bytes = 0;
 };
 
 struct FsdbCtx {
@@ -76,13 +82,17 @@ struct FsdbCtx {
     bool                              transition_group_lazy = false;
     std::set<fsdbVarIdcode>           transition_group_ids;
     std::map<unsigned long long, FsdbEventCursor> event_cursors;
+    std::map<fsdbVarIdcode, FsdbEventReclaimProgress> event_reclaim_progress;
     unsigned long long next_event_cursor = 0;
     bool cleanup_failed = false;
 };
 
 static bool _CloseEventCursors(FsdbCtx *ctx) {
     for (auto &entry : ctx->event_cursors) {
-        try { entry.second.hdl->ffrFree(); }
+        if (!entry.second.hdl) continue;
+        auto hdl = entry.second.hdl;
+        entry.second.hdl = nullptr;
+        try { hdl->ffrFree(); }
         catch (...) { ctx->cleanup_failed = true; }
     }
     ctx->event_cursors.clear();
@@ -92,19 +102,24 @@ static bool _CloseEventCursors(FsdbCtx *ctx) {
 static bool _FinishTransitionGroup(FsdbCtx *ctx) {
     _CloseEventCursors(ctx);
     if (ctx->transition_group_active) {
-        for (fsdbVarIdcode id : ctx->transition_group_ids) {
+        // A failed handle release may still own native storage. Once poisoned,
+        // leave storage teardown to ffrClose instead of unloading under it.
+        if (!ctx->cleanup_failed) {
+            for (fsdbVarIdcode id : ctx->transition_group_ids) {
+                try {
+                    if (ctx->obj->ffrUnloadSignals(id) != FSDB_RC_SUCCESS)
+                        ctx->cleanup_failed = true;
+                } catch (...) { ctx->cleanup_failed = true; }
+            }
             try {
-                if (ctx->obj->ffrUnloadSignals(id) != FSDB_RC_SUCCESS)
+                if (!ctx->cleanup_failed && ctx->obj->ffrResetSignalList() != FSDB_RC_SUCCESS)
                     ctx->cleanup_failed = true;
             } catch (...) { ctx->cleanup_failed = true; }
         }
-        try {
-            if (ctx->obj->ffrResetSignalList() != FSDB_RC_SUCCESS)
-                ctx->cleanup_failed = true;
-        } catch (...) { ctx->cleanup_failed = true; }
         ctx->transition_group_active = false;
         ctx->transition_group_lazy = false;
         ctx->transition_group_ids.clear();
+        ctx->event_reclaim_progress.clear();
     }
     return !ctx->cleanup_failed;
 }
@@ -1042,12 +1057,46 @@ fsdb_end_transition_group(void *handle,
 /* Private bounded event ABI. Each row is P/T, public ps, exact raw tick, value.
  * A page can split a raw-time group; next_tick explicitly identifies its
  * unfinished tail. No caller may compare that tail until the next time is
- * strictly greater (or EOF). Pages never seek again and never reload signals.
- * FFR's initial load may still decompress whole flush sessions. */
+ * strictly greater (or EOF). Lazy groups periodically release and reseek all
+ * cursors of the same ID; eager groups keep their original resident lifetime.
+ * FFR may decompress a whole flush session, so progress budgets below are not
+ * a universal resident-byte bound. Same-tick replay may also be longer than a
+ * page when a file contains a very large glitch group. */
 struct FsdbEventPageV1 {
     unsigned long long next_tick;
     unsigned int has_next, complete, truncated, events, output_bytes;
 };
+
+// Compile-time overrides are for deterministic small-fixture regression.
+#ifndef TRACEWEAVE_FSDB_EVENT_RECLAIM_RECORDS
+#define TRACEWEAVE_FSDB_EVENT_RECLAIM_RECORDS 262144ULL
+#endif
+#ifndef TRACEWEAVE_FSDB_EVENT_RECLAIM_BYTES
+#define TRACEWEAVE_FSDB_EVENT_RECLAIM_BYTES (64ULL * 1024 * 1024)
+#endif
+
+static int _ReclaimEventProgress(FsdbCtx *ctx, SigInfo *sig, unsigned int records) {
+    if (!ctx->transition_group_lazy || !records) return 0;
+    auto &progress = ctx->event_reclaim_progress[sig->idcode];
+    // Conservative logical work, not an estimate of compressed FFR allocation.
+    // Wide signals reach the byte budget sooner than a one-bit clock. The
+    // 128-bit intermediate keeps malformed/extreme widths from wrapping.
+    unsigned __int128 bytes = (unsigned __int128)sig->bit_size *
+        (sig->bytes_per_bit ? sig->bytes_per_bit : 1) + sizeof(fsdbTag64);
+    bytes = progress.bytes + bytes * records;
+    const auto maximum = std::numeric_limits<unsigned long long>::max();
+    progress.bytes = bytes > maximum ? maximum : (unsigned long long)bytes;
+    progress.records += records;
+    if (progress.records < TRACEWEAVE_FSDB_EVENT_RECLAIM_RECORDS &&
+        progress.bytes < TRACEWEAVE_FSDB_EVENT_RECLAIM_BYTES) return 0;
+    std::vector<FsdbEventCursor*> siblings;
+    for (auto &entry : ctx->event_cursors)
+        if (entry.second.sig->idcode == sig->idcode) siblings.push_back(&entry.second);
+    if (!FsdbReclaimEventCursors(ctx->obj, sig->idcode, siblings, ctx->cleanup_failed))
+        return -6;
+    progress = FsdbEventReclaimProgress{};
+    return 0;
+}
 
 int fsdb_event_page_version() { return 1; }
 
@@ -1079,35 +1128,39 @@ int fsdb_event_open_v1(void *handle, const char *path,
         || ctx->event_cursors.size() >= 256) return -5;
     ffrVCTrvsHdl hdl = read.Create(it->second.idcode);
     if (!hdl) return -3;
-    bool valid;
+    bool valid, last_at_tick = false;
     if (!start_ps) {
         int rc = _SeekPublicWindowStart(ctx, hdl, 0);
         if (rc < 0) return read.Result(rc);
         valid = rc > 0;
     } else {
-            fsdbTag64 tag = _ToTag(ctx, start_ps);
-            // Seek strictly before the physical window; GotoXTag returns the
-            // LAST event at a tick. This preserves every event at the start.
-            if (((unsigned __int128)start_ps * FS_PER_PS) % ctx->scale_fs == 0) {
-                if (tag.L == 0) { --tag.H; tag.L = 0xffffffff; }
-                else --tag.L;
+        fsdbTag64 tag = _ToTag(ctx, start_ps);
+        // Seek strictly before the physical window; GotoXTag returns the
+        // LAST event at a tick. This preserves every event at the start.
+        if (((unsigned __int128)start_ps * FS_PER_PS) % ctx->scale_fs == 0) {
+            if (tag.L == 0) { --tag.H; tag.L = 0xffffffff; }
+            else --tag.L;
+        }
+        const fsdbTag64 target = tag;
+        valid = FSDB_RC_SUCCESS == hdl->ffrGotoXTag(&tag);
+        last_at_tick = valid;
+        if (!valid) {
+            fsdbTag64 last;
+            if (ctx->obj->ffrGetMaxFsdbTag64(&last) == FSDB_RC_SUCCESS &&
+                (last.H < target.H || (last.H == target.H && last.L < target.L))) {
+                valid = FSDB_RC_SUCCESS == hdl->ffrGotoXTag(&last);
+                last_at_tick = valid;
+            } else {
+                int rc = _SeekPublicWindowStart(ctx, hdl, 0);
+                if (rc < 0) return read.Result(rc);
+                valid = rc > 0;
             }
-            const fsdbTag64 target = tag;
-            valid = FSDB_RC_SUCCESS == hdl->ffrGotoXTag(&tag);
-            if (!valid) {
-                fsdbTag64 last;
-                if (ctx->obj->ffrGetMaxFsdbTag64(&last) == FSDB_RC_SUCCESS &&
-                    (last.H < target.H || (last.H == target.H && last.L < target.L)))
-                    valid = FSDB_RC_SUCCESS == hdl->ffrGotoXTag(&last);
-                else {
-                    int rc = _SeekPublicWindowStart(ctx, hdl, 0);
-                    if (rc < 0) return read.Result(rc);
-                    valid = rc > 0;
-                }
-            }
+        }
     }
+    FsdbEventCursor state = {hdl, &it->second, start_ps, end_ps, valid, {}};
+    if (valid && !state.position.Initialize(hdl, last_at_tick)) return read.Result(-3);
     *cursor = ++ctx->next_event_cursor;
-    ctx->event_cursors.emplace(*cursor, FsdbEventCursor{hdl, &it->second, start_ps, end_ps, valid});
+    ctx->event_cursors.emplace(*cursor, state);
     read.ReleaseHandle();
     return 0;
     } catch (...) { return read.Result(-3); }
@@ -1118,31 +1171,31 @@ int fsdb_event_close_v1(void *handle, unsigned long long cursor) {
     FsdbCtx *ctx = (FsdbCtx*)handle;
     auto it = ctx->event_cursors.find(cursor);
     if (it != ctx->event_cursors.end()) {
-        try { it->second.hdl->ffrFree(); }
-        catch (...) { ctx->cleanup_failed = true; }
+        if (it->second.hdl) {
+            auto hdl = it->second.hdl;
+            it->second.hdl = nullptr;
+            try { hdl->ffrFree(); }
+            catch (...) { ctx->cleanup_failed = true; }
+        }
         ctx->event_cursors.erase(it);
     }
     return ctx->cleanup_failed ? -6 : 0;
 }
 
-int fsdb_event_page_v1(void *handle, unsigned long long cursor,
-                       unsigned int max_events, char *out, unsigned int capacity,
-                       FsdbEventPageV1 *page, unsigned int page_size) {
-    if (!handle || !out || !page || page_size != sizeof(*page) || !max_events
-        || max_events > 4096 || capacity < 128 || capacity > 1048576) return -1;
+static int _ReadEventPage(FsdbCtx *ctx, unsigned long long cursor,
+                         unsigned int max_events, char *out, unsigned int capacity,
+                         FsdbEventPageV1 *page) {
     memset(page, 0, sizeof(*page));
-    out[0] = '\0';
-    FsdbCtx *ctx = (FsdbCtx*)handle;
+    if (out) out[0] = '\0';
     if (ctx->cleanup_failed) return -6;
+    if (!ctx->scale_fs) return FSDB_ERR_SCALE_UNKNOWN;
     try {
     auto found = ctx->event_cursors.find(cursor);
     if (!ctx->transition_group_active || found == ctx->event_cursors.end()) return -5;
     FsdbEventCursor &c = found->second;
     while (c.valid) {
-        fsdbTag64 tag;
-        if (FSDB_RC_SUCCESS != c.hdl->ffrGetXTag(&tag)) return -3;
         unsigned long long tick;
-        unsigned long long ps = _TagToPs(ctx, tag, &tick);
+        unsigned long long ps = _TagToPs(ctx, c.position.tag, &tick);
         unsigned __int128 fs = (unsigned __int128)tick * ctx->scale_fs;
         if (c.end_ps != (unsigned long long)-1 && fs > (unsigned __int128)c.end_ps * FS_PER_PS) {
             c.valid = false;
@@ -1150,30 +1203,58 @@ int fsdb_event_page_v1(void *handle, unsigned long long cursor,
         }
         page->next_tick = tick;
         page->has_next = 1;
-        // Cap before GetVC/value formatting as well as before copying. Digital
-        // rows need at most width+64 bytes; real rows use a fixed small bound.
-        size_t needed = (c.sig->bytes_per_bit == FSDB_BYTES_PER_BIT_1B ? c.sig->bit_size : 64) + 64ULL;
-        if (page->events >= max_events || needed >= capacity - page->output_bytes) {
-            if (!page->events) page->truncated = 1; // one unrepresentable event
-            break;
+        if (page->events >= max_events) break;
+        if (out) {
+            // Cap before GetVC/value formatting as well as before copying.
+            // Digital rows need width+64 bytes; real rows use a fixed bound.
+            size_t needed = (c.sig->bytes_per_bit == FSDB_BYTES_PER_BIT_1B ? c.sig->bit_size : 64) + 64ULL;
+            if (needed >= capacity - page->output_bytes) {
+                if (!page->events) page->truncated = 1; // one unrepresentable event
+                break;
+            }
+            byte_T *vc = NULL;
+            if (FSDB_RC_SUCCESS != c.hdl->ffrGetVC(&vc) || !vc) return -3;
+            std::string value = _VCToStr(vc, c.sig->bit_size, c.sig->bytes_per_bit);
+            char prefix[64];
+            char kind = fs < (unsigned __int128)c.start_ps * FS_PER_PS ? 'P' : 'T';
+            int n = snprintf(prefix, sizeof(prefix), "%c\t%llu\t%llu\t", kind, ps, tick);
+            memcpy(out + page->output_bytes, prefix, n); page->output_bytes += n;
+            memcpy(out + page->output_bytes, value.data(), value.size()); page->output_bytes += value.size();
+            out[page->output_bytes++] = '\n';
         }
-        byte_T *vc = NULL;
-        if (FSDB_RC_SUCCESS != c.hdl->ffrGetVC(&vc) || !vc) return -3;
-        std::string value = _VCToStr(vc, c.sig->bit_size, c.sig->bytes_per_bit);
-        char prefix[64];
-        char kind = fs < (unsigned __int128)c.start_ps * FS_PER_PS ? 'P' : 'T';
-        int n = snprintf(prefix, sizeof(prefix), "%c\t%llu\t%llu\t", kind, ps, tick);
-        memcpy(out + page->output_bytes, prefix, n); page->output_bytes += n;
-        memcpy(out + page->output_bytes, value.data(), value.size()); page->output_bytes += value.size();
-        out[page->output_bytes++] = '\n';
         ++page->events;
         page->has_next = 0;
-        c.valid = FSDB_RC_SUCCESS == c.hdl->ffrGotoNextVC();
+        int rc = c.position.Advance(c.hdl);
+        if (rc < 0) {
+            ctx->cleanup_failed = true;
+            return -6;  // The next unread position is no longer trustworthy.
+        }
+        c.valid = rc > 0;
     }
     page->complete = !c.valid;
-    out[page->output_bytes] = '\0';
-    return 0;
-    } catch (...) { return -3; }
+    if (out) out[page->output_bytes] = '\0';
+    return _ReclaimEventProgress(ctx, c.sig, page->events);
+    } catch (...) { ctx->cleanup_failed = true; return -6; }
+}
+
+int fsdb_event_page_v1(void *handle, unsigned long long cursor,
+                       unsigned int max_events, char *out, unsigned int capacity,
+                       FsdbEventPageV1 *page, unsigned int page_size) {
+    if (!handle || !out || !page || page_size != sizeof(*page) || !max_events
+        || max_events > 4096 || capacity < 128 || capacity > 1048576) return -1;
+    return _ReadEventPage((FsdbCtx*)handle, cursor, max_events, out, capacity, page);
+}
+
+/* Optional count-only suffix read. Counts exactly the records consumed from
+ * this cursor, including its predecessor/initial observation if still unread.
+ * No values are obtained or formatted. Python can checkpoint cancellation
+ * between calls; complete/next_tick/has_next retain event-page semantics. */
+int fsdb_event_count_v1(void *handle, unsigned long long cursor,
+                        unsigned int max_events, FsdbEventPageV1 *page,
+                        unsigned int page_size) {
+    if (!handle || !page || page_size != sizeof(*page) || !max_events
+        || max_events > 65536) return -1;
+    return _ReadEventPage((FsdbCtx*)handle, cursor, max_events, nullptr, 0, page);
 }
 
 int
