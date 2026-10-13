@@ -6,6 +6,7 @@ cycle_query.py
 from __future__ import annotations
 
 import time
+from array import array
 from bisect import bisect_left, bisect_right
 from typing import Any
 
@@ -808,6 +809,63 @@ def _sample_signals_at_edges(
     return per_edge_signals, signal_errors, transition_signals_truncated
 
 
+def _read_fsdb_clock_edges(parser, clock_path, edge, start_ps=0, end_ps=-1):
+    """Stream an after-phase FSDB clock into compact public-ps timestamps.
+
+    None means the caller should use its existing compatibility path. Require
+    the count capability introduced with resumable cursor reclamation, even
+    though this scan needs values: a pre-reclamation lazy wrapper would retain
+    the entire traversed clock in FFR. No native group escapes this function.
+    """
+    from .fsdb_parser import FSDBParser
+    if not isinstance(parser, FSDBParser):
+        return None  # Adapters may forward unknown methods to their raw parser.
+    check_cancelled()
+    parser._open()
+    if parser._transition_group_active or not all(getattr(parser._lib, name, False) for name in (
+            '_traceweave_has_event_pages_v1', '_traceweave_has_lazy_transition_group',
+            '_traceweave_has_event_count_v1')):
+        return None
+    if start_ps < 0 or end_ps < -1 or (end_ps != -1 and end_ps < start_ps):
+        return None
+    if edge not in {'posedge', 'negedge'}:
+        raise ValueError("edge must be posedge or negedge")
+    _validate_clock_width(parser, clock_path)
+    physical_start = max(0, start_ps - 1)
+    edges = array('Q')
+    previous = None
+    complete = False
+    with parser._event_transition_group([clock_path], physical_start, end_ps) as active:
+        if not active:
+            return None
+        with parser._event_pages(clock_path, physical_start, end_ps, max_events=4096) as reader:
+            while True:
+                check_cancelled()
+                page = reader.read_page()
+                records = page_records(page)
+                for event in records:
+                    # Preserve EACH event, including 0->1->0->1 at one tick.
+                    # X/Z breaks direction; a later known pair may form an edge.
+                    current = event.value.strip() if event.value is not None else None
+                    if current not in ('0', '1'):
+                        previous = None
+                        continue
+                    if event.time_ps >= start_ps and (end_ps == -1 or event.time_ps <= end_ps):
+                        if ((edge == 'posedge' and previous == '0' and current == '1') or
+                                (edge == 'negedge' and previous == '1' and current == '0')):
+                            edges.append(event.time_ps)
+                    previous = current
+                if page.truncated or page.complete:
+                    complete = page.complete and not page.truncated
+                    break
+                if not records:
+                    raise RuntimeError('FSDB clock event page made no progress')
+    check_cancelled()
+    period = _compute_compact_clock_period_ps(edges)
+    check_cancelled()
+    return edges, period, complete
+
+
 def _full_clock_edges(parser, clock_path, edge, *, sample_phase="after"):
     """Retain global cycle numbering and period while reusing complete reads.
 
@@ -815,6 +873,9 @@ def _full_clock_edges(parser, clock_path, edge, *, sample_phase="after"):
     their previous uncached behavior. Native prefixes never enter the cache.
     """
     check_cancelled()
+    from .fsdb_parser import FSDBParser
+    if isinstance(parser, FSDBParser):
+        parser._open()  # Validate the snapshot before accepting a cache hit.
     token = getattr(parser, "_clock_cache_token", None)
     before = sample_phase == "before"
     exact = before or getattr(parser, "_exact_sampling", False)
@@ -823,6 +884,14 @@ def _full_clock_edges(parser, clock_path, edge, *, sample_phase="after"):
     if cached is not None:
         check_cancelled()
         return *cached, None, True
+    if not exact:
+        compact = _read_fsdb_clock_edges(parser, clock_path, edge)
+        if compact is not None:
+            edges, period, complete = compact
+            check_cancelled()
+            if complete:
+                clock_edge_cache.cache.put(token, key, edges, period)
+            return edges, period, None, complete
     safe_before_fs = None
     if exact:
         result = _before_clock_prefix(_read_before_transitions(parser, clock_path, 0, -1))
@@ -897,6 +966,85 @@ def _compute_clock_period_ps(edge_times: list[int]) -> int | None:
     ordered = sorted(deltas)
     mid = len(ordered) // 2
     return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) // 2
+
+
+_CLOCK_DELTA_HISTOGRAM_LIMIT = 4096
+
+
+def _compact_deltas(edges):
+    """Yield the legacy nonnegative deltas without slicing/copying the array."""
+    if not edges:
+        return
+    previous = edges[0]
+    for index in range(1, len(edges)):
+        if not index % CANCEL_CHECK_STRIDE:
+            check_cancelled()
+        current = edges[index]
+        delta = current - previous
+        previous = current
+        if delta >= 0:
+            yield delta
+
+
+def _compute_compact_clock_period_ps(edges):
+    """Exact median with bounded auxiliary memory, including zero deltas.
+
+    Clock periods normally have few distinct deltas. If irregular activity
+    exhausts the small histogram, radix-select the two median ranks over the
+    compact timestamps in at most eight further passes. This trades extra
+    scanning for bounded memory; it never expands all deltas into Python ints.
+    """
+    check_cancelled()
+    if len(edges) < 2:
+        return None
+    counts = {}
+    total = maximum = 0
+    for delta in _compact_deltas(edges):
+        total += 1
+        if delta > maximum:
+            maximum = delta
+        if counts is not None:
+            if delta in counts or len(counts) < _CLOCK_DELTA_HISTOGRAM_LIMIT:
+                counts[delta] = counts.get(delta, 0) + 1
+            else:
+                counts = None
+    if not total:
+        return None
+    ranks = ((total - 1) // 2, total // 2)
+    if counts is not None:
+        ordered = sorted(counts.items())
+        selected = []
+        before = 0
+        for value, count in ordered:
+            while len(selected) < 2 and ranks[len(selected)] < before + count:
+                selected.append(value)
+            before += count
+            if len(selected) == 2:
+                check_cancelled()
+                return (selected[0] + selected[1]) // 2
+
+    # Each state holds the high-byte prefix and the rank within that bucket.
+    # Adjacent median ranks share scans even when they fall in different bins.
+    states = [(0, rank) for rank in ranks]
+    shift = max(0, (maximum.bit_length() - 1) // 8 * 8)
+    while shift >= 0:
+        check_cancelled()
+        buckets = {prefix: [0] * 256 for prefix, _ in states}
+        for delta in _compact_deltas(edges):
+            counts = buckets.get(delta >> (shift + 8))
+            if counts is not None:
+                counts[(delta >> shift) & 255] += 1
+        next_states = []
+        for prefix, rank in states:
+            for byte, count in enumerate(buckets[prefix]):
+                if rank < count:
+                    next_states.append(((prefix << 8) | byte, rank))
+                    break
+                rank -= count
+        states = next_states
+        shift -= 8
+    check_cancelled()
+    return (states[0][0] + states[1][0]) // 2
 
 
 def _sample_signal_values(

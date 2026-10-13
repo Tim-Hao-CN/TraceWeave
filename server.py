@@ -156,6 +156,7 @@ from src.x_trace import inspect_upstream_values, trace_x_source
 from src.cycle_query import (
     _compute_clock_period_ps,
     _extract_edge_times,
+    _read_fsdb_clock_edges,
     annotate_center_transients,
     get_signals_by_cycle,
 )
@@ -5186,6 +5187,7 @@ def _detect_wave_clock(parser) -> tuple[str | None, int | None]:
     clock_path: str | None = None
     period_ps: int | None = None
     detect_reason: str | None = None
+    cacheable = True
 
     try:
         candidate_paths: set[str] = set()
@@ -5210,17 +5212,28 @@ def _detect_wave_clock(parser) -> tuple[str | None, int | None]:
             candidate_paths, key=lambda path: (path.count("."), len(path))
         ):
             try:
-                transitions = parser.get_transitions(
-                    candidate, 0, CLOCK_DETECT_SAMPLE_PS
-                ).get("transitions", [])
-                edge_times = _extract_edge_times(transitions, "posedge")
-                period = _compute_clock_period_ps(edge_times)
+                compact = (_read_fsdb_clock_edges(parser, candidate, "posedge", 0,
+                    CLOCK_DETECT_SAMPLE_PS) if isinstance(parser, FSDBParser) else None)
+                if compact is not None:
+                    edge_times, period, complete = compact
+                    edge_count = len(edge_times)
+                    del edge_times, compact  # Release a large index before the next candidate.
+                    if not complete:
+                        cacheable = False
+                        raise RuntimeError("incomplete clock event pages")
+                else:
+                    transitions = parser.get_transitions(
+                        candidate, 0, CLOCK_DETECT_SAMPLE_PS
+                    ).get("transitions", [])
+                    edge_times = _extract_edge_times(transitions, "posedge")
+                    period = _compute_clock_period_ps(edge_times)
+                    edge_count = len(edge_times)
                 if period and period > 0:
                     scored.append(
                         (
                             candidate,
                             period,
-                            len(edge_times),
+                            edge_count,
                             is_tool_pseudo_signal(candidate),
                         )
                     )
@@ -5252,8 +5265,9 @@ def _detect_wave_clock(parser) -> tuple[str | None, int | None]:
         detect_reason = f"{type(exc).__name__}: {exc}"
 
     try:
-        parser._cached_clock_info = (clock_path, period_ps)
-        parser._cached_clock_detect_reason = detect_reason
+        if cacheable:
+            parser._cached_clock_info = (clock_path, period_ps)
+            parser._cached_clock_detect_reason = detect_reason
     except Exception:
         pass
 
