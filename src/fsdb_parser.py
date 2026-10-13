@@ -254,6 +254,20 @@ def _setup(lib):
     except AttributeError:
         lib._traceweave_has_transition_group = False
 
+    # Event cursors can share ownership without eagerly loading every signal's
+    # full history. The event-page ABI and the existing eager sweep group stay
+    # unchanged; older wrappers retain their resident-group compatibility path.
+    try:
+        lib.fsdb_begin_lazy_transition_group_v1.restype = ctypes.c_int
+        lib.fsdb_begin_lazy_transition_group_v1.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_char_p), ctypes.c_int,
+            ctypes.POINTER(_NativeTransitionGroupProfileV1),
+        ]
+        lib._traceweave_has_lazy_transition_group = lib._traceweave_has_transition_group
+    except AttributeError:
+        lib._traceweave_has_lazy_transition_group = False
+
     # int fsdb_get_multi_signals_around_time(
     #     void*, const char**, int, uint64, uint64, int, char*, int)
     lib.fsdb_get_multi_signals_around_time.restype = ctypes.c_int
@@ -501,7 +515,8 @@ class FSDBParser:
             )
             operation_metrics.record_sweep_native_transition(
                 _profile_dict(profile),
-                standalone_load=not self._transition_group_active,
+                standalone_load=(not self._transition_group_active and not
+                    getattr(self._lib, '_traceweave_has_lazy_transition_group', False)),
             )
         else:
             rc = self._lib.fsdb_get_transitions(
@@ -561,6 +576,24 @@ class FSDBParser:
         failed groups fall back before touching FFR group state, so callers can
         continue using ordinary ``get_transitions`` unchanged.
         """
+        with self._transition_group(signal_paths, lazy=False) as active:
+            yield active
+
+    @contextmanager
+    def _event_transition_group(self, signal_paths, start, end):
+        """Own event-page signals without a full-history preload when supported.
+
+        Each event cursor seeks its own exact ``start``/``end`` inside the
+        original view. Ownership is shared, but a narrowed native view must not
+        fabricate boundary observations or replace a true predecessor.
+        """
+        self._open()
+        lazy = bool(getattr(self._lib, '_traceweave_has_lazy_transition_group', False))
+        with self._transition_group(signal_paths, lazy=lazy) as active:
+            yield active
+
+    @contextmanager
+    def _transition_group(self, signal_paths, *, lazy):
         self._open()
         if self._transition_group_active:
             raise RuntimeError("Nested FSDB transition groups are not supported")
@@ -589,7 +622,9 @@ class FSDBParser:
         encoded = [path.encode() for path in paths]
         c_paths = (ctypes.c_char_p * len(encoded))(*encoded)
         begin_profile = _NativeTransitionGroupProfileV1()
-        rc = self._lib.fsdb_begin_transition_group(
+        begin = (self._lib.fsdb_begin_lazy_transition_group_v1 if lazy
+                 else self._lib.fsdb_begin_transition_group)
+        rc = begin(
             self._handle, c_paths, len(encoded), ctypes.byref(begin_profile)
         )
         self._check_native_cleanup(rc, "group-begin")
@@ -605,7 +640,7 @@ class FSDBParser:
         group_token = self._transition_group_token = object()
         try:
             operation_metrics.record_sweep_native_group_begin(
-                _profile_dict(begin_profile)
+                _profile_dict(begin_profile), eager_load=not lazy
             )
             operation_metrics.record_sweep_rss(phase="sample")
             yield True

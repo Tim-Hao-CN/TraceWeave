@@ -73,6 +73,7 @@ struct FsdbCtx {
     unsigned long long                scale_fs;
     char                              scale_unit[32]; /* 原始刻度字符串，"" = 未知 */
     bool                              transition_group_active;
+    bool                              transition_group_lazy = false;
     std::set<fsdbVarIdcode>           transition_group_ids;
     std::map<unsigned long long, FsdbEventCursor> event_cursors;
     unsigned long long next_event_cursor = 0;
@@ -102,6 +103,7 @@ static bool _FinishTransitionGroup(FsdbCtx *ctx) {
                 ctx->cleanup_failed = true;
         } catch (...) { ctx->cleanup_failed = true; }
         ctx->transition_group_active = false;
+        ctx->transition_group_lazy = false;
         ctx->transition_group_ids.clear();
     }
     return !ctx->cleanup_failed;
@@ -717,8 +719,10 @@ fsdb_get_value_at_time(void *handle, const char *signal_path,
             rc = read.Open(idcode, tag, resident, attempt == 0);
             if (rc == 0) {
                 ffrVCTrvsHdl hdl = read.Handle();
-                if (hdl->ffrHasIncoreVC() &&
-                    FSDB_RC_SUCCESS == hdl->ffrGotoXTag((void*)&tag)) {
+                // GotoXTag may replace its argument with the landed tag. Keep
+                // the requested timestamp intact for the original-view retry.
+                fsdbTag64 seek_tag = tag;
+                if (FSDB_RC_SUCCESS == hdl->ffrGotoXTag((void*)&seek_tag)) {
                     byte_T *vc_ptr = NULL;
                     if (FSDB_RC_SUCCESS == hdl->ffrGetVC(&vc_ptr) && vc_ptr) {
                         result = _VCToStr(vc_ptr, bsize, bpb);
@@ -933,10 +937,10 @@ fsdb_get_transitions(void *handle, const char *signal_path,
 /* Load a bounded group once, then let Python request each signal independently
  * through its existing reusable 64 MiB per-call buffer. This avoids per-signal
  * Load/Unload while preserving the legacy output/truncation contract. */
-int
-fsdb_begin_transition_group(void *handle, const char **signal_paths,
+static int
+_BeginTransitionGroup(void *handle, const char **signal_paths,
                             int signal_count,
-                            FsdbTransitionGroupProfileV1 *profile)
+                            FsdbTransitionGroupProfileV1 *profile, bool lazy)
 {
     if (profile) memset(profile, 0, sizeof(*profile));
     if (!handle || !signal_paths || signal_count <= 0) return -1;
@@ -967,20 +971,35 @@ fsdb_begin_transition_group(void *handle, const char **signal_paths,
             if (rc) return fail(rc);
         }
         _ProfileClock::time_point add_end = _ProfileClock::now();
-        rc = selection.Load();
-        if (rc) return fail(rc);
+        if (!lazy) {
+            rc = selection.Load();
+            if (rc) return fail(rc);
+        }
         _ProfileClock::time_point load_end = _ProfileClock::now();
         ctx->transition_group_ids.swap(ids);
         ctx->transition_group_active = true;
+        ctx->transition_group_lazy = lazy;
         selection.Release();
         if (profile) {
             profile->lookup_ns = _ElapsedNs(lookup_begin, lookup_end);
             profile->add_signal_ns = _ElapsedNs(add_begin, add_end);
-            profile->load_ns = _ElapsedNs(add_end, load_end);
+            profile->load_ns = lazy ? 0 : _ElapsedNs(add_end, load_end);
             profile->signal_count = ctx->transition_group_ids.size();
         }
         return signal_count;
     } catch (...) { return fail(-3); }
+}
+
+int fsdb_begin_transition_group(void *handle, const char **paths, int count,
+                                 FsdbTransitionGroupProfileV1 *profile) {
+    return _BeginTransitionGroup(handle, paths, count, profile, false);
+}
+
+/* Additive capability: ownership only. Each cursor demand-loads its own
+ * sessions in the unchanged original view, bounded by its requested window. */
+int fsdb_begin_lazy_transition_group_v1(void *handle, const char **paths, int count,
+                                         FsdbTransitionGroupProfileV1 *profile) {
+    return _BeginTransitionGroup(handle, paths, count, profile, true);
 }
 
 int
@@ -1060,10 +1079,12 @@ int fsdb_event_open_v1(void *handle, const char *path,
         || ctx->event_cursors.size() >= 256) return -5;
     ffrVCTrvsHdl hdl = read.Create(it->second.idcode);
     if (!hdl) return -3;
-    bool valid = hdl->ffrHasIncoreVC();
-    if (valid) {
-        if (!start_ps) valid = FSDB_RC_SUCCESS == hdl->ffrGotoTheFirstVC();
-        else {
+    bool valid;
+    if (!start_ps) {
+        int rc = _SeekPublicWindowStart(ctx, hdl, 0);
+        if (rc < 0) return read.Result(rc);
+        valid = rc > 0;
+    } else {
             fsdbTag64 tag = _ToTag(ctx, start_ps);
             // Seek strictly before the physical window; GotoXTag returns the
             // LAST event at a tick. This preserves every event at the start.
@@ -1071,9 +1092,19 @@ int fsdb_event_open_v1(void *handle, const char *path,
                 if (tag.L == 0) { --tag.H; tag.L = 0xffffffff; }
                 else --tag.L;
             }
-            if (FSDB_RC_SUCCESS != hdl->ffrGotoXTag(&tag))
-                valid = FSDB_RC_SUCCESS == hdl->ffrGotoTheFirstVC();
-        }
+            const fsdbTag64 target = tag;
+            valid = FSDB_RC_SUCCESS == hdl->ffrGotoXTag(&tag);
+            if (!valid) {
+                fsdbTag64 last;
+                if (ctx->obj->ffrGetMaxFsdbTag64(&last) == FSDB_RC_SUCCESS &&
+                    (last.H < target.H || (last.H == target.H && last.L < target.L)))
+                    valid = FSDB_RC_SUCCESS == hdl->ffrGotoXTag(&last);
+                else {
+                    int rc = _SeekPublicWindowStart(ctx, hdl, 0);
+                    if (rc < 0) return read.Result(rc);
+                    valid = rc > 0;
+                }
+            }
     }
     *cursor = ++ctx->next_event_cursor;
     ctx->event_cursors.emplace(*cursor, FsdbEventCursor{hdl, &it->second, start_ps, end_ps, valid});

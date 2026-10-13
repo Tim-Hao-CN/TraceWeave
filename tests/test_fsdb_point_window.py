@@ -188,13 +188,17 @@ def test_real_reader_restores_an_existing_view(native_reader_probe, monkeypatch)
 
 @pytest.mark.eda_integration
 @pytest.mark.parametrize("first_read", ["point", "transitions", "around", "group"])
-def test_interleaved_reads_release_selection_and_residency(native_reader_probe, monkeypatch, first_read):
+@pytest.mark.parametrize("lazy_group", [False, True], ids=["eager", "lazy"])
+def test_interleaved_reads_release_selection_and_residency(native_reader_probe, monkeypatch, first_read, lazy_group):
     """Dense A must not become a hidden dependency of subsequent sparse B reads."""
     from src import fsdb_parser
     monkeypatch.setattr(fsdb_parser, "_WRAPPER_SO", str(native_reader_probe))
     parser = FSDBParser(os.environ["TW_POINT_READ_FSDB"])
     fresh = FSDBParser(parser.file_path)
     dense, sparse = "top.data", "top.sparse"
+
+    def group(paths):
+        return parser._event_transition_group(paths, 0, -1) if lazy_group else parser.transition_group(paths)
 
     def state(path):
         out = (ctypes.c_uint64 * 2)()
@@ -220,7 +224,7 @@ def test_interleaved_reads_release_selection_and_residency(native_reader_probe, 
         elif first_read == "around":
             parser.get_signals_around_time([dense], 7_000_033, 30, 5)
         else:
-            with parser.transition_group([dense]) as active:
+            with group([dense]) as active:
                 assert active
                 parser.get_transitions(dense, 7_000_000, 7_000_050)
                 assert state(dense)[0] == 1 and state(dense)[1] > 0
@@ -231,12 +235,17 @@ def test_interleaved_reads_release_selection_and_residency(native_reader_probe, 
         clean()
         assert parser.get_signals_around_time([sparse], 3_000_033, 30, 5) == expected_around
         clean()
-        with parser.transition_group([sparse, sparse]) as active:
+        with group([sparse, sparse]) as active:
             assert active
+            initial_state = state(sparse)
+            assert initial_state[0] == 1
+            assert initial_state[1] == 0 if lazy_group else initial_state[1] > 0
+            assert state(dense) == (0, 0)
+            # The lazy group's untouched signal has no in-core values before
+            # this point seek; a premature HasIncoreVC check would return X.
+            assert parser.get_value_at_time(sparse, 3_000_033) == expected_point
             group_state = state(sparse)
             assert group_state[0] == 1 and group_state[1] > 0
-            assert state(dense) == (0, 0)
-            assert parser.get_value_at_time(sparse, 3_000_033) == expected_point
             assert parser.get_transitions(sparse, 3_000_000, 3_000_050) == expected_transition
             assert parser.get_signals_around_time([sparse], 3_000_033, 30, 5) == expected_around
             assert state(sparse) == group_state
@@ -258,7 +267,7 @@ def test_interleaved_reads_release_selection_and_residency(native_reader_probe, 
         clean()
         # An exceptional group body must still release selection and residency.
         with pytest.raises(RuntimeError, match="injected group interruption"):
-            with parser.transition_group([dense, sparse]) as active:
+            with group([dense, sparse]) as active:
                 assert active
                 with parser._event_pages(dense, 100, 200, max_events=2) as reader:
                     reader.read_page()
@@ -387,7 +396,8 @@ def same_tick_fsdb(tmp_path_factory):
 
 
 @pytest.mark.eda_integration
-def test_lazy_public_windows_preserve_same_tick_and_subps_order(native_reader_probe, same_tick_fsdb, monkeypatch):
+@pytest.mark.parametrize("lazy_group", [False, True], ids=["eager", "lazy"])
+def test_lazy_public_windows_preserve_same_tick_and_subps_order(native_reader_probe, same_tick_fsdb, monkeypatch, lazy_group):
     from src import fsdb_parser
     monkeypatch.setattr(fsdb_parser, "_WRAPPER_SO", str(native_reader_probe))
     parser = FSDBParser(str(same_tick_fsdb))
@@ -416,7 +426,9 @@ def test_lazy_public_windows_preserve_same_tick_and_subps_order(native_reader_pr
         # event. Native pages use physical fs and preserve sequence across caps.
         for start, end in ((0, 4), (1, 2)):
             for cap in (1, 2, 3):
-                with parser.transition_group(["top.data"]) as active:
+                group = (parser._event_transition_group(["top.data"], start, end)
+                         if lazy_group else parser.transition_group(["top.data"]))
+                with group as active:
                     assert active
                     with parser._event_pages("top.data", start, end, max_events=cap) as reader:
                         events, predecessor = [], None
@@ -459,5 +471,105 @@ def test_lazy_narrow_read_loads_only_a_fraction_of_multisession_trace(native_rea
         result = parser.get_signals_around_time(["top.data"], 90_000_033, 100, 5)
         assert len(result["signals"]["top.data"]["transitions_in_window"]) == 20
         assert 20 <= parser._lib.test_take_peak_records() < 1_000_000
+    finally:
+        parser.close()
+
+
+@pytest.mark.eda_integration
+def test_lazy_event_group_cancellation_releases_loaded_and_untouched_signals(native_reader_probe, monkeypatch):
+    import threading
+    from src import fsdb_parser
+    from src.cancellation import OperationCancelled, push_cancel_event, pop_cancel_event
+
+    monkeypatch.setattr(fsdb_parser, "_WRAPPER_SO", str(native_reader_probe))
+    parser = FSDBParser(os.environ["TW_POINT_READ_FSDB"])
+    event = threading.Event()
+    token = push_cancel_event(event)
+    paths = ["top.data", "top.sparse", "top.wide"]
+    try:
+        parser._open()
+        parser._lib.test_signal_state.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                                  ctypes.POINTER(ctypes.c_uint64)]
+        original = parser._lib.fsdb_event_page_v1
+
+        def cancel_after_first_page(*args):
+            rc = original(*args)
+            event.set()
+            return rc
+
+        with monkeypatch.context() as native_patch:
+            native_patch.setattr(parser._lib, "fsdb_event_page_v1", cancel_after_first_page)
+            with pytest.raises(OperationCancelled):
+                with parser._event_transition_group(paths, 9_000_003, 9_000_203) as active:
+                    assert active
+                    for path in paths[1:]:
+                        state = (ctypes.c_uint64 * 2)()
+                        assert parser._lib.test_signal_state(parser._handle, path.encode(), state) == 0
+                        assert tuple(state) == (1, 0)
+                    with parser._event_pages(paths[0], 9_000_003, 9_000_203, max_events=2) as reader:
+                        reader.read_page()
+        assert not parser._transition_group_active
+        for path in paths:
+            state = (ctypes.c_uint64 * 2)()
+            assert parser._lib.test_signal_state(parser._handle, path.encode(), state) == 0
+            assert tuple(state) == (0, 0)
+        event.clear()
+        result = parser.get_transitions("top.data", 9_000_003, 9_000_023)
+        assert _rows(result["transitions"]) == _million_rows("data", 9_000_003, 9_000_023)
+    finally:
+        pop_cancel_event(token)
+        parser.close()
+
+
+@pytest.mark.eda_integration
+def test_lazy_multisignal_event_group_avoids_full_history_residency(native_reader_probe, monkeypatch):
+    """The actual event_readers entry point shares an owned, unloaded group."""
+    from src import fsdb_parser
+    from src.waveform_batch import event_readers
+
+    wave = os.environ.get("TW_LAZY_LARGE_FSDB")
+    if not wave:
+        pytest.skip("set TW_LAZY_LARGE_FSDB to activity_10000000.fsdb")
+    monkeypatch.setattr(fsdb_parser, "_WRAPPER_SO", str(native_reader_probe))
+    parser = FSDBParser(wave)
+    start, end = 90_000_003, 90_000_203
+    paths = ["top.data", "top.sparse", "top.wide"]
+    try:
+        parser._open()
+        parser._lib.test_signal_state.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                                  ctypes.POINTER(ctypes.c_uint64)]
+        with event_readers([(parser, path) for path in paths], start, end, max_events=2) as readers:
+            for index, reader in enumerate(readers):
+                rows, previous = [], None
+                while True:
+                    page = reader.read_page()
+                    rows.extend((row.time_ps, row.value) for row in page.events)
+                    if page.predecessor is not None:
+                        assert previous is None
+                        previous = (page.predecessor.time_ps, page.predecessor.value)
+                    assert not page.truncated
+                    if page.complete:
+                        break
+                if index == 0:
+                    expected_times = range(90_000_010, 90_000_204, 10)
+                    assert rows == [(t, f"{t // 10 * 2654435761 & 0xffffffff:032b}") for t in expected_times]
+                    assert previous == (90_000_000, f"{9_000_000 * 2654435761 & 0xffffffff:032b}")
+                elif index == 1:
+                    assert rows == []
+                    assert previous == (50_000_000, f"{5_000_000 * 2654435761 & 0xffffffff:032b}")
+                else:
+                    assert rows == []
+                    assert previous == (90_000_000, f"{9_000_000 * 2654435761 & 0xffffffff:032b}" * 32)
+            resident_records = 0
+            for path in paths:
+                state = (ctypes.c_uint64 * 2)()
+                assert parser._lib.test_signal_state(parser._handle, path.encode(), state) == 0
+                assert state[0] == 1
+                resident_records += state[1]
+            assert 20 <= resident_records < 1_000_000
+        for path in paths:
+            state = (ctypes.c_uint64 * 2)()
+            assert parser._lib.test_signal_state(parser._handle, path.encode(), state) == 0
+            assert tuple(state) == (0, 0)
     finally:
         parser.close()
