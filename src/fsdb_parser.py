@@ -169,6 +169,16 @@ def _setup(lib):
     except AttributeError:
         pass
 
+    # Optional count-only suffix reads; event-page ABI v1 remains unchanged.
+    lib._traceweave_has_event_count_v1 = False
+    try:
+        lib.fsdb_event_count_v1.restype = ctypes.c_int
+        lib.fsdb_event_count_v1.argtypes = [ctypes.c_void_p, ctypes.c_uint64,
+            ctypes.c_uint, ctypes.POINTER(_NativeEventPageV1), ctypes.c_uint]
+        lib._traceweave_has_event_count_v1 = lib._traceweave_has_event_pages_v1
+    except AttributeError:
+        pass
+
     # int fsdb_search_signals(void*, const char*, char*, int)
     lib.fsdb_search_signals.restype  = ctypes.c_int
     lib.fsdb_search_signals.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
@@ -565,6 +575,86 @@ class FSDBParser:
             # Native output is bounded by the shared buffer. A true value means
             # this is only a prefix and must never support a clean/full verdict.
             "truncated":        native_truncated,
+            "transition_count_is_lower_bound": native_truncated,
+        }
+
+    def get_transitions_capped(self, signal_path: str,
+                               start_ps: int = 0, end_ps: int = -1,
+                               *, max_transitions: int = 1000) -> dict:
+        """Public detail prefix plus exact count, with the legacy ABI fallback.
+
+        Internal callers retain ``get_transitions`` and its full-list contract.
+        The dispatch layer still applies its return cap to legacy fallbacks.
+        """
+        if type(max_transitions) is not int or max_transitions < 1:
+            raise ValueError("max_transitions must be a positive integer")
+        self._open()
+        supported = all(getattr(self._lib, name, False) for name in (
+            '_traceweave_has_event_pages_v1', '_traceweave_has_event_count_v1',
+            '_traceweave_has_lazy_transition_group'))
+        if (not supported or self._transition_group_active or start_ps < 0 or end_ps < -1 or
+                (end_ps != -1 and end_ps < start_ps)):
+            return self.get_transitions(signal_path, start_ps, end_ps)
+
+        # Keep the legacy wide-signal domain. Event pages have a smaller ABI
+        # ceiling than the old output buffer, so enlarge a page for one wide
+        # record or take the old path if even the maximum page cannot hold it.
+        record_bytes = self.get_signal_width(signal_path) + 128
+        if record_bytes > 1048576:
+            return self.get_transitions(signal_path, start_ps, end_ps)
+        page_bytes = max(262144, record_bytes)
+
+        # Public timestamps ceil to ps. Reading from the previous integer ps
+        # includes every sub-ps event that rounds into start_ps, and enough
+        # history to select the last real public-ps predecessor separately.
+        physical_start = max(0, start_ps - 1)
+        transitions, previous = [], None
+        total, native_truncated = 0, False
+        from .event_pages import page_records
+        with self._event_transition_group([signal_path], physical_start, end_ps) as active:
+            if not active:
+                return self.get_transitions(signal_path, start_ps, end_ps)
+            with self._event_pages(signal_path, physical_start, end_ps,
+                                   max_events=min(1024, max_transitions), max_bytes=page_bytes) as reader:
+                complete = False
+                while not complete and not native_truncated:
+                    check_cancelled()
+                    if len(transitions) < max_transitions:
+                        # Native pages never format suffix values beyond the
+                        # requested prefix. Pre-window records do not use cap.
+                        reader.max_events = min(1024, max_transitions - len(transitions))
+                        page = reader.read_page()
+                        records = page_records(page)
+                        for event in records:
+                            check_cancelled()
+                            if event.time_ps < start_ps:
+                                previous = event
+                            elif end_ps == -1 or event.time_ps <= end_ps:
+                                transitions.append({
+                                    "time_ps": event.time_ps,
+                                    "time_ns": event.time_ps / 1000,
+                                    "value": _enrich_value(event.value),
+                                })
+                                total += 1
+                        if not records and not page.complete and not page.truncated:
+                            raise RuntimeError('FSDB event page made no progress')
+                    else:
+                        # The prefix consumed every anchor and start-boundary
+                        # record; all remaining cursor records are in-window.
+                        page = reader.count_page()
+                        total += page.events
+                    complete, native_truncated = page.complete, page.truncated
+        check_cancelled()
+        predecessor = None if previous is None else {
+            "time_ps": previous.time_ps,
+            "time_ns": previous.time_ps / 1000,
+            "value": _enrich_value(previous.value),
+        }
+        return {
+            "signal": signal_path, "start_ps": start_ps, "end_ps": end_ps,
+            "transition_count": total, "transitions": transitions,
+            "predecessor": predecessor,
+            "truncated": native_truncated or total > len(transitions),
             "transition_count_is_lower_bound": native_truncated,
         }
 

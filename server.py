@@ -5148,23 +5148,24 @@ def _prepare_signal_transitions_result(
     result: dict, max_transitions: int
 ) -> schemas.SignalTransitionsResult:
     """Apply the public return cap while preserving native-prefix honesty."""
-    if max_transitions < 1:
-        raise ValueError("max_transitions must be >= 1")
+    if type(max_transitions) is not int or max_transitions < 1:
+        raise ValueError("max_transitions must be a positive integer")
     transitions = result.get("transitions") or []
     native_truncated = bool(result.get("transition_count_is_lower_bound"))
-    if len(transitions) > max_transitions:
+    total = result.get("transition_count", len(transitions))
+    if total > max_transitions:
         result["transitions"] = transitions[:max_transitions]
         result["truncated"] = True
         if native_truncated:
             result["hint"] = (
                 f"showing the first {max_transitions} of at least "
-                f"{len(transitions)} transitions; native output also reached "
+                f"{total} transitions; native output also reached "
                 "its buffer limit, so transition_count is a lower bound. "
                 "Narrow [start_time_ps, end_time_ps]."
             )
         else:
             result["hint"] = (
-                f"showing the first {max_transitions} of {len(transitions)} transitions; "
+                f"showing the first {max_transitions} of {total} transitions; "
                 "narrow [start_time_ps, end_time_ps] or raise max_transitions explicitly"
             )
     elif native_truncated:
@@ -7753,16 +7754,20 @@ async def _dispatch(name: str, args: dict):
     elif name == "get_signal_transitions":
 
         def _work():
+            max_transitions = args.get("max_transitions", TRANSITIONS_MAX_RETURNED)
+            if type(max_transitions) is not int or max_transitions < 1:
+                raise ValueError("max_transitions must be a positive integer")
             parser, selected = prepare_selections(_get_parser(args["wave_path"]), {"signal_path": args["signal_path"]})
-            result = parser.get_transitions(
-                selected["signal_path"],
-                _resolve_time(args.get("start_time_ps", 0)),
-                _resolve_time(args.get("end_time_ps", -1), allow_sentinel=True),
-            )
-            # Cap at the dispatch layer only: internal callers of parser
-            # .get_transitions() still see the full list. Telemetry showed a
-            # single uncapped call returning 8.9MB into the model context.
-            max_transitions = int(args.get("max_transitions", TRANSITIONS_MAX_RETURNED))
+            start = _resolve_time(args.get("start_time_ps", 0))
+            end = _resolve_time(args.get("end_time_ps", -1), allow_sentinel=True)
+            # Selection/expression adapters forward unknown attributes. Check
+            # the actual parser class so this path cannot bypass projection or
+            # expression evaluation via their underlying FSDB method.
+            if isinstance(parser, FSDBParser):
+                result = parser.get_transitions_capped(
+                    selected["signal_path"], start, end, max_transitions=max_transitions)
+            else:
+                result = parser.get_transitions(selected["signal_path"], start, end)
             return _prepare_signal_transitions_result(attach_selections(result, parser), max_transitions)
 
         return await _run_in_wave_request(args["wave_path"], _work)

@@ -45,6 +45,20 @@ class EventPage:
     recording_gaps: tuple[RecordingGap, ...] = ()
 
 
+@dataclass(frozen=True)
+class EventCountPage:
+    """Consumed cursor records without values, including an unread anchor.
+
+    Callers counting a window suffix must first consume/filter its anchors and
+    boundary records using detail pages. This is a record count, not a count
+    of physical toggles after subtracting the initial observation.
+    """
+    events: int
+    next_time: int | None = None
+    complete: bool = False
+    truncated: bool = False
+
+
 def page_records(page):
     """Account for every retained record, including a separately typed anchor."""
     return (*((page.initial_state,) if page.initial_state else ()),
@@ -240,23 +254,15 @@ class FsdbEventReader:
         if rc < 0:
             raise RuntimeError('FSDB event cursor could not open')
 
-    def read_page(self):
-        import ctypes
-        from .fsdb_parser import _NativeEventPageV1
+    def _check_owner(self):
         check_cancelled()
         self.parser._check_metadata_identity(self.identity)
         if self.handle != self.parser._handle or self.epoch is not self.parser._scope_epoch:
             raise RuntimeError('FSDB event cursor owner changed')
-        receipt = _NativeEventPageV1()
-        started = time.perf_counter()
+
+    def _check_read_result(self, rc, operation):
         try:
-            rc = self.parser._lib.fsdb_event_page_v1(self.handle, self.cursor,
-                self.max_events, self.buffer, self.max_bytes, ctypes.byref(receipt), ctypes.sizeof(receipt))
-        finally:
-            operation_metrics.record_sweep_native_event("page", (time.perf_counter() - started) * 1000,
-                transitions=receipt.events, output_bytes=receipt.output_bytes, truncated=bool(receipt.truncated))
-        try:
-            self.parser._check_native_cleanup(rc, "event-page")
+            self.parser._check_native_cleanup(rc, operation)
         except RuntimeError:
             # Invalidate a poisoned reader even when native return and request
             # cancellation coincide, then preserve the cancellation exception.
@@ -265,7 +271,21 @@ class FsdbEventReader:
         check_cancelled()
         self.parser._check_metadata_identity(self.identity)
         if rc < 0:
-            raise RuntimeError('FSDB event page read failed')
+            raise RuntimeError(f'FSDB {operation.replace("-", " ")} read failed')
+
+    def read_page(self):
+        import ctypes
+        from .fsdb_parser import _NativeEventPageV1
+        self._check_owner()
+        receipt = _NativeEventPageV1()
+        started = time.perf_counter()
+        try:
+            rc = self.parser._lib.fsdb_event_page_v1(self.handle, self.cursor,
+                self.max_events, self.buffer, self.max_bytes, ctypes.byref(receipt), ctypes.sizeof(receipt))
+        finally:
+            operation_metrics.record_sweep_native_event("page", (time.perf_counter() - started) * 1000,
+                transitions=receipt.events, output_bytes=receipt.output_bytes, truncated=bool(receipt.truncated))
+        self._check_read_result(rc, "event-page")
         rows, previous = [], None
         for line in self.buffer.raw[:receipt.output_bytes].decode().splitlines():
             kind, ps, tick, value = line.split('\t', 3)
@@ -277,6 +297,30 @@ class FsdbEventReader:
         return EventPage(tuple(rows), previous,
             receipt.next_tick*self.parser._scale_fs if receipt.has_next else None,
             bool(receipt.complete), bool(receipt.truncated), receipt.output_bytes)
+
+    def count_page(self, max_events=65536):
+        """Advance a bounded suffix without requesting or formatting values."""
+        import ctypes
+        from .fsdb_parser import _NativeEventPageV1
+        if type(max_events) is not int or not 1 <= max_events <= 65536:
+            raise ValueError('event count limit requires 1..65536 records')
+        self._check_owner()
+        if not getattr(self.parser._lib, '_traceweave_has_event_count_v1', False):
+            raise RuntimeError('FSDB event count capability unavailable')
+        receipt = _NativeEventPageV1()
+        started = time.perf_counter()
+        try:
+            rc = self.parser._lib.fsdb_event_count_v1(self.handle, self.cursor,
+                max_events, ctypes.byref(receipt), ctypes.sizeof(receipt))
+        finally:
+            operation_metrics.record_sweep_native_event("page", (time.perf_counter() - started) * 1000,
+                transitions=receipt.events, output_bytes=receipt.output_bytes, truncated=bool(receipt.truncated))
+        self._check_read_result(rc, "event-count")
+        if not receipt.events and not receipt.complete and not receipt.truncated:
+            raise RuntimeError('FSDB event count made no progress')
+        return EventCountPage(int(receipt.events),
+            receipt.next_tick*self.parser._scale_fs if receipt.has_next else None,
+            bool(receipt.complete), bool(receipt.truncated))
 
     def close(self):
         unwinding = sys.exc_info()[0] is not None
