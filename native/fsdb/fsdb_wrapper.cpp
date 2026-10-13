@@ -752,6 +752,37 @@ fsdb_get_value_at_time(void *handle, const char *signal_path,
 }
 
 static int
+_SeekPublicWindowStart(FsdbCtx *ctx, ffrVCTrvsHdl hdl,
+                       unsigned long long start_ps)
+{
+    /* Seek triggers on-demand loading, so HasIncoreVC before this call would
+     * falsely classify an unloaded signal as empty. Keep the original view:
+     * shrinking it fabricates boundary observations and predecessor times.
+     * GotoXTag lands on the LAST event at a raw tick; walk backward until the
+     * true public-ps predecessor, or the first observation, is reached. This
+     * also retains all distinct sub-ps events that ceil to start_ps. */
+    fsdbTag64 target = _ToTag(ctx, start_ps);
+    fsdbTag64 seek_tag = target;
+    fsdbRC rc = hdl->ffrGotoXTag(&seek_tag);
+    if (rc != FSDB_RC_SUCCESS) {
+        fsdbTag64 last;
+        if (ctx->obj->ffrGetMaxFsdbTag64(&last) == FSDB_RC_SUCCESS &&
+            (last.H < target.H || (last.H == target.H && last.L < target.L)))
+            rc = hdl->ffrGotoXTag(&last);
+        else
+            rc = hdl->ffrGotoTheFirstVC();
+    }
+    if (rc != FSDB_RC_SUCCESS) return 0;
+    while (true) {
+        fsdbTag64 tag;
+        if (hdl->ffrGetXTag(&tag) != FSDB_RC_SUCCESS) return -3;
+        if (_TagToPs(ctx, tag) < start_ps) return 1;
+        if (hdl->ffrGotoPrevVC() != FSDB_RC_SUCCESS)
+            return hdl->ffrGotoTheFirstVC() == FSDB_RC_SUCCESS ? 1 : 0;
+    }
+}
+
+static int
 _GetTransitionsImpl(
     FsdbCtx *ctx,
     SigInfo *sig,
@@ -777,12 +808,9 @@ _GetTransitionsImpl(
         int rc = read.Begin({idcode});
         if (rc) return read.Result(rc);
         _ProfileClock::time_point added = _ProfileClock::now();
-        rc = read.Load();
-        if (rc) return read.Result(rc);
-        _ProfileClock::time_point loaded = _ProfileClock::now();
         if (profile) {
             profile->add_signal_ns = _ElapsedNs(begin, added);
-            profile->load_ns = _ElapsedNs(added, loaded);
+            profile->load_ns = 0;  // Standalone seek demand-loads the needed sessions.
         }
     }
 
@@ -798,44 +826,35 @@ _GetTransitionsImpl(
     int   pos       = 0;
     bool  truncated = false;
 
-    if (hdl->ffrHasIncoreVC()) {
-        fsdbTag64 start_tag = _ToTag(ctx, start_ps);
+    {
         _ProfileClock::time_point seek_begin = _ProfileClock::now();
-        fsdbRC seek_rc = hdl->ffrGotoXTag((void*)&start_tag);
-
-        /* ffrGotoXTag is at-or-before. Preserve that state explicitly for
-         * edge-direction classification, but never disguise it as an
-         * in-window transition. Multiple sub-ps tags can ceil to the same
-         * reported ps, so walk back until the reported timestamp is strictly
-         * less than start_ps. */
-        if (start_ps > 0 && FSDB_RC_SUCCESS == seek_rc) {
-            while (true) {
+        int seek_rc = _SeekPublicWindowStart(ctx, hdl, start_ps);
+        if (seek_rc < 0) return read.Result(seek_rc);
+        if (seek_rc > 0) {
                 fsdbTag64 time;
                 byte_T *vc_ptr = NULL;
-                hdl->ffrGetXTag(&time);
-                hdl->ffrGetVC(&vc_ptr);
+                if (hdl->ffrGetXTag(&time) != FSDB_RC_SUCCESS ||
+                    hdl->ffrGetVC(&vc_ptr) != FSDB_RC_SUCCESS || !vc_ptr)
+                    return read.Result(-3);
                 unsigned long long t_ps = _TagToPs(ctx, time);
                 if (t_ps < start_ps) {
                     std::string val = _VCToStr(
                         vc_ptr, sig->bit_size, sig->bytes_per_bit);
                     _AppendPredecessorLine(
                         out_buf, buf_size, pos, t_ps, val, truncated);
-                    break;
                 }
-                if (FSDB_RC_SUCCESS != hdl->ffrGotoPrevVC()) break;
-            }
-            seek_rc = hdl->ffrGotoXTag((void*)&start_tag);
         }
         _ProfileClock::time_point seek_end = _ProfileClock::now();
         if (profile) profile->seek_ns = _ElapsedNs(seek_begin, seek_end);
 
         _ProfileClock::time_point traverse_begin = _ProfileClock::now();
-        if (!truncated && FSDB_RC_SUCCESS == seek_rc) {
+        if (!truncated && seek_rc > 0) {
             do {
                 fsdbTag64  time;
                 byte_T    *vc_ptr = NULL;
-                hdl->ffrGetXTag(&time);
-                hdl->ffrGetVC(&vc_ptr);
+                if (hdl->ffrGetXTag(&time) != FSDB_RC_SUCCESS ||
+                    hdl->ffrGetVC(&vc_ptr) != FSDB_RC_SUCCESS || !vc_ptr)
+                    return read.Result(-3);
 
                 unsigned long long t_ps = _TagToPs(ctx, time);
                 if (t_ps < start_ps) continue;
@@ -1173,8 +1192,6 @@ fsdb_get_multi_signals_around_time(
 
     int rc = read.Begin(ids);
     if (rc) return read.Result(rc);
-    rc = read.Load();
-    if (rc) return read.Result(rc);
 
     unsigned long long start_ps = (center_ps > window_ps) ? (center_ps - window_ps) : 0;
     unsigned long long end_ps = center_ps + window_ps;
@@ -1194,7 +1211,7 @@ fsdb_get_multi_signals_around_time(
         }
 
         std::string value_at_center = "?";
-        if (hdl->ffrHasIncoreVC()) {
+        {
             fsdbTag64 center_tag = _ToTag(ctx, center_ps);
             if (FSDB_RC_SUCCESS == hdl->ffrGotoXTag((void*)&center_tag)) {
                 byte_T *vc_ptr = NULL;
@@ -1214,14 +1231,16 @@ fsdb_get_multi_signals_around_time(
             break;
         }
 
-        if (hdl->ffrHasIncoreVC()) {
-            fsdbTag64 start_tag = _ToTag(ctx, start_ps);
-            if (FSDB_RC_SUCCESS == hdl->ffrGotoXTag((void*)&start_tag)) {
+        {
+            int seek_rc = _SeekPublicWindowStart(ctx, hdl, start_ps);
+            if (seek_rc < 0) return read.Result(seek_rc);
+            if (seek_rc > 0) {
                 do {
                     fsdbTag64 time;
                     byte_T *vc_ptr = NULL;
-                    hdl->ffrGetXTag(&time);
-                    hdl->ffrGetVC(&vc_ptr);
+                    if (hdl->ffrGetXTag(&time) != FSDB_RC_SUCCESS ||
+                        hdl->ffrGetVC(&vc_ptr) != FSDB_RC_SUCCESS || !vc_ptr)
+                        return read.Result(-3);
                     unsigned long long t_ps = _TagToPs(ctx, time);
                     if (t_ps < start_ps) continue;
                     if (t_ps > end_ps) break;
@@ -1242,15 +1261,17 @@ fsdb_get_multi_signals_around_time(
             break;
         }
 
-        if (hdl->ffrHasIncoreVC() && extra_transitions > 0) {
-            fsdbTag64 start_tag = _ToTag(ctx, start_ps);
-            if (FSDB_RC_SUCCESS == hdl->ffrGotoXTag((void*)&start_tag)) {
+        if (extra_transitions > 0) {
+            int seek_rc = _SeekPublicWindowStart(ctx, hdl, start_ps);
+            if (seek_rc < 0) return read.Result(seek_rc);
+            if (seek_rc > 0) {
                 std::vector<std::pair<unsigned long long, std::string> > history;
                 while ((int)history.size() < extra_transitions) {
                     fsdbTag64 time;
                     byte_T *vc_ptr = NULL;
-                    hdl->ffrGetXTag(&time);
-                    hdl->ffrGetVC(&vc_ptr);
+                    if (hdl->ffrGetXTag(&time) != FSDB_RC_SUCCESS ||
+                        hdl->ffrGetVC(&vc_ptr) != FSDB_RC_SUCCESS || !vc_ptr)
+                        return read.Result(-3);
                     unsigned long long t_ps = _TagToPs(ctx, time);
                     if (t_ps < start_ps) {
                         history.push_back(std::make_pair(

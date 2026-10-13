@@ -85,7 +85,24 @@ def native_reader_probe(tmp_path_factory):
         pytest.skip("requires TW_POINT_READ_FSDB, VERDI_HOME and g++")
     tmp_path = tmp_path_factory.mktemp("reader_probe")
     sdk = Path(verdi) / "share/FsdbReader"
-    source = (NATIVE_FSDB / "fsdb_wrapper.cpp").read_text() + r'''
+    source = (NATIVE_FSDB / "fsdb_wrapper.cpp").read_text()
+    finish_marker = "    bool Finish() {\n        FreeHandle();"
+    assert source.count(finish_marker) == 1
+    source = "static unsigned long long test_peak_loaded_records = 0;\n" + source.replace(
+        finish_marker,
+        """    bool Finish() {
+        unsigned long long loaded = 0;
+        for (const auto &entry : ctx_->id_to_sig)
+            loaded += ctx_->obj->ffrGetVCCount(entry.first);
+        if (loaded > test_peak_loaded_records) test_peak_loaded_records = loaded;
+        FreeHandle();""",
+    )
+    source += r'''
+extern "C" unsigned long long test_take_peak_records() {
+    unsigned long long result = test_peak_loaded_records;
+    test_peak_loaded_records = 0;
+    return result;
+}
 extern "C" int test_view(void *p, unsigned long long start, unsigned long long end) {
     FsdbCtx *ctx = (FsdbCtx*)p;
     fsdbTag64 a = _ToTag(ctx, start), b = _ToTag(ctx, end);
@@ -252,3 +269,195 @@ def test_interleaved_reads_release_selection_and_residency(native_reader_probe, 
     finally:
         parser.close()
         fresh.close()
+
+
+def _million_bits(leaf, time_ps):
+    step = time_ps // 10
+    if leaf == "wide":
+        step = step // 1000 * 1000
+    elif leaf == "sparse":
+        step = 500_000 if step >= 500_000 else 0
+    bits = f"{step * 2654435761 & 0xffffffff:032b}"
+    return bits * 32 if leaf == "wide" else bits
+
+
+def _million_rows(leaf, start, end):
+    if leaf == "sparse":
+        times = [t for t in (0, 5_000_000) if start <= t <= end]
+    else:
+        stride = 10_000 if leaf == "wide" else 10
+        times = range(max(0, (start + stride - 1) // stride * stride), min(end, 10_000_000) + 1, stride)
+    return [(t, _million_bits(leaf, t)) for t in times]
+
+
+def _rows(response):
+    return [(row["time_ps"], row["value"]["bin"]) for row in response]
+
+
+@pytest.mark.eda_integration
+def test_lazy_windows_match_generator_across_sessions_in_both_directions(native_reader_probe, monkeypatch):
+    """Full values, counts and true predecessor are checked against the generator."""
+    from src import fsdb_parser
+    monkeypatch.setattr(fsdb_parser, "_WRAPPER_SO", str(native_reader_probe))
+    parser = FSDBParser(os.environ["TW_POINT_READ_FSDB"])
+    try:
+        parser._open()
+        parser._lib.test_session_boundaries.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64), ctypes.c_int]
+        boundaries = (ctypes.c_uint64 * 64)()
+        count = parser._lib.test_session_boundaries(parser._handle, boundaries, 64)
+        assert 2 < count < 64
+        rng = random.Random(130013)
+        windows = [(0, 0), (0, 13), (1, 9), (10, 10), (9_999_993, 10_000_050), (10_000_001, 10_000_030)]
+        windows += [(max(0, t - 13), min(10_000_050, t + 17)) for t in list(boundaries)[:count]]
+        windows += [(t, t + rng.randrange(1, 201)) for t in (rng.randrange(10_000_000) for _ in range(20))]
+        for start, end in windows + list(reversed(windows)):
+            for leaf in ("data", "wide", "sparse"):
+                result = parser.get_transitions("top." + leaf, start, end)
+                expected = _million_rows(leaf, start, end)
+                assert _rows(result["transitions"]) == expected, (leaf, start, end)
+                assert result["transition_count"] == len(expected)
+                assert not result["truncated"] and not result["transition_count_is_lower_bound"]
+                if start:
+                    if leaf == "sparse":
+                        previous_time = 5_000_000 if start > 5_000_000 else 0
+                    else:
+                        stride = 10_000 if leaf == "wide" else 10
+                        previous_time = min(10_000_000, (start - 1) // stride * stride)
+                    assert _rows([result["predecessor"]]) == [(previous_time, _million_bits(leaf, previous_time))]
+                else:
+                    assert result["predecessor"] is None
+    finally:
+        parser.close()
+
+
+@pytest.mark.eda_integration
+def test_lazy_around_keeps_full_requested_history_and_center(native_reader_probe, monkeypatch):
+    from src import fsdb_parser
+    monkeypatch.setattr(fsdb_parser, "_WRAPPER_SO", str(native_reader_probe))
+    parser = FSDBParser(os.environ["TW_POINT_READ_FSDB"])
+    rng = random.Random(316)
+    centers = [0, 3, 10, 5_000_000, 10_000_000]
+    centers += [rng.randrange(1, 10_000_000) for _ in range(15)]
+    try:
+        for center in centers + list(reversed(centers)):
+            window, extra = 23, 7
+            start, end = max(0, center - window), center + window
+            result = parser.get_signals_around_time(["top." + leaf for leaf in ("data", "wide", "sparse")], center, window, extra)
+            assert not result["truncated"]
+            for leaf in ("data", "wide", "sparse"):
+                signal = result["signals"]["top." + leaf]
+                assert signal["value_at_center"]["bin"] == _million_bits(leaf, center)
+                assert _rows(signal["transitions_in_window"]) == _million_rows(leaf, start, end)
+                stride = 10_000 if leaf == "wide" else 10
+                history_start = 0 if leaf == "sparse" else max(0, start - (extra + 1) * stride)
+                assert _rows(signal["pre_window_transitions"]) == _million_rows(leaf, history_start, start - 1)[-extra:]
+        # The last event remains historical evidence beyond EOF; the center
+        # observation keeps the legacy FFR unavailable value outside the file.
+        signal = parser.get_signals_around_time(["top.data"], 10_000_100, 10, 3)["signals"]["top.data"]
+        assert signal["value_at_center"]["bin"] == "?"
+        assert signal["transitions_in_window"] == []
+        assert _rows(signal["pre_window_transitions"]) == _million_rows("data", 9_999_980, 10_000_000)
+    finally:
+        parser.close()
+
+
+@pytest.fixture(scope="module")
+def same_tick_fsdb(tmp_path_factory):
+    """Convert fixed events, including sequence numbers, without a simulator."""
+    verdi = os.environ.get("VERDI_HOME")
+    if not os.environ.get("TW_POINT_READ_FSDB") or not verdi:
+        pytest.skip("requires TW_POINT_READ_FSDB and VERDI_HOME")
+    converter = Path(verdi) / "bin/vcd2fsdb"
+    if not converter.exists():
+        pytest.skip("vcd2fsdb unavailable")
+    directory = tmp_path_factory.mktemp("same_tick_fsdb")
+    vcd = directory / "events.vcd"
+    vcd.write_text(
+        '$timescale 100fs $end\n$scope module top $end\n'
+        '$var wire 1 ! data $end\n$var wire 1 @ sparse $end\n'
+        '$upscope $end\n$enddefinitions $end\n'
+        '#0\n0!\n0@\n#1\n1!\n#2\nx!\n#9\nz!\n'
+        '#10\n0!\n1!\nx!\n0!\n#11\n1!\n'
+        '#20\nz!\n1@\n#29\n0!\n#30\n1!\n#40\n')
+    fsdb = directory / "events.fsdb"
+    subprocess.run([str(converter), str(vcd), "-seq_num", "-o", str(fsdb)],
+                   cwd=directory, env={**os.environ, "FSDB_ENV_MAX_GLITCH_NUM": "0"},
+                   check=True, capture_output=True, timeout=30)
+    return fsdb
+
+
+@pytest.mark.eda_integration
+def test_lazy_public_windows_preserve_same_tick_and_subps_order(native_reader_probe, same_tick_fsdb, monkeypatch):
+    from src import fsdb_parser
+    monkeypatch.setattr(fsdb_parser, "_WRAPPER_SO", str(native_reader_probe))
+    parser = FSDBParser(str(same_tick_fsdb))
+    # Public transitions compare integer ceil timestamps; native pages instead
+    # use physical femtoseconds. Several physical times intentionally share 1ps.
+    raw = [(0, "0"), (1, "1"), (2, "x"), (9, "z"),
+           (10, "0"), (10, "1"), (10, "x"), (10, "0"),
+           (11, "1"), (20, "z"), (29, "0"), (30, "1")]
+    public = [((tick + 9) // 10, value) for tick, value in raw]
+    try:
+        for start, end in [(0, 4), (1, 1), (2, 2), (3, 3), (2, 4), (4, 4), (0, 0)]:
+            result = parser.get_transitions("top.data", start, end)
+            expected = [row for row in public if start <= row[0] <= end]
+            assert _rows(result["transitions"]) == expected, (start, end)
+            assert result["transition_count"] == len(expected)
+            earlier = [row for row in public if row[0] < start]
+            assert (_rows([result["predecessor"]]) if result["predecessor"] else []) == earlier[-1:]
+            around = parser.get_signals_around_time(["top.data", "top.sparse"], start, 0, 100)
+            signal = around["signals"]["top.data"]
+            assert _rows(signal["transitions_in_window"]) == [row for row in public if row[0] == start]
+            assert _rows(signal["pre_window_transitions"]) == earlier
+            center_value = [value for tick, value in raw if tick <= start * 10][-1]
+            assert signal["value_at_center"]["bin"] == center_value
+            assert not around["truncated"]
+        # Independently verify the converter really stored every same-tick
+        # event. Native pages use physical fs and preserve sequence across caps.
+        for start, end in ((0, 4), (1, 2)):
+            for cap in (1, 2, 3):
+                with parser.transition_group(["top.data"]) as active:
+                    assert active
+                    with parser._event_pages("top.data", start, end, max_events=cap) as reader:
+                        events, predecessor = [], None
+                        while True:
+                            page = reader.read_page()
+                            events.extend((event.time_fs, event.value) for event in page.events)
+                            if page.predecessor is not None:
+                                assert predecessor is None
+                                predecessor = (page.predecessor.time_fs, page.predecessor.value)
+                            assert not page.truncated
+                            if page.complete:
+                                break
+                assert events == [(tick * 100, value) for tick, value in raw if start * 10 <= tick <= end * 10]
+                earlier = [(tick * 100, value) for tick, value in raw if tick < start * 10]
+                assert predecessor == (earlier[-1] if earlier else None)
+    finally:
+        parser.close()
+
+
+@pytest.mark.eda_integration
+def test_lazy_narrow_read_loads_only_a_fraction_of_multisession_trace(native_reader_probe, monkeypatch):
+    """A fixture-specific resident-record bound, not a general byte/RSS claim."""
+    from src import fsdb_parser
+    wave = os.environ.get("TW_LAZY_LARGE_FSDB")
+    if not wave:
+        pytest.skip("set TW_LAZY_LARGE_FSDB to activity_10000000.fsdb")
+    monkeypatch.setattr(fsdb_parser, "_WRAPPER_SO", str(native_reader_probe))
+    parser = FSDBParser(wave)
+    try:
+        parser._open()
+        parser._lib.test_take_peak_records.restype = ctypes.c_uint64
+        parser._lib.test_take_peak_records()
+        result = parser.get_transitions("top.data", 90_000_003, 90_000_203)
+        expected_times = range(90_000_010, 90_000_204, 10)
+        assert _rows(result["transitions"]) == [(t, f"{t // 10 * 2654435761 & 0xffffffff:032b}") for t in expected_times]
+        assert result["predecessor"]["time_ps"] == 90_000_000
+        loaded = parser._lib.test_take_peak_records()
+        # This converted trace has ~107K events/session and 10M total events.
+        assert 20 <= loaded < 1_000_000
+        result = parser.get_signals_around_time(["top.data"], 90_000_033, 100, 5)
+        assert len(result["signals"]["top.data"]["transitions_in_window"]) == 20
+        assert 20 <= parser._lib.test_take_peak_records() < 1_000_000
+    finally:
+        parser.close()
