@@ -156,6 +156,7 @@ from src.x_trace import inspect_upstream_values, trace_x_source
 from src.cycle_query import (
     _compute_clock_period_ps,
     _extract_edge_times,
+    _read_fsdb_clock_edges,
     annotate_center_transients,
     get_signals_by_cycle,
 )
@@ -5148,23 +5149,24 @@ def _prepare_signal_transitions_result(
     result: dict, max_transitions: int
 ) -> schemas.SignalTransitionsResult:
     """Apply the public return cap while preserving native-prefix honesty."""
-    if max_transitions < 1:
-        raise ValueError("max_transitions must be >= 1")
+    if type(max_transitions) is not int or max_transitions < 1:
+        raise ValueError("max_transitions must be a positive integer")
     transitions = result.get("transitions") or []
     native_truncated = bool(result.get("transition_count_is_lower_bound"))
-    if len(transitions) > max_transitions:
+    total = result.get("transition_count", len(transitions))
+    if total > max_transitions:
         result["transitions"] = transitions[:max_transitions]
         result["truncated"] = True
         if native_truncated:
             result["hint"] = (
                 f"showing the first {max_transitions} of at least "
-                f"{len(transitions)} transitions; native output also reached "
+                f"{total} transitions; native output also reached "
                 "its buffer limit, so transition_count is a lower bound. "
                 "Narrow [start_time_ps, end_time_ps]."
             )
         else:
             result["hint"] = (
-                f"showing the first {max_transitions} of {len(transitions)} transitions; "
+                f"showing the first {max_transitions} of {total} transitions; "
                 "narrow [start_time_ps, end_time_ps] or raise max_transitions explicitly"
             )
     elif native_truncated:
@@ -5185,6 +5187,7 @@ def _detect_wave_clock(parser) -> tuple[str | None, int | None]:
     clock_path: str | None = None
     period_ps: int | None = None
     detect_reason: str | None = None
+    cacheable = True
 
     try:
         candidate_paths: set[str] = set()
@@ -5209,17 +5212,28 @@ def _detect_wave_clock(parser) -> tuple[str | None, int | None]:
             candidate_paths, key=lambda path: (path.count("."), len(path))
         ):
             try:
-                transitions = parser.get_transitions(
-                    candidate, 0, CLOCK_DETECT_SAMPLE_PS
-                ).get("transitions", [])
-                edge_times = _extract_edge_times(transitions, "posedge")
-                period = _compute_clock_period_ps(edge_times)
+                compact = (_read_fsdb_clock_edges(parser, candidate, "posedge", 0,
+                    CLOCK_DETECT_SAMPLE_PS) if isinstance(parser, FSDBParser) else None)
+                if compact is not None:
+                    edge_times, period, complete = compact
+                    edge_count = len(edge_times)
+                    del edge_times, compact  # Release a large index before the next candidate.
+                    if not complete:
+                        cacheable = False
+                        raise RuntimeError("incomplete clock event pages")
+                else:
+                    transitions = parser.get_transitions(
+                        candidate, 0, CLOCK_DETECT_SAMPLE_PS
+                    ).get("transitions", [])
+                    edge_times = _extract_edge_times(transitions, "posedge")
+                    period = _compute_clock_period_ps(edge_times)
+                    edge_count = len(edge_times)
                 if period and period > 0:
                     scored.append(
                         (
                             candidate,
                             period,
-                            len(edge_times),
+                            edge_count,
                             is_tool_pseudo_signal(candidate),
                         )
                     )
@@ -5251,8 +5265,9 @@ def _detect_wave_clock(parser) -> tuple[str | None, int | None]:
         detect_reason = f"{type(exc).__name__}: {exc}"
 
     try:
-        parser._cached_clock_info = (clock_path, period_ps)
-        parser._cached_clock_detect_reason = detect_reason
+        if cacheable:
+            parser._cached_clock_info = (clock_path, period_ps)
+            parser._cached_clock_detect_reason = detect_reason
     except Exception:
         pass
 
@@ -7753,16 +7768,20 @@ async def _dispatch(name: str, args: dict):
     elif name == "get_signal_transitions":
 
         def _work():
+            max_transitions = args.get("max_transitions", TRANSITIONS_MAX_RETURNED)
+            if type(max_transitions) is not int or max_transitions < 1:
+                raise ValueError("max_transitions must be a positive integer")
             parser, selected = prepare_selections(_get_parser(args["wave_path"]), {"signal_path": args["signal_path"]})
-            result = parser.get_transitions(
-                selected["signal_path"],
-                _resolve_time(args.get("start_time_ps", 0)),
-                _resolve_time(args.get("end_time_ps", -1), allow_sentinel=True),
-            )
-            # Cap at the dispatch layer only: internal callers of parser
-            # .get_transitions() still see the full list. Telemetry showed a
-            # single uncapped call returning 8.9MB into the model context.
-            max_transitions = int(args.get("max_transitions", TRANSITIONS_MAX_RETURNED))
+            start = _resolve_time(args.get("start_time_ps", 0))
+            end = _resolve_time(args.get("end_time_ps", -1), allow_sentinel=True)
+            # Selection/expression adapters forward unknown attributes. Check
+            # the actual parser class so this path cannot bypass projection or
+            # expression evaluation via their underlying FSDB method.
+            if isinstance(parser, FSDBParser):
+                result = parser.get_transitions_capped(
+                    selected["signal_path"], start, end, max_transitions=max_transitions)
+            else:
+                result = parser.get_transitions(selected["signal_path"], start, end)
             return _prepare_signal_transitions_result(attach_selections(result, parser), max_transitions)
 
         return await _run_in_wave_request(args["wave_path"], _work)

@@ -409,3 +409,87 @@ def test_small_reads_do_not_visit_full_signal_history(tmp_path):
     signal = parser.get_signals_around_time(["top_tb.clk"], 9_500_020, 10, 2)["signals"]["top_tb.clk"]
     assert signal["transitions_in_window"] == result["transitions"]
     assert [r["time_ps"] for r in signal["pre_window_transitions"]] == [9_499_990, 9_500_000]
+
+
+@pytest.mark.parametrize("chunk_chars", [1, 7, 31, 128])
+def test_chunk_boundaries_preserve_declarations_and_wide_values(tmp_path, monkeypatch, chunk_chars):
+    from src import vcd_parser
+
+    monkeypatch.setattr(vcd_parser, "_TOKEN_CHUNK_CHARS", chunk_chars)
+    wide = "10xz" * 80
+    # Mixed whitespace, a token wider than a chunk, aliases, duplicate rounded
+    # timestamps and EOF immediately after a symbol all cross token boundaries.
+    content = f'''$version Verilator $end
+$timescale 100
+fs $end
+$scope module top $end
+$var wire 320 ! data [319:0] $end
+$scope module child $end
+$var wire 320 ! alias [319:0] $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+#0 b{'0' * 320} !
+#1\tb{wide}\t!
+#2\vB{'1' * 320}\f!'''
+    wave = tmp_path / 'chunked.vcd'
+    wave.write_text(content)
+    parser = VCDParser(str(wave))
+    result = parser.get_transitions('top.data', 1, 1)
+    assert result['predecessor']['time_ps'] == 0
+    # The existing public representation keeps the VCD prefix on X/Z vectors.
+    assert [t['value']['bin'] for t in result['transitions']] == ['b' + wide, '1' * 320]
+    assert parser.get_value_at_time('top.child.alias[319:0]', 1)['value']['bin'] == '1' * 320
+    assert parser.get_summary()['scale_unit'] == '100\nfs'
+    assert list(parser._raw_ticks['!']) == [0, 1, 2]
+    assert parser._path_to_sym['top.data'] == parser._path_to_sym['top.child.alias']
+
+
+def test_cancelled_initial_parse_can_retry_without_duplicate_records(tmp_path, monkeypatch):
+    import threading
+    from src import vcd_parser
+    from src.cancellation import OperationCancelled, check_cancelled, push_cancel_event, pop_cancel_event
+
+    wave = tmp_path / 'cancel.vcd'
+    wave.write_text(VCD_SAMPLE + ''.join(f'#{i}\n{i % 2}!\n' for i in range(16, 1000)))
+    parser = VCDParser(str(wave))
+    event = threading.Event()
+    monkeypatch.setattr(vcd_parser, '_TOKEN_CHUNK_CHARS', 128)
+    def cancel_after_progress():
+        if len(parser._transitions.get('!', [])) > 10:
+            event.set()
+        check_cancelled()
+    monkeypatch.setattr(vcd_parser, 'check_cancelled', cancel_after_progress)
+    token = push_cancel_event(event)
+    try:
+        with pytest.raises(OperationCancelled):
+            parser.get_summary()
+    finally:
+        pop_cancel_event(token)
+    assert not parser._parsed
+    assert parser._transitions == {} and parser._path_to_sym == {}
+    monkeypatch.setattr(vcd_parser, 'check_cancelled', check_cancelled)
+    result = parser.get_transitions('top_tb.clk')
+    assert result['transition_count'] == 988
+    assert result['transitions'][-1]['time_ps'] == 999000
+
+
+def test_changed_input_during_parse_discards_partial_state(tmp_path, monkeypatch):
+    from src.scope_metadata import ScopeIdentityChanged
+
+    wave = tmp_path / 'changed.vcd'
+    wave.write_text(VCD_SAMPLE)
+    parser = VCDParser(str(wave))
+    original_parse = parser._parse
+    def change_after_parse():
+        original_parse()
+        with wave.open('a') as handle:
+            handle.write('#20\n0!\n')
+    monkeypatch.setattr(parser, '_parse', change_after_parse)
+    with pytest.raises(ScopeIdentityChanged):
+        parser.get_summary()
+    assert not parser._parsed and parser._transitions == {}
+    monkeypatch.setattr(parser, '_parse', original_parse)
+    result = parser.get_transitions('top_tb.clk')
+    assert result['transition_count'] == 5
+    assert result['transitions'][-1]['time_ps'] == 20000

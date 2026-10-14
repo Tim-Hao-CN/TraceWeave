@@ -360,7 +360,7 @@ def _ns_to_ms(value: object) -> float:
     return float(value) / 1_000_000.0
 
 
-def record_sweep_native_group_begin(profile: Mapping[str, object]) -> None:
+def record_sweep_native_group_begin(profile: Mapping[str, object], *, eager_load: bool = True) -> None:
     """Aggregate one identity-free native group-load receipt."""
     metrics = current()
     if metrics is None:
@@ -383,7 +383,7 @@ def record_sweep_native_group_begin(profile: Mapping[str, object]) -> None:
         _add_native_duration_locked(metrics, "add_signal", profile.get("add_signal_ns"))
         load_ms = _add_native_duration_locked(metrics, "load", profile.get("load_ns"))
         metrics.values["sweep_native_group_load_call_count"] = (
-            int(metrics.values.get("sweep_native_group_load_call_count", 0)) + 1
+            int(metrics.values.get("sweep_native_group_load_call_count", 0)) + int(eager_load)
         )
         metrics.values["sweep_native_group_load_total_ms"] = (
             float(metrics.values.get("sweep_native_group_load_total_ms", 0.0)) + load_ms

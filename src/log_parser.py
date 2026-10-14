@@ -742,6 +742,11 @@ def _classify_failure_source(event: dict[str, Any]) -> tuple[str, str]:
     return "unknown", "heuristic"
 
 
+_DEADLOCK_SYMPTOM_RE = re.compile(
+    r"\b(?:deadlock(?:s|ed|ing)?|hang(?:s|ed|ing)?|hung|stuck|stall(?:s|ed|ing)?)\b"
+)
+
+
 def _classify_failure_mechanism(
     event: dict[str, Any],
     expected: str | None,
@@ -760,7 +765,9 @@ def _classify_failure_mechanism(
         return "timeout", "derived"
     if any(token in text for token in ("xprop", " x ", " z ", "unknown value", "x-state")):
         return "xprop", "derived"
-    if any(token in text for token in ("deadlock", "hang", "stuck", "stall")):
+    # A symptom word or explicit inflection is evidence; substrings in
+    # ordinary words such as "changed" and "installation" are not.
+    if _DEADLOCK_SYMPTOM_RE.search(text):
         return "deadlock", "derived"
     if any(token in text for token in ("assert", "protocol", "ready", "valid", "handshake")):
         return "protocol", "heuristic"

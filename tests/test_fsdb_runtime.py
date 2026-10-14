@@ -4,7 +4,9 @@ test_fsdb_runtime.py
 """
 
 from pathlib import Path
+from contextlib import contextmanager
 import ctypes
+from types import SimpleNamespace
 
 import pytest
 
@@ -303,3 +305,189 @@ def test_point_cleanup_failure_closes_reader_before_next_query():
     assert parser._lib.calls == ["close"]
     assert parser.get_value_at_time("top.clk", 5)["value"]["bin"] == "1"
     assert parser._lib.calls == ["close", "reopen"]
+
+
+@pytest.mark.parametrize("operation", ["transition", "around", "begin", "end", "duration", "batch"])
+def test_cleanup_failure_invalidates_reader(operation):
+    lib = _FakeGroupLib()
+    parser = _fake_group_parser(lib)
+    parser._buf = ctypes.create_string_buffer(64)
+    if operation == "transition":
+        lib.fsdb_get_transitions_profiled = lambda *args: -6
+        call = lambda: parser.get_transitions("top.clk")
+    elif operation == "around":
+        lib.fsdb_get_multi_signals_around_time = lambda *args: -6
+        call = lambda: parser.get_signals_around_time(["top.clk"], 5)
+    elif operation == "duration":
+        lib._traceweave_has_reader_status = True
+        lib.fsdb_get_end_time = lambda *args: 0
+        lib.fsdb_reader_status = lambda *args: -6
+        call = parser.get_header
+    elif operation == "batch":
+        from src.waveform_batch import FSDBBatchReader
+        lib.fsdb_batch_window_transitions = lambda *args: -6
+        call = lambda: FSDBBatchReader(parser).values_in_window(["top.clk"], 0, 10)
+    else:
+        setattr(lib, "fsdb_" + operation + "_transition_group", lambda *args: -6)
+        def call():
+            with parser.transition_group(["top.clk"]):
+                pass
+    with pytest.raises(RuntimeError, match="reader closed for recovery"):
+        call()
+    assert parser._handle is None
+    assert not parser._transition_group_active
+    assert lib.calls[-1] == "close"
+
+
+def test_group_cleanup_failure_preserves_cancellation():
+    from src.cancellation import OperationCancelled
+    parser = _fake_group_parser()
+    parser._lib.fsdb_end_transition_group = lambda *args: -6
+    with pytest.raises(OperationCancelled):
+        with parser.transition_group(["top.clk"]):
+            raise OperationCancelled()
+    assert parser._handle is None
+
+
+def test_failed_group_read_closes_once_and_skips_stale_finalizer():
+    parser = _fake_group_parser()
+    parser._lib.fsdb_get_loaded_transitions = lambda *args: -6
+    with pytest.raises(RuntimeError, match="reader closed for recovery"):
+        with parser.transition_group(["top.clk"]):
+            parser.get_transitions("top.clk")
+    assert parser._lib.calls == [("begin", ["top.clk"]), "end", "close"]
+
+
+def test_nested_group_cannot_unload_outer_group():
+    parser = _fake_group_parser()
+    with parser.transition_group(["top.clk"]):
+        with pytest.raises(RuntimeError, match="Nested"):
+            with parser.transition_group(["top.clk"]):
+                pass
+        assert parser.get_transitions("top.clk")["transition_count"] == 2
+    assert parser._lib.calls.count("end") == 1
+
+
+@pytest.mark.parametrize("metric", ["record_sweep_native_group_begin", "record_sweep_rss"])
+def test_group_releases_even_if_instrumentation_fails(monkeypatch, metric):
+    parser = _fake_group_parser()
+    def fail(*args, **kwargs):
+        raise RuntimeError("instrumentation")
+    monkeypatch.setattr(operation_metrics, metric, fail)
+    with pytest.raises(RuntimeError, match="instrumentation"):
+        with parser.transition_group(["top.clk"]):
+            pass
+    assert not parser._transition_group_active
+    assert parser._lib.calls[-1] == "end"
+
+
+class _FakeLazyGroupLib(_FakeGroupLib):
+    _traceweave_has_lazy_transition_group = True
+
+    def fsdb_begin_lazy_transition_group_v1(self, handle, paths, count, profile_ptr):
+        self.calls.append(('lazy_begin', [paths[index].decode() for index in range(count)]))
+        profile_ptr._obj.signal_count = count
+        return count
+
+
+@pytest.mark.parametrize('lazy', [False, True])
+def test_event_group_selects_capability_and_reports_actual_loads(lazy):
+    lib = _FakeLazyGroupLib() if lazy else _FakeGroupLib()
+    parser = _fake_group_parser(lib)
+    metrics = operation_metrics.OperationMetrics()
+    token = operation_metrics.push(metrics)
+    operation_metrics.set_value('_sweep_active', True)
+    try:
+        with parser._event_transition_group(['top.clk', 'top.clk'], 50, 60) as active:
+            assert active and parser._transition_group_active
+    finally:
+        operation_metrics.pop(token)
+    assert lib.calls == [('lazy_begin' if lazy else 'begin', ['top.clk']), 'end']
+    snapshot = operation_metrics.snapshot(metrics)
+    assert snapshot['sweep_native_group_count'] == 1
+    assert snapshot['sweep_native_group_load_call_count'] == (0 if lazy else 1)
+    assert snapshot['sweep_native_group_load_total_ms'] == (0 if lazy else 2.0)
+
+
+def test_eager_sweep_group_remains_eager_with_lazy_capability():
+    parser = _fake_group_parser(_FakeLazyGroupLib())
+    with parser.transition_group(['top.clk']) as active:
+        assert active
+    assert parser._lib.calls == [('begin', ['top.clk']), 'end']
+
+
+@pytest.mark.parametrize('lazy', [False, True])
+def test_standalone_seek_does_not_report_an_eager_load(lazy):
+    parser = _fake_group_parser(_FakeLazyGroupLib() if lazy else _FakeGroupLib())
+    metrics = operation_metrics.OperationMetrics()
+    token = operation_metrics.push(metrics)
+    operation_metrics.set_value('_sweep_active', True)
+    try:
+        result = parser.get_transitions('top.clk', 0, 10)
+    finally:
+        operation_metrics.pop(token)
+    assert result['transition_count'] == 1
+    assert parser._lib.calls == [('profiled', 'top.clk')]
+    snapshot = operation_metrics.snapshot(metrics)
+    assert snapshot['sweep_native_profiled_read_count'] == 1
+    assert snapshot.get('sweep_native_standalone_load_call_count', 0) == (0 if lazy else 1)
+
+
+@pytest.mark.parametrize('code', [-2, -6])
+def test_lazy_event_group_begin_failure_does_not_load_eagerly(code):
+    parser = _fake_group_parser(_FakeLazyGroupLib())
+    parser._lib.fsdb_begin_lazy_transition_group_v1 = lambda *args: code
+    if code == -6:
+        with pytest.raises(RuntimeError, match='reader closed for recovery'):
+            with parser._event_transition_group(['top.clk'], 50, 60):
+                pytest.fail('poisoned group must not be published')
+        assert parser._handle is None
+        assert parser._lib.calls == ['close']
+    else:
+        with parser._event_transition_group(['top.clk'], 50, 60) as active:
+            assert not active
+        assert parser._lib.calls == []
+
+
+@pytest.mark.parametrize('existing_group', [False, True])
+def test_event_readers_share_window_group_and_close_cursors_first(monkeypatch, existing_group):
+    from src.waveform_batch import event_readers
+    parser = _fake_group_parser(_FakeLazyGroupLib())
+    seen_windows = []
+    group = parser._event_transition_group
+
+    @contextmanager
+    def event_group(paths, start, end):
+        seen_windows.append((start, end))
+        with group(paths, start, end) as active:
+            yield active
+
+    @contextmanager
+    def pages(path, start, end, **limits):
+        assert parser._transition_group_active
+        parser._lib.calls.append(('open_cursor', path, start, end))
+        try:
+            yield SimpleNamespace(mode='native_event_pages_v1')
+        finally:
+            parser._lib.calls.append(('close_cursor', path))
+
+    monkeypatch.setattr(parser, '_supports_event_pages', lambda: True)
+    monkeypatch.setattr(parser, '_event_transition_group', event_group)
+    monkeypatch.setattr(parser, '_event_pages', pages)
+
+    def read():
+        with event_readers([(parser, 'top.clk'), (parser, 'top.data')], 50, 60) as readers:
+            assert [reader.mode for reader in readers] == ['native_event_pages_v1'] * 2
+
+    if existing_group:
+        with parser.transition_group(['top.clk', 'top.data']):
+            read()
+            assert parser._transition_group_active
+    else:
+        read()
+    assert seen_windows == ([] if existing_group else [(50, 60)])
+    assert parser._lib.calls == [
+        ('begin' if existing_group else 'lazy_begin', ['top.clk', 'top.data']),
+        ('open_cursor', 'top.clk', 50, 60), ('open_cursor', 'top.data', 50, 60),
+        ('close_cursor', 'top.data'), ('close_cursor', 'top.clk'), 'end',
+    ]

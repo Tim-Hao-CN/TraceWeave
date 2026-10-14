@@ -19,6 +19,27 @@ from src.waveform_hints import annotate_signal_search_result, normalize_vcd_prod
 from src.clock_edge_cache import ClockCacheToken
 
 _transition_time = itemgetter(0)
+_TOKEN_CHUNK_CHARS = 1024 * 1024
+_whitespace = re.compile(r"\s")
+
+
+def _iter_tokens(content: str):
+    """Split whitespace-aligned chunks without retaining a full token list.
+
+    A single wide value can exceed the nominal chunk size. Keeping that token
+    intact preserves the same whitespace grammar as str.split(). The decoded
+    input and the complete transition cache still belong to the full parse.
+    """
+    start = 0
+    size = len(content)
+    while start < size:
+        check_cancelled()
+        end = min(start + _TOKEN_CHUNK_CHARS, size)
+        if end < size and not content[end - 1].isspace():
+            boundary = _whitespace.search(content, end)
+            end = boundary.end() if boundary else size
+        yield from content[start:end].split()
+        start = end
 
 
 class VCDParser:
@@ -283,10 +304,18 @@ class VCDParser:
 
     def _ensure_parsed(self):
         if not self._parsed:
+            check_cancelled()
             identity = file_identity(self.file_path)
-            self._parse()
-            if file_identity(self.file_path) != identity:
-                raise ScopeIdentityChanged("VCD changed while parsing")
+            try:
+                self._parse()
+                check_cancelled()
+                if file_identity(self.file_path) != identity:
+                    raise ScopeIdentityChanged("VCD changed while parsing")
+            except BaseException:
+                # A cancelled or failed first load must not leave records that
+                # a subsequent request could append to or query as complete.
+                VCDParser.__init__(self, self.file_path)
+                raise
             self._parsed_identity = identity
             self._parsed = True
 
@@ -321,33 +350,42 @@ class VCDParser:
         scope_ends = ()
         current_ps    = 0
         ticks         = 0
-        tokens        = content.split()
+        tokens        = _iter_tokens(content)
+        transitions   = self._transitions
+        raw_ticks     = self._raw_ticks
+        sub_ps        = self._timescale_fs % 1000
         ranged_declarations: dict[str, set[str]] = {}
-        i = 0
-        while i < len(tokens):
-            tok = tokens[i]
+        for tok in tokens:
             if tok == "$scope":
-                scope_name = tokens[i + 2] if i + 2 < len(tokens) else "unknown"
+                next(tokens, None)  # scope type
+                scope_name = next(tokens, "unknown")
                 scope_stack.append(scope_name)
                 scope_ends += ((scope_ends[-1] + 1 if scope_ends else 0) + len(scope_name),)
                 if len(scope_stack) == 1 and scope_name not in self._top_modules:
                     self._top_modules.append(scope_name)
-                i += 4
+                next(tokens, None)  # $end
             elif tok == "$upscope":
                 if scope_stack:
                     scope_stack.pop()
                     scope_ends = scope_ends[:-1]
-                i += 2
+                next(tokens, None)  # $end
             elif tok == "$var":
                 # $var <var_type> <size> <id> <reference> [index/range] $end
                 # var_type is the language-level type (wire/reg/integer/real/parameter/...).
                 # VCD has no port direction, so direction stays None at higher layers.
-                var_type = tokens[i + 1] if i + 1 < len(tokens) else ""
-                width  = int(tokens[i + 2]) if tokens[i + 2].isdigit() else 1
-                symbol = tokens[i + 3]
-                name   = tokens[i + 4]
-                end = tokens.index("$end", i + 5)
-                selection = "".join(tokens[i + 5:end])
+                var_type = next(tokens, "")
+                width_token = next(tokens)
+                width = int(width_token) if width_token.isdigit() else 1
+                symbol = next(tokens)
+                name = next(tokens)
+                selection_parts = []
+                for part in tokens:
+                    if part == "$end":
+                        break
+                    selection_parts.append(part)
+                else:
+                    raise ValueError("VCD declaration is missing $end")
+                selection = "".join(selection_parts)
                 if selection and not re.fullmatch(r"\[-?\d+(?::-?\d+)?\]", selection):
                     raise ValueError("Unsupported VCD declaration selection")
                 base = ".".join(scope_stack + [name])
@@ -364,11 +402,10 @@ class VCDParser:
                 declared = declaration_range("v" + selection if selection else full, width)
                 self._declared_ranges[full] = (declared.left, declared.right)
                 self._scope_ends[full] = scope_ends
-                self._transitions.setdefault(symbol, [])
-                if self._timescale_fs % 1000:
-                    self._raw_ticks.setdefault(symbol, array('Q'))
-                i = end + 1
-            elif tok.startswith("#"):
+                transitions.setdefault(symbol, [])
+                if sub_ps:
+                    raw_ticks.setdefault(symbol, array('Q'))
+            elif tok[0] == "#":
                 try:
                     # ceil to ps, matching the FSDB wrapper's convention: a
                     # sub-ps transition time is reported as the next integer
@@ -383,26 +420,21 @@ class VCDParser:
                     self._end_time_fs = max(self._end_time_fs, ticks * self._timescale_fs)
                 except ValueError:
                     pass
-                i += 1
-            elif tok.startswith(("b", "B")):
-                val = tok
-                if i + 1 < len(tokens):
-                    sym = tokens[i + 1]
-                    if sym in self._transitions:
-                        self._transitions[sym].append((current_ps, val))
-                        if sym in self._raw_ticks:
-                            self._raw_ticks[sym].append(ticks)
-                i += 2
+            elif tok[0] in "bB":
+                sym = next(tokens, None)
+                records = transitions.get(sym)
+                if records is not None:
+                    records.append((current_ps, tok))
+                    if sub_ps:
+                        raw_ticks[sym].append(ticks)
             elif len(tok) >= 2 and tok[0] in "01xXzZ":
                 val = tok[0]
                 sym = tok[1:]
-                if sym in self._transitions:
-                    self._transitions[sym].append((current_ps, val))
-                    if sym in self._raw_ticks:
-                        self._raw_ticks[sym].append(ticks)
-                i += 1
-            else:
-                i += 1
+                records = transitions.get(sym)
+                if records is not None:
+                    records.append((current_ps, val))
+                    if sub_ps:
+                        raw_ticks[sym].append(ticks)
 
         # Preserve the traditional bare-name access for one dumped vector.
         # A separately dumped bit is never a scalar alias of the whole bus;

@@ -112,14 +112,27 @@ Verification
   Symbol aliases continue sharing the same transition records. Point/window reads
   do not rebuild a timestamp list or scan the preceding history. Equal
   timestamps keep file order, including rounded sub-ps events. Query work is
-  O(log N + returned events) with no persistent duplicate time index; the first
-  full-file parse and its memory cost are unchanged. Reproduce reader timings
+  O(log N + returned events) with no persistent duplicate time index. Initial
+  parsing retains the decoded input and complete transition records, and splits
+  whitespace-aligned token chunks of about one million characters. An individual
+  wide token can exceed that size. Iterator dispatch avoids retaining a whole-file
+  token list; no signal, scope or time-window filtering is applied during loading.
+  Cancellation checkpoints between chunks discard partial parser state so a later
+  request can retry without duplicate records. Reproduce reader timings
   with `scripts/benchmark_waveform_reads.py`: generate a deterministic VCD using
   `--generate --wave /tmp/activity.vcd --steps 1000000`, then run the same command
   without `--generate` (optionally `--workload point`, `window`, `around`, or
   `cycle`). `--source-root` selects another checkout for before/after comparison.
   The script checks returned values and reports first-load versus repeated-read
   timing and Linux RSS; it excludes MCP transport, conversion and disk-cold I/O.
+  `scripts/benchmark_vcd_replay.py --wave <original.vcd> --calls <calls.json>
+  --output <new-directory>` replays a retained list of `{tool, arguments}` calls
+  through the public handler. It measures the complete first sequence and repeated
+  sequences, CPU, RSS and existing sweep phases. Hashing primes the OS file cache;
+  a cold run means a new parser. Optional `--debug-dir` runs the discovery/log
+  prerequisites, `--fingerprint` checks all retained transitions outside timing,
+  and `--profile-parse` records statement-boundary diagnostic probes separately
+  from the uninstrumented performance comparison.
 - FSDB point output retains the shared 64 MiB capacity for wide values, but
   copies only the actual value plus its NUL terminator. Unused capacity is not
   zero-filled on each read; the allocation and native signal-loading costs are

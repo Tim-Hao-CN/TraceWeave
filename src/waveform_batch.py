@@ -76,9 +76,10 @@ def sampling_batch(parser, paths, start, end):
 def event_readers(requests, start, end, *, max_events=1024, max_bytes=262144):
     """Private batch session over existing parsers, under the caller's wave lock.
 
-    Reuse transition_group for one load per file; free every cursor before group
-    unload. The old time-based batch ABI lacks predecessor/raw tick evidence and
-    is intentionally not used to manufacture a streaming capability.
+    Share a lazy event group where supported, otherwise a resident group; free
+    every cursor before group unload. The old time-based batch ABI lacks
+    predecessor/raw tick evidence and is intentionally not used to manufacture
+    a streaming capability.
     """
     with ExitStack() as stack:
         # A single budget covers all native preparation plus page consumption.
@@ -109,9 +110,11 @@ def event_readers(requests, start, end, *, max_events=1024, max_bytes=262144):
                 prepared = stack.enter_context(batch(paths, start, end, deadline=deadline,
                                                      spool_bytes=spool_remaining))
                 spool_remaining -= prepared.metrics['spool_bytes']
-            group = getattr(parser, 'transition_group', None)
+            event_group = getattr(parser, '_event_transition_group', None)
+            group = event_group or getattr(parser, 'transition_group', None)
             if group is not None and not getattr(parser, '_transition_group_active', False):
-                if not stack.enter_context(group(paths)):
+                session = group(paths, start, end) if event_group is not None else group(paths)
+                if not stack.enter_context(session):
                     raise EventPagingUnavailable()
         readers = [stack.enter_context(parser._event_pages(path, start, end,
                    max_events=max_events, max_bytes=max_bytes)) for parser, path in requests]
@@ -153,6 +156,7 @@ class FSDBBatchReader:
         )
         if rc == -4:
             raise self._parser._scale_unknown_error()
+        self._parser._check_native_cleanup(rc, "batch-read")
         if rc < 0:
             raise RuntimeError(f"fsdb_batch_window_transitions failed, rc={rc}")
         text = buf.value.decode()

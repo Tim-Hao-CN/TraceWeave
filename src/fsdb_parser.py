@@ -142,6 +142,13 @@ def _setup(lib):
     lib.fsdb_close.restype  = None
     lib.fsdb_close.argtypes = [ctypes.c_void_p]
 
+    try:
+        lib.fsdb_reader_status.restype = ctypes.c_int
+        lib.fsdb_reader_status.argtypes = [ctypes.c_void_p]
+        lib._traceweave_has_reader_status = True
+    except AttributeError:
+        lib._traceweave_has_reader_status = False
+
     lib._traceweave_has_event_pages_v1 = False
     try:
         lib.fsdb_event_page_version.restype = ctypes.c_int
@@ -159,6 +166,16 @@ def _setup(lib):
                 fn = getattr(lib, name)
                 fn.restype, fn.argtypes = ctypes.c_int, args
             lib._traceweave_has_event_pages_v1 = True
+    except AttributeError:
+        pass
+
+    # Optional count-only suffix reads; event-page ABI v1 remains unchanged.
+    lib._traceweave_has_event_count_v1 = False
+    try:
+        lib.fsdb_event_count_v1.restype = ctypes.c_int
+        lib.fsdb_event_count_v1.argtypes = [ctypes.c_void_p, ctypes.c_uint64,
+            ctypes.c_uint, ctypes.POINTER(_NativeEventPageV1), ctypes.c_uint]
+        lib._traceweave_has_event_count_v1 = lib._traceweave_has_event_pages_v1
     except AttributeError:
         pass
 
@@ -247,6 +264,20 @@ def _setup(lib):
     except AttributeError:
         lib._traceweave_has_transition_group = False
 
+    # Event cursors can share ownership without eagerly loading every signal's
+    # full history. The event-page ABI and the existing eager sweep group stay
+    # unchanged; older wrappers retain their resident-group compatibility path.
+    try:
+        lib.fsdb_begin_lazy_transition_group_v1.restype = ctypes.c_int
+        lib.fsdb_begin_lazy_transition_group_v1.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_char_p), ctypes.c_int,
+            ctypes.POINTER(_NativeTransitionGroupProfileV1),
+        ]
+        lib._traceweave_has_lazy_transition_group = lib._traceweave_has_transition_group
+    except AttributeError:
+        lib._traceweave_has_lazy_transition_group = False
+
     # int fsdb_get_multi_signals_around_time(
     #     void*, const char**, int, uint64, uint64, int, char*, int)
     lib.fsdb_get_multi_signals_around_time.restype = ctypes.c_int
@@ -325,6 +356,7 @@ class FSDBParser:
         self._scale_unit = None   # raw header string, e.g. "100fs"; "unknown" if unreadable
         self._scale_fs   = None   # fs per FSDB tick; 0 = unknown
         self._transition_group_active = False
+        self._transition_group_token = None
         self._file_identity = None
         self._header = None
         self._summary_paths = None
@@ -427,6 +459,7 @@ class FSDBParser:
                     self._handle, ctypes.byref(profile)
                 )
                 self._transition_group_active = False
+                self._transition_group_token = None
             self._lib.fsdb_close(self._handle)
             self._handle = None
 
@@ -438,6 +471,13 @@ class FSDBParser:
         if self._buf is None:
             self._buf = ctypes.create_string_buffer(_BUF_SIZE)
         return self._buf
+
+    def _check_native_cleanup(self, rc, operation):
+        if rc == -6:
+            # Unknown selection/view state must never survive into another
+            # query. Closing also discards file-bound clock/metadata caches.
+            self.close()
+            raise RuntimeError(f"FSDB {operation} cleanup failed; reader closed for recovery")
 
     def get_value_at_time(self, signal_path: str, time_ps: int) -> dict:
         self._open()
@@ -455,11 +495,7 @@ class FSDBParser:
             )
         if rc == -4:
             raise self._scale_unknown_error()
-        if rc == -6:
-            # Do not let a failed native view restoration poison later reads.
-            # A future call will open a fresh handle; close also drops indexes.
-            self.close()
-            raise RuntimeError("FSDB point-read cleanup failed; reader closed for recovery")
+        self._check_native_cleanup(rc, "point-read")
         if rc < 0:
             raise RuntimeError(f"fsdb_get_value_at_time failed, rc={rc}")
         return {
@@ -489,7 +525,8 @@ class FSDBParser:
             )
             operation_metrics.record_sweep_native_transition(
                 _profile_dict(profile),
-                standalone_load=not self._transition_group_active,
+                standalone_load=(not self._transition_group_active and not
+                    getattr(self._lib, '_traceweave_has_lazy_transition_group', False)),
             )
         else:
             rc = self._lib.fsdb_get_transitions(
@@ -501,6 +538,7 @@ class FSDBParser:
             raise KeyError(f"Signal not found: '{signal_path}'")
         if rc == -4:
             raise self._scale_unknown_error()
+        self._check_native_cleanup(rc, "transition-read")
         if rc < 0:
             raise RuntimeError(f"fsdb_get_transitions failed, rc={rc}")
         text = buf.value.decode()
@@ -540,6 +578,86 @@ class FSDBParser:
             "transition_count_is_lower_bound": native_truncated,
         }
 
+    def get_transitions_capped(self, signal_path: str,
+                               start_ps: int = 0, end_ps: int = -1,
+                               *, max_transitions: int = 1000) -> dict:
+        """Public detail prefix plus exact count, with the legacy ABI fallback.
+
+        Internal callers retain ``get_transitions`` and its full-list contract.
+        The dispatch layer still applies its return cap to legacy fallbacks.
+        """
+        if type(max_transitions) is not int or max_transitions < 1:
+            raise ValueError("max_transitions must be a positive integer")
+        self._open()
+        supported = all(getattr(self._lib, name, False) for name in (
+            '_traceweave_has_event_pages_v1', '_traceweave_has_event_count_v1',
+            '_traceweave_has_lazy_transition_group'))
+        if (not supported or self._transition_group_active or start_ps < 0 or end_ps < -1 or
+                (end_ps != -1 and end_ps < start_ps)):
+            return self.get_transitions(signal_path, start_ps, end_ps)
+
+        # Keep the legacy wide-signal domain. Event pages have a smaller ABI
+        # ceiling than the old output buffer, so enlarge a page for one wide
+        # record or take the old path if even the maximum page cannot hold it.
+        record_bytes = self.get_signal_width(signal_path) + 128
+        if record_bytes > 1048576:
+            return self.get_transitions(signal_path, start_ps, end_ps)
+        page_bytes = max(262144, record_bytes)
+
+        # Public timestamps ceil to ps. Reading from the previous integer ps
+        # includes every sub-ps event that rounds into start_ps, and enough
+        # history to select the last real public-ps predecessor separately.
+        physical_start = max(0, start_ps - 1)
+        transitions, previous = [], None
+        total, native_truncated = 0, False
+        from .event_pages import page_records
+        with self._event_transition_group([signal_path], physical_start, end_ps) as active:
+            if not active:
+                return self.get_transitions(signal_path, start_ps, end_ps)
+            with self._event_pages(signal_path, physical_start, end_ps,
+                                   max_events=min(1024, max_transitions), max_bytes=page_bytes) as reader:
+                complete = False
+                while not complete and not native_truncated:
+                    check_cancelled()
+                    if len(transitions) < max_transitions:
+                        # Native pages never format suffix values beyond the
+                        # requested prefix. Pre-window records do not use cap.
+                        reader.max_events = min(1024, max_transitions - len(transitions))
+                        page = reader.read_page()
+                        records = page_records(page)
+                        for event in records:
+                            check_cancelled()
+                            if event.time_ps < start_ps:
+                                previous = event
+                            elif end_ps == -1 or event.time_ps <= end_ps:
+                                transitions.append({
+                                    "time_ps": event.time_ps,
+                                    "time_ns": event.time_ps / 1000,
+                                    "value": _enrich_value(event.value),
+                                })
+                                total += 1
+                        if not records and not page.complete and not page.truncated:
+                            raise RuntimeError('FSDB event page made no progress')
+                    else:
+                        # The prefix consumed every anchor and start-boundary
+                        # record; all remaining cursor records are in-window.
+                        page = reader.count_page()
+                        total += page.events
+                    complete, native_truncated = page.complete, page.truncated
+        check_cancelled()
+        predecessor = None if previous is None else {
+            "time_ps": previous.time_ps,
+            "time_ns": previous.time_ps / 1000,
+            "value": _enrich_value(previous.value),
+        }
+        return {
+            "signal": signal_path, "start_ps": start_ps, "end_ps": end_ps,
+            "transition_count": total, "transitions": transitions,
+            "predecessor": predecessor,
+            "truncated": native_truncated or total > len(transitions),
+            "transition_count_is_lower_bound": native_truncated,
+        }
+
     @contextmanager
     def transition_group(self, signal_paths: list[str]) -> Iterator[bool]:
         """Load a bounded signal group once while preserving per-signal output.
@@ -548,7 +666,27 @@ class FSDBParser:
         failed groups fall back before touching FFR group state, so callers can
         continue using ordinary ``get_transitions`` unchanged.
         """
+        with self._transition_group(signal_paths, lazy=False) as active:
+            yield active
+
+    @contextmanager
+    def _event_transition_group(self, signal_paths, start, end):
+        """Own event-page signals without a full-history preload when supported.
+
+        Each event cursor seeks its own exact ``start``/``end`` inside the
+        original view. Ownership is shared, but a narrowed native view must not
+        fabricate boundary observations or replace a true predecessor.
+        """
         self._open()
+        lazy = bool(getattr(self._lib, '_traceweave_has_lazy_transition_group', False))
+        with self._transition_group(signal_paths, lazy=lazy) as active:
+            yield active
+
+    @contextmanager
+    def _transition_group(self, signal_paths, *, lazy):
+        self._open()
+        if self._transition_group_active:
+            raise RuntimeError("Nested FSDB transition groups are not supported")
         paths = list(dict.fromkeys(str(path) for path in signal_paths if path))
         if not paths:
             yield False
@@ -574,9 +712,12 @@ class FSDBParser:
         encoded = [path.encode() for path in paths]
         c_paths = (ctypes.c_char_p * len(encoded))(*encoded)
         begin_profile = _NativeTransitionGroupProfileV1()
-        rc = self._lib.fsdb_begin_transition_group(
+        begin = (self._lib.fsdb_begin_lazy_transition_group_v1 if lazy
+                 else self._lib.fsdb_begin_transition_group)
+        rc = begin(
             self._handle, c_paths, len(encoded), ctypes.byref(begin_profile)
         )
+        self._check_native_cleanup(rc, "group-begin")
         if rc < 0:
             operation_metrics.record_sweep_native_group_fallback(
                 "begin_error", signal_count=len(paths)
@@ -585,21 +726,35 @@ class FSDBParser:
             return
 
         self._transition_group_active = True
-        operation_metrics.record_sweep_native_group_begin(
-            _profile_dict(begin_profile)
-        )
-        operation_metrics.record_sweep_rss(phase="sample")
+        group_handle = self._handle
+        group_token = self._transition_group_token = object()
         try:
+            operation_metrics.record_sweep_native_group_begin(
+                _profile_dict(begin_profile), eager_load=not lazy
+            )
+            operation_metrics.record_sweep_rss(phase="sample")
             yield True
         finally:
             # Capture the group's loaded high-water before FFR unload, then the
             # caller samples again after the context to observe retention.
-            operation_metrics.record_sweep_rss(phase="sample")
             end_profile = _NativeTransitionGroupProfileV1()
-            self._lib.fsdb_end_transition_group(
-                self._handle, ctypes.byref(end_profile)
-            )
-            self._transition_group_active = False
+            try:
+                operation_metrics.record_sweep_rss(phase="sample")
+            finally:
+                # A failed read may already have invalidated this reader. Never
+                # end an old group against a closed or reopened native handle.
+                if (self._handle == group_handle and self._transition_group_token is group_token
+                        and self._transition_group_active):
+                    rc = self._lib.fsdb_end_transition_group(
+                        self._handle, ctypes.byref(end_profile)
+                    )
+                    self._transition_group_active = False
+                    self._transition_group_token = None
+                    if rc < 0:
+                        self.close()
+                        # Keep the original cancellation/body exception visible.
+                        if sys.exc_info()[0] is None:
+                            raise RuntimeError("FSDB group-end cleanup failed; reader closed for recovery")
             operation_metrics.record_sweep_native_group_end(
                 _profile_dict(end_profile)
             )
@@ -634,6 +789,7 @@ class FSDBParser:
         )
         if rc == -4:
             raise self._scale_unknown_error()
+        self._check_native_cleanup(rc, "around-read")
         if rc < 0:
             raise RuntimeError(f"fsdb_get_multi_signals_around_time failed, rc={rc}")
         return _parse_multi_signal_buf(
@@ -685,6 +841,8 @@ class FSDBParser:
             return dict(self._header)
         identity = self._file_identity
         end_ps = int(self._lib.fsdb_get_end_time(self._handle))
+        if getattr(self._lib, "_traceweave_has_reader_status", False):
+            self._check_native_cleanup(self._lib.fsdb_reader_status(self._handle), "duration-read")
         count  = self._lib.fsdb_get_signal_count(self._handle)
         try:
             if end_ps <= 0 and self._scale_fs != 0:

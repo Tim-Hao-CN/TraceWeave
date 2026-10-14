@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -338,3 +339,82 @@ def test_native_reader_cannot_survive_owner_generation_change(require_fsdb_runti
         assert not p._transition_group_active
         assert p.get_value_at_time('scale_1ns_tb.addr[31:0]',100000)['value']['dec']==0xaaaa0000
     finally:p.close()
+
+
+@pytest.fixture
+def cleanup_parser(monkeypatch):
+    """Exercise Python ownership failures independently of the installed ABI."""
+    p = FSDBParser('/unused-event-cleanup.fsdb')
+    calls = []
+    p._handle = 17
+    p._file_identity = object()
+    p._scale_fs = 1000
+    p._transition_group_active = True
+
+    def open_cursor(handle, path, start, end, cursor):
+        cursor._obj.value = 23
+        return 0
+
+    p._lib = SimpleNamespace(
+        _traceweave_has_event_pages_v1=True,
+        fsdb_event_end_tick_v1=lambda *args: 0,
+        fsdb_event_open_v1=open_cursor,
+        fsdb_event_close_v1=lambda *args: calls.append('cursor_close') or -6,
+        fsdb_end_transition_group=lambda *args: calls.append('group_end') or 0,
+        fsdb_close=lambda *args: calls.append('reader_close'),
+    )
+    monkeypatch.setattr(p, '_open', lambda: None)
+    monkeypatch.setattr(p, 'get_signal_width', lambda path: 1)
+    monkeypatch.setattr(p, '_check_metadata_identity', lambda expected: None)
+    yield p, calls
+    p.close()
+
+
+@pytest.mark.parametrize('entry', ['fsdb_event_end_tick_v1', 'fsdb_event_open_v1'])
+def test_event_constructor_cleanup_failure_invalidates_reader(cleanup_parser, monkeypatch, entry):
+    p, calls = cleanup_parser
+    monkeypatch.setattr(p._lib, entry, lambda *args: -6)
+    with pytest.raises(RuntimeError, match='cleanup failed; reader closed'):
+        with p._event_pages('top.clk'):
+            pytest.fail('failed constructor cannot publish a cursor')
+    assert p._handle is None and not p._transition_group_active
+    assert calls == ['group_end', 'reader_close']
+
+
+@pytest.mark.parametrize('cancel', [False, True])
+def test_event_page_cleanup_failure_closes_before_cancellation(cleanup_parser, monkeypatch, cancel):
+    p, calls = cleanup_parser
+    flag = threading.Event()
+    token = push_cancel_event(flag)
+
+    def failed_page(*args):
+        if cancel:
+            flag.set()
+        return -6
+
+    monkeypatch.setattr(p._lib, 'fsdb_event_page_v1', failed_page, raising=False)
+    try:
+        with pytest.raises(OperationCancelled if cancel else RuntimeError):
+            with p._event_pages('top.clk') as reader:
+                reader.read_page()
+        assert p._handle is None and not p._transition_group_active
+        assert calls == ['group_end', 'reader_close']
+        assert reader.cursor.value == 0 and reader.buffer is None
+    finally:
+        pop_cancel_event(token)
+
+
+@pytest.mark.parametrize('body_error', [None, ValueError('body failure'), OperationCancelled('cancelled body')])
+def test_event_close_failure_clears_cursor_and_preserves_body(cleanup_parser, body_error):
+    p, calls = cleanup_parser
+    with pytest.raises(type(body_error) if body_error is not None else RuntimeError) as caught:
+        with p._event_pages('top.clk') as reader:
+            if body_error is not None:
+                raise body_error
+    if body_error is not None:
+        assert caught.value is body_error
+    assert p._handle is None and not p._transition_group_active
+    assert calls == ['cursor_close', 'group_end', 'reader_close']
+    assert reader.cursor.value == 0 and reader.buffer is None
+    reader.close()  # Closing the invalidated cursor again cannot touch native state.
+    assert calls == ['cursor_close', 'group_end', 'reader_close']

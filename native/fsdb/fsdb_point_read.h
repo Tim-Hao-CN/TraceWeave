@@ -1,6 +1,8 @@
 #ifndef TRACEWEAVE_FSDB_POINT_READ_H
 #define TRACEWEAVE_FSDB_POINT_READ_H
 
+#include "fsdb_read_lifecycle.h"
+
 /* Include after ffrAPI.h. Parameterizing the reader and handle lets the same
  * resource lifecycle run against a fault-injecting reader in portable tests.
  * This guard owns only standalone point loads; resident groups own their load.
@@ -8,6 +10,7 @@
 template <typename Reader, typename TraverseHandle>
 class FsdbPointRead {
     Reader *reader_;
+    FsdbSignalSelection<Reader> selection_;
     TraverseHandle handle_;
     fsdbTag64 saved_start_, saved_end_;
     bool loaded_, restore_, narrowed_, cleanup_ok_;
@@ -19,10 +22,11 @@ class FsdbPointRead {
     bool Restore() {
         if (restore_) {
             restore_ = false;
-            if (reader_->ffrResetViewWindow(
+            try { if (reader_->ffrResetViewWindow(
                     (fsdbXTag*)&saved_start_, (fsdbXTag*)&saved_end_)
                 != FSDB_RC_SUCCESS)
                 cleanup_ok_ = false;
+            } catch (...) { cleanup_ok_ = false; }
         }
         return cleanup_ok_;
     }
@@ -32,7 +36,7 @@ class FsdbPointRead {
 
 public:
     explicit FsdbPointRead(Reader *reader)
-        : reader_(reader), handle_(nullptr), loaded_(false), restore_(false),
+        : reader_(reader), selection_(reader), handle_(nullptr), loaded_(false), restore_(false),
           narrowed_(false), cleanup_ok_(true) {}
 
     ~FsdbPointRead() { Finish(); }
@@ -62,8 +66,9 @@ public:
                 }
             }
             loaded_ = true;  // Unload even if Add/Load partially fails or throws.
-            if (reader_->ffrAddToSignalList(id) != FSDB_RC_SUCCESS ||
-                reader_->ffrLoadSignals() != FSDB_RC_SUCCESS)
+            int rc = selection_.Begin();
+            if (rc != 0) return rc;
+            if (selection_.Add(id) != 0 || selection_.Load() != 0)
                 return -3;
         }
         handle_ = reader_->ffrCreateVCTraverseHandle(id);
@@ -75,12 +80,13 @@ public:
 
     bool Finish() {
         if (handle_) {
-            handle_->ffrFree();
+            try { handle_->ffrFree(); }
+            catch (...) { cleanup_ok_ = false; }
             handle_ = nullptr;
         }
         if (loaded_) {
             loaded_ = false;
-            if (reader_->ffrUnloadSignals() != FSDB_RC_SUCCESS)
+            if (!selection_.Finish())
                 cleanup_ok_ = false;
         }
         return Restore();
