@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+pytest_plugins = ["scripts.pytest_profiles"]
+
 # 测试绝不能写入真实的用户遥测文件：走 server.call_tool 的测试（如
 # TestCallToolErrors）会触发真实的 record_call 落盘，曾把每次 pytest 运行
 # 都变成 ~/.cache/traceweave/telemetry/usage.jsonl 里的一个假"失败会话"，
@@ -19,10 +21,25 @@ os.environ["TRACEWEAVE_TELEMETRY"] = "0"
 # monkeypatch and use a fake transport.
 os.environ["TRACEWEAVE_NPI_EXECUTION"] = "local"
 
+# Keep default-flow regressions independent of an operator's opt-out. Focused
+# policy tests launch fresh servers with explicit startup environments.
+os.environ["TRACEWEAVE_STRUCTURAL_SCAN_IN_WORKFLOW"] = "1"
+
 # 把 TraceWeave/ 根目录加入路径
 ROOT = os.path.dirname(os.path.dirname(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+
+
+@pytest.fixture(scope="session")
+def source_graph_python():
+    """Run real Source Graph workers with the pinned frontend installed for pytest."""
+    from src.slang_connectivity_projector import SLANG_FRONTEND_VERSION
+
+    pyslang = pytest.importorskip("pyslang")
+    if pyslang.__version__ != SLANG_FRONTEND_VERSION:
+        pytest.skip(f"requires pyslang=={SLANG_FRONTEND_VERSION}")
+    return sys.executable
 
 
 @pytest.fixture

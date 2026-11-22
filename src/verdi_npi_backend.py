@@ -20,6 +20,7 @@ import atexit
 import contextlib
 import ctypes
 import hashlib
+import json
 import logging
 import os
 import re
@@ -29,11 +30,13 @@ import threading
 import time
 from typing import Any
 
-from config import NPI_ALLOW_DEGRADED_KDB
+from config import NPI_ALLOW_DEGRADED_KDB, NPI_VENDOR_DIRECT
 from .cancellation import OperationCancelled, check_cancelled
+from .compile_input_capture import CaptureAborted
 from .compile_log_parser import parse_compile_log
 from .connectivity_backend import StaticConnectivityBackend
 from .kdb_identity import kdb_identity
+from .kdb_anchor import KdbAnchor, KdbBindingChanged, validate_query_anchor
 from .connectivity_limits import (
     DEFAULT_DRIVER_OUTPUT_LIMIT,
     DEFAULT_LOAD_OUTPUT_LIMIT,
@@ -56,6 +59,9 @@ from .verdi_backend import (
 
 
 _LOG = logging.getLogger(__name__)
+# Best-effort native getters may omit ordinary missing data, never lifecycle
+# failures. These errors must reach dispatch without advancing fallback.
+_FATAL_QUERY_ERRORS = (OperationCancelled, CaptureAborted, KdbBindingChanged, TimeoutError)
 
 # Process-level guard: NPI's npisys.init is non-reentrant. The native
 # library prints "Repeated npi_init ... ignored until npi_end" and
@@ -65,6 +71,9 @@ _LOG = logging.getLogger(__name__)
 # subsequent integration tests with the real native module.
 _NPI_INITIALIZED_IDS: set[int] = set()
 _NPI_ACTIVE_DESIGNS: dict[int, tuple] = {}
+# A reload can invalidate native handles without changing the design identity.
+# Increment before every load attempt, including restoration after a failure.
+_NPI_LOAD_GENERATIONS: dict[int, int] = {}
 _BANNER_SILENCER_INSTALLED = False
 _NPI_FAN_IN_CALLBACK_LOCK = threading.Lock()
 
@@ -189,12 +198,16 @@ def _module_of(hdl: Any) -> str | None:
         return None
     try:
         scope = hdl.scope_inst() if hasattr(hdl, "scope_inst") else None
+    except _FATAL_QUERY_ERRORS:
+        raise
     except Exception:
         return None
     if scope is None:
         return None
     try:
         name = scope.def_name() if hasattr(scope, "def_name") else None
+    except _FATAL_QUERY_ERRORS:
+        raise
     except Exception:
         return None
     return name or None
@@ -206,6 +219,8 @@ def _npi_handle_key(hdl: Any) -> tuple[str, str] | tuple[str, int]:
     try:
         kind = str(hdl.type()) if hasattr(hdl, "type") else type(hdl).__name__
         name = hdl.full_name() if hasattr(hdl, "full_name") else None
+    except _FATAL_QUERY_ERRORS:
+        raise
     except Exception:
         return ("object", id(hdl))
     if isinstance(name, str) and name:
@@ -221,6 +236,8 @@ def _is_output_boundary_load(hdl: Any) -> bool:
     try:
         kind = str(hdl.type())
         direction = str(hdl.direction())
+    except _FATAL_QUERY_ERRORS:
+        raise
     except Exception:
         return False
     return kind in {"npiNlPort", "npiNlPseudoPort"} and direction in {
@@ -240,6 +257,8 @@ def _is_boundary_driver(hdl: Any) -> bool:
     """
     try:
         raw = hdl.full_name() if hasattr(hdl, "full_name") else None
+    except _FATAL_QUERY_ERRORS:
+        raise
     except Exception:
         return False
     if not raw:
@@ -339,27 +358,195 @@ class VerdiNpiBackend:
 
     def bind_compile_context(self, compile_result: dict) -> None:
         """Bind one immutable caller-validated compile context to this instance."""
-        self._bound_compile_result = compile_result
+        from copy import deepcopy
+        self._bound_compile_result = deepcopy(compile_result)
+        if hasattr(self._fallback, "bind_compile_context"):
+            self._fallback.bind_compile_context(compile_result)
+
+    def bind_native_inputs(self, inputs) -> None:
+        from .native_query import NativeQueryInputs
+        if not isinstance(inputs, NativeQueryInputs):
+            raise TypeError("native metadata inputs required")
+        self._native_inputs = inputs
+        if inputs.compile_result_json is not None:
+            self.bind_compile_context(inputs.compile_result())
+
+    def bind_kdb_anchor(self, anchor: KdbAnchor) -> None:
+        validate_query_anchor(anchor)
+        previous = getattr(self, "_bound_kdb_anchor", None)
+        if previous is not None and previous.identity_sha256 != anchor.identity_sha256:
+            self._clear_loaded_state(failed=False)
+        self._bound_kdb_anchor = anchor
+
+    def _finish_bound_query(self, result):
+        check_cancelled()
+        anchor = getattr(self, "_bound_kdb_anchor", None)
+        if anchor is not None:
+            anchor.require_current()
+        return result
+
+    def query_hierarchy(self, operation: str, arguments: dict, *, top: str,
+                        budget=None) -> dict:
+        """Internal prepared-context source service; no discovery or fallback.
+
+        Like the existing local NPI entry points, this runs synchronously on
+        the dispatch/native-owner thread. The caller pins and validates its
+        compile context and execution policy; this method validates the bound
+        KDB and ensures no Language handle survives the operation.
+        """
+        from .hierarchy_source_ir import HierarchyQueryBudget
+        from .hierarchy_source_service import HierarchySourceService, validate_hierarchy_query
+
+        validate_hierarchy_query(operation, arguments)
+        budget = budget if budget is not None else HierarchyQueryBudget()
+
+        def execute(provider):
+            service = HierarchySourceService(provider)
+            method = {"get_tb_subtree": service.subtree,
+                      "find_tb_instance": service.find_instances,
+                      "get_tb_class_hierarchy": service.class_hierarchy}[operation]
+            return method(**arguments, budget=budget)
+
+        return self._query_language(execute, top=top, budget=budget)
+
+    def query_source(self, request) -> dict:
+        """Execute a six-tool plan in one owner, or metadata without any owner.
+
+        The caller pins and validates request.context before and after this
+        synchronous operation. Compile ownership is not proof that the KDB was
+        compiled from those source bytes; the separate binding receipt retains
+        that limitation. No fallback, discovery or source parsing occurs here.
+        """
+        from .hierarchy_source_ir import HierarchyBudgetExceeded
+        from .hierarchy_source_request import HierarchySourceRequest
+        from .npi_hierarchy_source import NpiHierarchyUnavailable
+
+        check_cancelled()
+        if not isinstance(request, HierarchySourceRequest):
+            raise TypeError("a prepared hierarchy/source request is required")
+        request.validate()
+        self._last_query_kdb_status = None
+        if not request.needs_provider or request.preparation_limit is not None:
+            return request.execute()
+        try:
+            request.budget.checkpoint()
+        except HierarchyBudgetExceeded as exc:
+            return request._unstarted(exc.reason)
+        if request.context.backend_preference == "source":
+            raise NpiHierarchyUnavailable("npi_source_only_context")
+        if getattr(self, "_bound_compile_result", None) != request.context.compile_result():
+            raise NpiHierarchyUnavailable("npi_compile_context_mismatch")
+        def execute(provider):
+            arguments = json.loads(request.arguments_json)
+            if request.operation == "get_tb_file_detail" and request.catalog is not None:
+                entry = request.catalog.find_file(arguments["path"], checkpoint=request.budget.checkpoint)
+                if entry is not None:
+                    # A single-file query need not retain unrelated declarations.
+                    # Exports and multi-file queries keep their shared inventory.
+                    provider._file_query_paths = frozenset((entry.path, *entry.aliases))
+            if request.operation == "get_tb_class_hierarchy":
+                provider._class_query_root = arguments.get("root_class")
+            return request.execute(provider)
+
+        result = self._query_language(execute, top=request.context.selected_top,
+                                      budget=request.budget)
+        from .hierarchy_source_request import NativeSourceRequest
+        if not isinstance(request, NativeSourceRequest):
+            result["context_identity_sha256"] = request.context.identity_sha256
+        result["kdb_binding"] = dict(self._bound_kdb_anchor.receipt(), load_status="loaded",
+                                      load_quality=self.kdb_load_quality)
+        return result
+
+    def _query_language(self, execute, *, top, budget) -> dict:
+        """Common exclusive owner for instance, class, file and export work."""
+        from .hierarchy_source_ir import HierarchyQueryBudget
+        from .hierarchy_source_service import finish_hierarchy_query
+        from .npi_hierarchy_source import NpiHierarchyUnavailable, language_query_owner
+
+        if not isinstance(top, str) or not top:
+            raise ValueError("an explicit selected top is required")
+        if not isinstance(budget, HierarchyQueryBudget):
+            raise TypeError("a hierarchy query budget is required")
+        anchor = getattr(self, "_bound_kdb_anchor", None)
+        if anchor is None or (getattr(self, "_bound_compile_result", None) is None
+                              and getattr(self, "_native_inputs", None) is None):
+            raise NpiHierarchyUnavailable("npi_prepared_context_required")
+        budget.checkpoint()
+        self._last_query_kdb_status = None
+        started = time.monotonic()
+        npisys_id, load_generation, load_ms = None, None, 0.0
+        expected = (anchor.path, top, ("bounded_maps", anchor.identity_sha256))
+        owner_thread = threading.get_ident()
+
+        def prepare_owner():
+            nonlocal npisys_id, load_generation, load_ms
+            load_started = time.monotonic()
+            if not self._ensure_loaded(anchor.path, top):
+                raise NpiHierarchyUnavailable("npi_load_failed")
+            load_ms = (time.monotonic() - load_started) * 1000
+            budget.checkpoint()
+            self._record_query_kdb_status()
+            npisys_id = id(self._npi_modules[0])
+            load_generation = _NPI_LOAD_GENERATIONS.get(npisys_id, 0)
+
+        def require_owner():
+            # Identity-only: cleanup must still run when the caller cancelled.
+            if (threading.get_ident() != owner_thread or self._state != "ready"
+                    or self._npi_modules is None or id(self._npi_modules[0]) != npisys_id
+                    or _NPI_LOAD_GENERATIONS.get(npisys_id, 0) != load_generation
+                    or _NPI_ACTIVE_DESIGNS.get(npisys_id) != expected):
+                raise NpiHierarchyUnavailable("npi_loaded_generation_changed")
+
+        def cleanup_failed():
+            if (_NPI_LOAD_GENERATIONS.get(npisys_id, 0) == load_generation
+                    and _NPI_ACTIVE_DESIGNS.get(npisys_id) == expected):
+                _NPI_ACTIVE_DESIGNS.pop(npisys_id, None)
+                if self._npi_modules is not None and id(self._npi_modules[0]) == npisys_id:
+                    self._clear_loaded_state(failed=True)
+
+        identity = hashlib.sha256((anchor.identity_sha256 + "\0" + top).encode()).hexdigest()
+        with _silence_native_stdio():
+            with language_query_owner(top=top, artifact_identity=identity, budget=budget,
+                                      require_owner=require_owner, cleanup_failed=cleanup_failed,
+                                      prepare_owner=prepare_owner,
+                                      degraded=lambda: self._loaded_degraded) as provider:
+                result = execute(provider)
+        require_owner()
+        self._finish_bound_query(None)
+        finish_hierarchy_query(result, budget)
+        # Native cleanup and final map validation are mandatory even after an
+        # analysis limit; expose their cost rather than hiding it in a cache hit.
+        result["query_metrics"].update(
+            native_handle_count=provider.handle_count,
+            native_iterator_release_count=provider.iterator_releases,
+            language_cleanup_ms=provider.cleanup_ms, design_load_ms=load_ms,
+            query_with_cleanup_validation_ms=(time.monotonic() - started) * 1000,
+        )
+        return result
 
     def get_dynamic_step(self, signal_path: str, compile_log: str, *,
                          top_hint: str | None = None, simulator: str = "auto",
                          include_dependency_candidates: bool = False, **_kwargs) -> dict:
         from .dynamic_evidence import unsupported_step
         from .npi_dynamic import query_step
+        self._last_query_kdb_status = None
         try:
             compile_result = getattr(self, "_bound_compile_result", None)
-            if compile_result is None:
+            if compile_result is None and getattr(self, "_native_inputs", None) is None:
                 compile_result = parse_compile_log(compile_log, simulator)
             kdb = self._kdb_path_from(compile_result, compile_log)
             top = top_hint or self._top_from(compile_result)
             if not kdb or not top or not self._ensure_loaded(kdb, top):
-                return unsupported_step(signal_path, self.name, "npi_load_failed")
+                return self._finish_bound_query(unsupported_step(signal_path, self.name, "npi_load_failed"))
+            self._record_query_kdb_status()
             with _silence_native_stdio():
-                return query_step(self, signal_path,
-                                  include_dependency_candidates=include_dependency_candidates)
-        except OperationCancelled:
+                result = query_step(self, signal_path,
+                                    include_dependency_candidates=include_dependency_candidates)
+            return self._finish_bound_query(result)
+        except (OperationCancelled, CaptureAborted, KdbBindingChanged, TimeoutError):
             raise
         except Exception:
+            self._finish_bound_query(None)
             return unsupported_step(signal_path, self.name, "npi_dynamic_query_failed")
 
     def find_driver(
@@ -376,7 +563,7 @@ class VerdiNpiBackend:
         self._last_query_kdb_status = None
         try:
             compile_result = getattr(self, "_bound_compile_result", None)
-            if compile_result is None:
+            if compile_result is None and getattr(self, "_native_inputs", None) is None:
                 compile_result = parse_compile_log(compile_log, simulator)
             kdb_path = self._kdb_path_from(compile_result, compile_log)
             top = top_hint or self._top_from(compile_result)
@@ -387,7 +574,7 @@ class VerdiNpiBackend:
                     simulator=simulator,
                 )
                 result.setdefault("_npi_fallback_reason", "kdb_or_top_missing")
-                return result
+                return self._finish_bound_query(result)
             if not self._ensure_loaded(kdb_path, top):
                 result = self._fallback.find_driver(
                     signal_path, wave_path, compile_log,
@@ -395,25 +582,27 @@ class VerdiNpiBackend:
                     simulator=simulator,
                 )
                 result.setdefault("_npi_fallback_reason", "npi_load_failed")
-                return result
+                return self._finish_bound_query(result)
             self._record_query_kdb_status()
-            return self._npi_find_driver(
+            result = self._npi_find_driver(
                 signal_path,
                 wave_path,
                 top,
                 recursive=recursive,
             )
-        except OperationCancelled:
+            return self._finish_bound_query(result)
+        except (OperationCancelled, CaptureAborted, KdbBindingChanged, TimeoutError):
             raise
         except Exception as exc:  # noqa: BLE001
             _LOG.warning("VerdiNpiBackend.find_driver failed: %s", exc)
+            self._finish_bound_query(None)
             result = self._fallback.find_driver(
                 signal_path, wave_path, compile_log,
                 top_hint=top_hint, recursive=recursive, max_depth=max_depth,
                 simulator=simulator,
             )
             result.setdefault("_npi_fallback_reason", f"exception: {exc}")
-            return result
+            return self._finish_bound_query(result)
 
     def find_loads(
         self,
@@ -428,7 +617,9 @@ class VerdiNpiBackend:
     ) -> dict[str, Any]:
         self._last_query_kdb_status = None
         try:
-            compile_result = parse_compile_log(compile_log, simulator)
+            compile_result = getattr(self, "_bound_compile_result", None)
+            if compile_result is None and getattr(self, "_native_inputs", None) is None:
+                compile_result = parse_compile_log(compile_log, simulator)
             kdb_path = self._kdb_path_from(compile_result, compile_log)
             top = top_hint or self._top_from(compile_result)
             if not kdb_path or not top:
@@ -442,14 +633,16 @@ class VerdiNpiBackend:
                     include_expr, kind_filter, simulator, "npi_load_failed"
                 )
             self._record_query_kdb_status()
-            return self._npi_find_loads(
+            result = self._npi_find_loads(
                 signal_path, compile_result, kdb_path, top,
                 include_expr, kind_filter,
             )
-        except OperationCancelled:
+            return self._finish_bound_query(result)
+        except (OperationCancelled, CaptureAborted, KdbBindingChanged, TimeoutError):
             raise
         except Exception as exc:  # noqa: BLE001 - never crash the MCP server
             _LOG.warning("VerdiNpiBackend.find_loads failed: %s", exc)
+            self._finish_bound_query(None)
             return self._fallback_with_reason(
                 signal_path, compile_log, top_hint, max_depth,
                 include_expr, kind_filter, simulator, f"exception: {exc}"
@@ -467,7 +660,9 @@ class VerdiNpiBackend:
     ) -> dict[str, Any]:
         self._last_query_kdb_status = None
         try:
-            compile_result = parse_compile_log(compile_log, simulator)
+            compile_result = getattr(self, "_bound_compile_result", None)
+            if compile_result is None and getattr(self, "_native_inputs", None) is None:
+                compile_result = parse_compile_log(compile_log, simulator)
             kdb_path = self._kdb_path_from(compile_result, compile_log)
             top = top_hint or self._top_from(compile_result)
             if not kdb_path or not top:
@@ -481,11 +676,15 @@ class VerdiNpiBackend:
                     reason="npi_load_failed",
                 )
             self._record_query_kdb_status()
-            return self._npi_find_path(
+            result = self._npi_find_path(
                 from_signal, to_signal, expand_assigns=expand_assigns,
             )
+            return self._finish_bound_query(result)
+        except (OperationCancelled, CaptureAborted, KdbBindingChanged, TimeoutError):
+            raise
         except Exception as exc:  # noqa: BLE001
             _LOG.warning("VerdiNpiBackend.find_path failed: %s", exc)
+            self._finish_bound_query(None)
             return self._path_fallback(
                 from_signal, to_signal, expand_assigns,
                 reason=f"exception: {exc}",
@@ -509,7 +708,7 @@ class VerdiNpiBackend:
             expand_assigns=expand_assigns,
         )
         result.setdefault("_npi_fallback_reason", reason)
-        return result
+        return self._finish_bound_query(result)
 
     def _npi_find_path(
         self,
@@ -553,6 +752,8 @@ class VerdiNpiBackend:
                 hdl_list = netlist.sig_to_sig_conn_list(
                     from_hdl, to_hdl, assign_cell=expand_assigns,
                 ) or []
+        except _FATAL_QUERY_ERRORS:
+            raise
         except Exception as exc:  # noqa: BLE001
             _LOG.warning("sig_to_sig_conn_list failed: %s", exc)
             base["unsupported_reason"] = "npi_call_failed"
@@ -583,6 +784,8 @@ class VerdiNpiBackend:
     ) -> dict[str, Any]:
         try:
             net_path = net_hdl.full_name() if hasattr(net_hdl, "full_name") else None
+        except _FATAL_QUERY_ERRORS:
+            raise
         except Exception:  # noqa: BLE001
             net_path = None
         scope_inst = _scope_inst_of(net_hdl)
@@ -593,6 +796,8 @@ class VerdiNpiBackend:
                     scope_inst.full_name()
                     if hasattr(scope_inst, "full_name") else None
                 )
+            except _FATAL_QUERY_ERRORS:
+                raise
             except Exception:  # noqa: BLE001
                 scope_path = None
         file_val, line_val = _inst_src_info(scope_inst)
@@ -719,6 +924,8 @@ class VerdiNpiBackend:
                 3,
             )
             metrics["rss_after_load_kib"] = _sample_rss()
+        except _FATAL_QUERY_ERRORS:
+            raise
         except Exception as exc:  # noqa: BLE001
             _LOG.warning("collect_instance_src_map setup failed: %s", exc)
             _finish("setup_failed")
@@ -747,6 +954,8 @@ class VerdiNpiBackend:
                     metrics["instance_visited_count"] += 1
                     try:
                         inst = netlist.get_inst(path)
+                    except _FATAL_QUERY_ERRORS:
+                        raise
                     except Exception:  # noqa: BLE001
                         metrics["lookup_error_count"] += 1
                         continue
@@ -795,6 +1004,8 @@ class VerdiNpiBackend:
                 (time.perf_counter() - phase_started) * 1000.0,
                 3,
             )
+        except _FATAL_QUERY_ERRORS:
+            raise
         except Exception as exc:  # noqa: BLE001
             _LOG.warning("get_top_inst_list failed: %s", exc)
             _finish("top_list_failed")
@@ -896,6 +1107,8 @@ class VerdiNpiBackend:
                     compile_log, simulator
                 )
                 top = self._top_from(compile_result)
+            except _FATAL_QUERY_ERRORS:
+                raise
             except Exception:  # noqa: BLE001
                 _finish("top_unresolved")
                 return None
@@ -994,7 +1207,12 @@ class VerdiNpiBackend:
     # ── lifecycle ─────────────────────────────────────────────────────
 
     def _ensure_loaded(self, kdb_path: str, top: str) -> bool:
-        identity = kdb_identity(kdb_path)
+        anchor = getattr(self, "_bound_kdb_anchor", None)
+        if anchor is not None:
+            if os.path.abspath(kdb_path) != anchor.path:
+                raise KdbBindingChanged()
+            anchor.require_current()
+        identity = ("bounded_maps", anchor.identity_sha256) if anchor is not None else kdb_identity(kdb_path)
         if (self._state == "ready" and self._loaded_kdb == kdb_path and self._loaded_top == top
                 and self._npi_modules is not None
                 and _NPI_ACTIVE_DESIGNS.get(id(self._npi_modules[0])) == (kdb_path, top, identity)):
@@ -1002,6 +1220,17 @@ class VerdiNpiBackend:
         if self._state == "failed":
             return False
         if self._npi_modules is None:
+            if NPI_VENDOR_DIRECT:
+                # Configure before importing the SDK. Seed an empty/absent
+                # spelling from the other to preserve existing proxy exceptions.
+                for key, other in (("NO_PROXY", "no_proxy"), ("no_proxy", "NO_PROXY")):
+                    current = os.environ.get(key) or os.environ.get(other, "")
+                    entries = {item.strip().lower() for item in current.split(",")}
+                    missing = [
+                        domain for domain in ("srv1.sw.synopsys.com", ".updates.synopsys.com")
+                        if domain not in entries
+                    ]
+                    os.environ[key] = current + ("," if current and missing else "") + ",".join(missing)
             modules = _import_pynpi()
             if modules is None:
                 self._state = "failed"
@@ -1030,7 +1259,8 @@ class VerdiNpiBackend:
                 old_degraded = self._loaded_degraded
                 old_error_count = self._degraded_error_count
                 old_error_log = self._degraded_error_log
-                _NPI_ACTIVE_DESIGNS.pop(npisys_id, None)
+                old_active = _NPI_ACTIVE_DESIGNS.pop(npisys_id, None)
+                _NPI_LOAD_GENERATIONS[npisys_id] = _NPI_LOAD_GENERATIONS.get(npisys_id, 0) + 1
                 rc = npisys.load_design([
                     "traceweave_npi",
                     "-simflow", "-dbdir", dbdir,
@@ -1046,6 +1276,7 @@ class VerdiNpiBackend:
                     # Failed load wipes the previously loaded case in NPI.
                     # Best-effort restore so subsequent calls can still hit cache.
                     if old_kdb and old_top:
+                        _NPI_LOAD_GENERATIONS[npisys_id] += 1
                         restore_rc = npisys.load_design([
                             "traceweave_npi",
                             "-simflow", "-dbdir", _simflow_dbdir(old_kdb),
@@ -1057,7 +1288,10 @@ class VerdiNpiBackend:
                             and self._netlist_usable(netlist, old_top)
                         )
                         if restored:
-                            _NPI_ACTIVE_DESIGNS[npisys_id] = (old_kdb, old_top, kdb_identity(old_kdb))
+                            # Restore only the identity already owned by this
+                            # backend; never bless a fresh stat as its old load.
+                            if old_active is not None and old_active[:2] == (old_kdb, old_top):
+                                _NPI_ACTIVE_DESIGNS[npisys_id] = old_active
                             self._state = old_state
                             self._loaded_kdb = old_kdb
                             self._loaded_top = old_top
@@ -1067,6 +1301,7 @@ class VerdiNpiBackend:
                         else:
                             _NPI_ACTIVE_DESIGNS.pop(npisys_id, None)
                             self._clear_loaded_state(failed=True)
+                    self._finish_bound_query(None)
                     return False
             self._state = "ready"
             _NPI_ACTIVE_DESIGNS[npisys_id] = (kdb_path, top, identity)
@@ -1081,10 +1316,16 @@ class VerdiNpiBackend:
             else:
                 self._degraded_error_count = None
                 self._degraded_error_log = None
+            self._finish_bound_query(None)
             return True
+        except (OperationCancelled, CaptureAborted, KdbBindingChanged, TimeoutError):
+            _NPI_ACTIVE_DESIGNS.pop(id(npisys), None)
+            self._clear_loaded_state(failed=True)
+            raise
         except Exception as exc:  # noqa: BLE001
             _LOG.warning("npisys.load_design crashed: %s", exc)
             self._clear_loaded_state(failed=True)
+            self._finish_bound_query(None)
             return False
 
     def _netlist_usable(self, netlist: Any, top: str) -> bool:
@@ -1095,6 +1336,8 @@ class VerdiNpiBackend:
         try:
             with _silence_native_stdio():
                 top_list = netlist.get_top_inst_list() or []
+        except _FATAL_QUERY_ERRORS:
+            raise
         except Exception as exc:  # noqa: BLE001
             _LOG.warning("degraded KDB top-instance self-check failed: %s", exc)
             return False
@@ -1112,6 +1355,8 @@ class VerdiNpiBackend:
                     continue
                 try:
                     value = member() if callable(member) else member
+                except _FATAL_QUERY_ERRORS:
+                    raise
                 except Exception:  # noqa: BLE001
                     continue
                 if isinstance(value, str) and value:
@@ -1189,6 +1434,8 @@ class VerdiNpiBackend:
         try:
             with _silence_native_stdio():
                 raw_loads = net.load_list() or []
+        except _FATAL_QUERY_ERRORS:
+            raise
         except Exception as exc:  # noqa: BLE001
             _LOG.warning("net.load_list crashed for %s: %s", signal_path, exc)
             result["stopped_at"] = "npi_load_list_failed"
@@ -1286,6 +1533,8 @@ class VerdiNpiBackend:
                 try:
                     with _silence_native_stdio():
                         handles = current.load_list() or []
+                except _FATAL_QUERY_ERRORS:
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     _LOG.warning("NPI boundary load_list failed: %s", exc)
                     recovery_failed = True
@@ -1311,6 +1560,8 @@ class VerdiNpiBackend:
                     with _silence_native_stdio():
                         peer = hdl.connected_pin()
                         parent_net = peer.connected_net() if peer is not None else None
+                except _FATAL_QUERY_ERRORS:
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     _LOG.warning("NPI output-boundary recovery failed: %s", exc)
                     recovery_failed = True
@@ -1399,6 +1650,8 @@ class VerdiNpiBackend:
         try:
             with _silence_native_stdio():
                 drivers = net.driver_list() or []
+        except _FATAL_QUERY_ERRORS:
+            raise
         except Exception as exc:  # noqa: BLE001
             _LOG.warning("net.driver_list crashed for %s: %s", signal_path, exc)
             base["driver_status"] = "unsupported"
@@ -1723,13 +1976,21 @@ class VerdiNpiBackend:
                     pins = []
             finally:
                 if registration_attempted:
+                    active_error = sys.exc_info()[1]
                     try:
                         with _silence_native_stdio():
                             netlist.reset_cb()
+                    except _FATAL_QUERY_ERRORS:
+                        # Cleanup cannot replace an earlier cancellation or
+                        # identity/timeout failure with a later reset failure.
+                        if isinstance(active_error, _FATAL_QUERY_ERRORS):
+                            raise active_error
+                        check_cancelled()
+                        raise
                     except Exception as exc:  # noqa: BLE001
                         reset_failed = True
                         _LOG.warning("NPI fan-in callback reset failed: %s", exc)
-        except OperationCancelled:
+        except _FATAL_QUERY_ERRORS:
             raise
         except Exception as exc:  # noqa: BLE001
             _LOG.warning("net.fan_in_reg_list failed for %s: %s", signal_path, exc)
@@ -1792,6 +2053,8 @@ class VerdiNpiBackend:
         try:
             with _silence_native_stdio():
                 raw_loads = net.load_list() or []
+        except _FATAL_QUERY_ERRORS:
+            raise
         except Exception as exc:  # noqa: BLE001
             _LOG.warning("cross-check load_list failed: %s", exc)
             return None
@@ -1799,6 +2062,8 @@ class VerdiNpiBackend:
         for hdl in raw_loads:
             try:
                 name = hdl.full_name() if hasattr(hdl, "full_name") else None
+            except _FATAL_QUERY_ERRORS:
+                raise
             except Exception:  # noqa: BLE001
                 name = None
             if name:
@@ -1928,6 +2193,8 @@ class VerdiNpiBackend:
         try:
             raw = hdl.full_name() if hasattr(hdl, "full_name") else None
             t = hdl.type() if hasattr(hdl, "type") else None
+        except _FATAL_QUERY_ERRORS:
+            raise
         except Exception:
             return None
         if not raw:
@@ -1961,6 +2228,8 @@ class VerdiNpiBackend:
     def _format_driver(self, hdl: Any) -> dict[str, Any] | None:
         try:
             raw = hdl.full_name() if hasattr(hdl, "full_name") else None
+        except _FATAL_QUERY_ERRORS:
+            raise
         except Exception:
             return None
         if not raw:
@@ -1984,6 +2253,8 @@ class VerdiNpiBackend:
         try:
             raw = hdl.full_name() if hasattr(hdl, "full_name") else None
             t = hdl.type() if hasattr(hdl, "type") else None
+        except _FATAL_QUERY_ERRORS:
+            raise
         except Exception:
             return None
         if not raw:
@@ -2026,12 +2297,16 @@ class VerdiNpiBackend:
                 net = netlist.get_net(signal_path)
             if net is not None:
                 return net
+        except _FATAL_QUERY_ERRORS:
+            raise
         except Exception:
             pass
         if "[" in signal_path:
             try:
                 with _silence_native_stdio():
                     return netlist.get_actual_net(signal_path)
+            except _FATAL_QUERY_ERRORS:
+                raise
             except Exception:
                 return None
         return None
@@ -2061,10 +2336,13 @@ class VerdiNpiBackend:
         # Tag the reason; the dispatch layer surfaces it through
         # backend_status.fallback_reason / actual_backend.
         result.setdefault("_npi_fallback_reason", reason)
-        return result
+        return self._finish_bound_query(result)
 
-    @staticmethod
-    def _kdb_path_from(compile_result: dict[str, Any], compile_log: str) -> str | None:
+    def _kdb_path_from(self, compile_result: dict[str, Any], compile_log: str) -> str | None:
+        anchor = getattr(self, "_bound_kdb_anchor", None)
+        if anchor is not None:
+            anchor.require_current()
+            return anchor.path
         status = probe_verdi_backend(compile_result, compile_log_path=compile_log)
         return status.get("kdb_path")
 
@@ -2331,6 +2609,8 @@ def _walk_inst_src(
         return
     try:
         path = inst.full_name() if hasattr(inst, "full_name") else None
+    except _FATAL_QUERY_ERRORS:
+        raise
     except Exception:  # noqa: BLE001
         path = None
         if stats is not None:
@@ -2343,6 +2623,8 @@ def _walk_inst_src(
                 stats["source_entry_count"] += 1
     try:
         children = inst.inst_list() if hasattr(inst, "inst_list") else []
+    except _FATAL_QUERY_ERRORS:
+        raise
     except Exception:  # noqa: BLE001
         children = []
         if stats is not None:
@@ -2357,6 +2639,8 @@ def _scope_inst_of(hdl: Any) -> Any:
         return None
     try:
         return hdl.scope_inst()
+    except _FATAL_QUERY_ERRORS:
+        raise
     except Exception:  # noqa: BLE001
         return None
 
@@ -2366,6 +2650,8 @@ def _inst_full_name(inst_hdl: Any) -> str | None:
         return None
     try:
         value = inst_hdl.full_name()
+    except _FATAL_QUERY_ERRORS:
+        raise
     except Exception:  # noqa: BLE001
         return None
     return str(value) if value else None
@@ -2378,6 +2664,8 @@ def _inst_definition_name(inst_hdl: Any) -> str | None:
         return None
     try:
         value = inst_hdl.def_name()
+    except _FATAL_QUERY_ERRORS:
+        raise
     except Exception:  # noqa: BLE001
         return None
     return str(value) if value else None
@@ -2405,6 +2693,8 @@ def _inst_src_info(inst_hdl: Any) -> tuple[str | None, int | None]:
             raw = inst_hdl.file()
             if raw:
                 file_val = str(raw)
+        except _FATAL_QUERY_ERRORS:
+            raise
         except Exception:  # noqa: BLE001
             pass
     if hasattr(inst_hdl, "begin_line_no"):
@@ -2412,6 +2702,8 @@ def _inst_src_info(inst_hdl: Any) -> tuple[str | None, int | None]:
             raw = inst_hdl.begin_line_no()
             if raw is not None:
                 line_val = int(raw)
+        except _FATAL_QUERY_ERRORS:
+            raise
         except Exception:  # noqa: BLE001
             pass
 
@@ -2429,6 +2721,8 @@ def _safe_src_info(hdl: Any) -> dict[str, Any]:
         return {}
     try:
         info = hdl.src_info()
+    except _FATAL_QUERY_ERRORS:
+        raise
     except Exception:
         return {}
     if info is None:

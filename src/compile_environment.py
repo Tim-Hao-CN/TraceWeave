@@ -14,6 +14,7 @@ import re
 import shlex
 
 from .cancellation import check_cancelled
+from .compile_input_capture import read_compile_text, resolve_compile_path
 from .filelist_tokenizer import tokenize_filelist
 
 _ENV_REF_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[^}]+\})")
@@ -311,9 +312,20 @@ def _infer_compile_environment(
     path expressions that matched simulator-reported absolute paths.
     """
 
-    anchors = _evidence_anchor_paths(compile_result)
-    if not anchors:
+    check_cancelled()
+    # Unit evidence guarantees a nonempty anchor domain. Canonicalize it only
+    # when inference actually encounters a variable. Literal command files
+    # must still be read: a nested filelist may introduce the first variable.
+    anchors = (None if _compilation_unit_records(compile_result)
+               else _evidence_anchor_paths(compile_result))
+    if anchors == ():
         return {}, set()
+    def evidence_anchors():
+        nonlocal anchors
+        if anchors is None:
+            anchors = _evidence_anchor_paths(compile_result)
+        return anchors
+
     try:
         command_tokens = shlex.split(command, comments=True, posix=True)
     except ValueError:
@@ -332,15 +344,17 @@ def _infer_compile_environment(
             check_cancelled()
             for mode, raw_path in _iter_filelist_references(tokens):
                 rendered = _expand_with_overrides_only(raw_path, bindings)
-                candidate = _candidate_environment_values(
-                    rendered,
-                    base=base,
-                    anchors=anchors,
-                ) or _candidate_filelist_root_values(
-                    rendered,
-                    base=base,
-                    anchors=anchors,
-                )
+                candidate = None
+                if _ENV_REF_RE.search(rendered):
+                    candidate = _candidate_environment_values(
+                        rendered,
+                        base=base,
+                        anchors=evidence_anchors(),
+                    ) or _candidate_filelist_root_values(
+                        rendered,
+                        base=base,
+                        anchors=evidence_anchors(),
+                    )
                 if candidate is not None:
                     name, values = candidate
                     if name not in bindings:
@@ -353,10 +367,12 @@ def _infer_compile_environment(
                 # binding must override that value locally rather than trust
                 # ambient state by accident.
                 rendered = _expand_with_overrides_only(expression, bindings)
+                if not _ENV_REF_RE.search(rendered):
+                    continue
                 candidate = _candidate_environment_values(
                     rendered,
                     base=base,
-                    anchors=anchors,
+                    anchors=evidence_anchors(),
                 )
                 if candidate is None:
                     continue
@@ -383,14 +399,14 @@ def _infer_compile_environment(
             path = Path(rendered)
             if not path.is_absolute():
                 path = base / path
-            path = path.resolve(strict=False)
+            path = Path(resolve_compile_path(path))
             if path in visited_filelists or not path.is_file():
                 continue
             if len(visited_filelists) >= _MAX_ENV_INFERENCE_FILELISTS:
                 break
             try:
                 tokens = tokenize_filelist(
-                    path.read_text(encoding="utf-8", errors="replace")
+                    read_compile_text(path, encoding="utf-8")
                 )
             except (OSError, ValueError):
                 continue

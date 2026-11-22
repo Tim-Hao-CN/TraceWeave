@@ -98,7 +98,7 @@ def _iter_clock_groups(
 
 
 def _chunk_oversized_clock_unit(
-    unit: dict[str, Any], limit: int
+    unit: dict[str, Any], limit: int, *, streaming: bool = False
 ) -> list[dict[str, Any]]:
     """Split one clock unit at interface boundaries without splitting a row."""
     chunks: list[dict[str, Any]] = []
@@ -121,13 +121,13 @@ def _chunk_oversized_clock_unit(
         current_members = []
         # The shared sampling session already owns the clock transition/edge
         # vectors after its first chunk, so later native groups need not load it.
-        current_paths = set()
+        current_paths = set(unit.get("clock_paths", ())) if streaming else set()
 
     for member, member_paths in zip(unit["members"], unit["member_paths"]):
         candidate = current_paths | set(member_paths)
         if current_members and len(candidate) > limit:
             flush()
-            candidate = set(member_paths)
+            candidate = current_paths | set(member_paths)
         current_members.append(member)
         current_paths = candidate
         # If one interface alone exceeds the bound, keep it intact and let the
@@ -139,14 +139,14 @@ def _chunk_oversized_clock_unit(
 
 
 def _pack_clock_units(
-    units: list[dict[str, Any]], limit: int
+    units: list[dict[str, Any]], limit: int, *, streaming: bool = False
 ) -> list[dict[str, Any]]:
     """Deterministic bounded first-fit packing of complete clock units."""
     packs: list[dict[str, Any]] = []
     regular: list[dict[str, Any]] = []
     for unit in units:
         if len(unit["paths"]) > limit:
-            packs.extend(_chunk_oversized_clock_unit(unit, limit))
+            packs.extend(_chunk_oversized_clock_unit(unit, limit, streaming=streaming))
         else:
             regular.append(unit)
 
@@ -282,9 +282,12 @@ def _retry_without_scope_action(
 ) -> dict[str, Any]:
     return {
         "tool": "sweep_handshakes",
+        "reason_code": "empty_scope",
+        "addresses": ["discovery_scope"],
+        "remaining_gaps": [],
         "reason": (
-            "Retry without scope to establish design-level protocol coverage; "
-            "the scoped sweep checked zero interfaces."
+            "Look for supported interfaces outside the empty scope; the prior "
+            "sweep checked zero interfaces. Read the new discovery and coverage limits."
         ),
         "arguments": {
             "wave_path": wave_path,
@@ -310,6 +313,9 @@ def _retry_truncated_action(
 ) -> dict[str, Any]:
     return {
         "tool": "sweep_handshakes",
+        "reason_code": "interface_cap",
+        "addresses": ["interface_cap"],
+        "remaining_gaps": [],
         "reason": (
             f"Previous sweep discovered {discovered_count} interfaces but only "
             f"swept {max_interfaces} due to cap. Re-run with max_interfaces>={discovered_count} "
@@ -325,6 +331,101 @@ def _retry_truncated_action(
             **({"scope": scope} if scope else {}),
         },
     }
+
+
+def sweep_coverage_gaps(result: dict[str, Any]) -> list[str]:
+    """Independent analysis limits; neither findings nor display size repairs them."""
+    gaps = []
+    if any(d.get("status") == "partial" for d in (result.get("discovery") or {}).values()):
+        gaps.append("discovery_incomplete")
+    if result.get("truncated") or result.get("coverage_status") == "truncated":
+        gaps.append("interface_cap")
+    if result.get("transition_truncated_count") or any(
+        row.get("transition_data_truncated") for row in result.get("interfaces", [])
+    ):
+        gaps.append("transition_truncated")
+    if result.get("skipped"):
+        gaps.append("skipped_checks")
+    return gaps
+
+
+def build_sweep_followup_actions(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Use observed scopes/anchors only; missing prerequisites remain warnings.
+
+    Scoped discovery is metadata work, not another all-time interface scan.
+    A larger interface cap is suggested only when it is the sole known gap.
+    """
+    check_cancelled()
+    wave_path = result["wave_path"]
+    scope = result.get("scope") or None
+    start_ps, end_ps = int(result.get("start_ps", 0)), int(result.get("end_ps", -1))
+    edge = result.get("edge", "posedge")
+    max_interfaces = int(result.get("max_interfaces", result.get("interface_count") or DEFAULT_MAX_INTERFACES))
+    max_wait_cycles = int(result.get("max_wait_cycles", 16))
+    gaps = sweep_coverage_gaps(result)
+    actions = []
+    if "discovery_incomplete" in gaps:
+        seen = set()
+        for row in result.get("interfaces", []):
+            check_cancelled()
+            child = row.get("scope")
+            if (not child or child in seen or child == scope
+                    or scope and not child.startswith(scope.rstrip(".") + ".")):
+                continue
+            seen.add(child)
+            ahb = row.get("kind") == "ahb"
+            actions.append({
+                "tool": "suggest_protocol_bundles" if ahb else "suggest_handshakes",
+                "arguments": {"wave_path": wave_path, "scope": child, "max_candidates": 8,
+                              **({"protocol": "ahb"} if ahb else {})},
+                "reason_code": "discovery_incomplete",
+                "addresses": ["discovery_incomplete"],
+                "remaining_gaps": [*gaps, "outside_selected_scope"],
+                "reason": (
+                    "If this observed child scope is relevant to the symptom, discover its "
+                    "interfaces first. This is metadata discovery only; it does not sample "
+                    "the prior time window or establish coverage outside this scope."
+                ),
+            })
+            if len(actions) == 2:
+                break
+    if "transition_truncated" in gaps:
+        for row in result.get("interfaces", []):
+            check_cancelled()
+            anchor = row.get("max_stall_begin_ps")
+            if (not row.get("transition_data_truncated") or type(anchor) is not int
+                    or anchor <= start_ps or end_ps >= 0 and anchor > end_ps):
+                continue
+            target_scope = row.get("scope") or scope
+            actions.append({
+                "tool": "sweep_handshakes",
+                "arguments": {"wave_path": wave_path, "edge": edge,
+                              "start_time_ps": anchor, "end_time_ps": end_ps,
+                              "max_interfaces": max_interfaces, "max_wait_cycles": max_wait_cycles,
+                              **({"scope": target_scope} if target_scope else {})},
+                "reason_code": "transition_truncated",
+                "addresses": ["transition_truncated"],
+                "remaining_gaps": [*gaps, "outside_selected_window"],
+                "reason": (
+                    "Retry from the observed stall anchor in this interface scope. "
+                    "The shorter history may still hit limits; inspect the new coverage. "
+                    "Earlier history and other scopes remain unchecked by this action."
+                ),
+            })
+            break
+    if (gaps == ["interface_cap"]
+            and int(result.get("discovered_count", 0)) > int(result.get("interface_count", 0))):
+        actions.append(_retry_truncated_action(
+            wave_path=wave_path, edge=edge, start_ps=start_ps, end_ps=end_ps,
+            max_wait_cycles=max_wait_cycles, max_interfaces=max_interfaces,
+            discovered_count=int(result.get("discovered_count", 0)), scope=scope,
+        ))
+    elif not gaps and scope and result.get("coverage_status") == "zero_coverage":
+        actions.append(_retry_without_scope_action(
+            wave_path=wave_path, edge=edge, start_ps=start_ps, end_ps=end_ps,
+            max_wait_cycles=max_wait_cycles, max_interfaces=max_interfaces,
+        ))
+    return actions
 
 
 # AXI channel markers, most-specific first: the address channels (AR/AW) share
@@ -608,7 +709,10 @@ def sweep_handshake_anomalies(
         })
 
     group_limit = max(1, int(getattr(parser, "transition_group_limit", 16)))
-    packs = _pack_clock_units(logical_units, group_limit)
+    from .fsdb_sweep_stream import supports_streaming, stream_fsdb_pack, SweepBudget
+    streaming = parser is not None and supports_streaming(parser)
+    stream_budget = SweepBudget() if streaming else None
+    packs = _pack_clock_units(logical_units, group_limit, streaming=streaming)
     session_last_pack: dict[int, int] = {}
     for pack_index, pack in enumerate(packs):
         for unit in pack["units"]:
@@ -622,12 +726,17 @@ def sweep_handshake_anomalies(
             for unit in pack["units"]
             for member in unit["members"]
         ]
-        transition_group = getattr(parser, "transition_group", None)
-        group_context = (
-            transition_group(list(pack["paths"]))
-            if transition_group is not None and pack["paths"]
-            else nullcontext(False)
-        )
+        event_group = getattr(parser, "_event_transition_group", None)
+        transition_group = event_group or getattr(parser, "transition_group", None)
+        group_context = nullcontext(False)
+        if transition_group is not None and pack["paths"]:
+            if event_group is not None:
+                # Keep pack ownership while cursors demand-load their histories.
+                # The existing context handles older native ABIs and preserves
+                # the original view, exact boundaries, and predecessor evidence.
+                group_context = event_group(list(pack["paths"]), start_ps, end_ps)
+            else:
+                group_context = transition_group(list(pack["paths"]))
         if transition_group is None and getattr(parser, '_event_batch', None) and pack['paths']:
             from .waveform_batch import sampling_batch
             group_context = sampling_batch(parser, list(pack['paths']), start_ps, end_ps)
@@ -636,7 +745,11 @@ def sweep_handshake_anomalies(
                 clock_count=int(pack.get("clock_count", 0)),
                 chunked=bool(pack.get("chunked")),
             )
-        with group_context:
+        with group_context as group_active:
+            streamed = stream_fsdb_pack(parser, pack_entries, resolution_cache,
+                wave_path=wave_path, start_ps=start_ps, end_ps=end_ps, edge=edge,
+                max_wait_cycles=max_wait_cycles, budget=stream_budget
+            ) if streaming and group_active else {}
             for nb, sampling_session in pack_entries:
                 # Per-interface cancellation checkpoint: an abandoned whole-design
                 # sweep stops at the next interface instead of finishing all of them.
@@ -657,20 +770,24 @@ def sweep_handshake_anomalies(
                 res: dict[str, Any] | None = None
                 try:
                     assert parser is not None
-                    res = inspect_handshake(
-                        get_parser=lambda _: parser, wave_path=wave_path,
-                        clock=nb["clock"], ready=nb["ready"], payload=nb["payload"],
-                        edge=edge, start_ps=start_ps, end_ps=end_ps,
-                        max_wait_cycles=max_wait_cycles,
-                        cursor_store=None,  # the sweep sets ONE cursor, not one per interface
-                        _sampling_session=sampling_session,
-                        _resolution_cache=resolution_cache,
-                        _compact_sampling=True,
-                        **nb["inspect_kwargs"],
-                    )
+                    if id(nb) in streamed:
+                        res, shared_ms = streamed[id(nb)]
+                    else:
+                        res = inspect_handshake(
+                            get_parser=lambda _: parser, wave_path=wave_path,
+                            clock=nb["clock"], ready=nb["ready"], payload=nb["payload"],
+                            edge=edge, start_ps=start_ps, end_ps=end_ps,
+                            max_wait_cycles=max_wait_cycles,
+                            cursor_store=None,  # the sweep sets ONE cursor, not one per interface
+                            _sampling_session=sampling_session,
+                            _resolution_cache=resolution_cache,
+                            _compact_sampling=True,
+                            **nb["inspect_kwargs"],
+                        )
                 finally:
                     operation_metrics.record_sweep_interface(
-                        (time.perf_counter() - inspect_started) * 1000.0,
+                        (shared_ms if id(nb) in streamed else
+                         (time.perf_counter() - inspect_started) * 1000.0),
                         completed=res is not None,
                         transition_truncated=bool(
                             res and res.get("transition_data_truncated")
@@ -743,7 +860,6 @@ def sweep_handshake_anomalies(
         reason = None
 
     coverage_warnings: list[str] = []
-    suggested_next_actions: list[dict[str, Any]] = []
     if not normalized:
         coverage_status = "zero_coverage"
         warning = (
@@ -757,16 +873,6 @@ def sweep_handshake_anomalies(
                 "from the dumped interface signals; retry without scope or with a "
                 "parent/interface scope."
             )
-            suggested_next_actions.append(
-                _retry_without_scope_action(
-                    wave_path=wave_path,
-                    edge=edge,
-                    start_ps=start_ps,
-                    end_ps=end_ps,
-                    max_wait_cycles=max_wait_cycles,
-                    max_interfaces=max_interfaces,
-                )
-            )
         coverage_warnings.append(warning)
     else:
         coverage_status = "complete"
@@ -776,31 +882,20 @@ def sweep_handshake_anomalies(
         coverage_warnings.append(
             f"COVERAGE TRUNCATED: {discovered} interfaces discovered but only "
             f"{len(to_inspect)} swept (max_interfaces={max_interfaces}). The dropped "
-            "interfaces are the tail of suggest's ordering; re-run with "
-            f"max_interfaces>={discovered} to inspect more discovered candidates. "
-            "This does not repair discovery or skipped-row gaps."
-        )
-        suggested_next_actions.append(
-            _retry_truncated_action(
-                wave_path=wave_path,
-                edge=edge,
-                start_ps=start_ps,
-                end_ps=end_ps,
-                max_wait_cycles=max_wait_cycles,
-                discovered_count=discovered,
-                max_interfaces=max_interfaces,
-                scope=scope,
-            )
+            "interfaces are the tail of suggest's ordering. A larger cap checks "
+            "more discovered candidates but does not repair discovery, transition "
+            "or skipped-row gaps. Choose a follow-up for the actual limits."
         )
     if transition_truncated_count:
         if coverage_status == "complete":
             coverage_status = "degraded"
         coverage_warnings.append(
-            "COVERAGE DEGRADED: native transition data was truncated for "
+            "COVERAGE DEGRADED: transition data was truncated for "
             f"{transition_truncated_count} inspected interface(s). Findings and "
             "zero counts cover only returned prefixes; flagged_count=0 is not a "
-            "clean-protocol conclusion. Narrow the time window for a complete "
-            "targeted check until bounded-memory streaming is available."
+            "clean-protocol conclusion. Choose a shorter failure-correlated time "
+            "window and inspect its coverage. Without a verified time anchor, "
+            "no narrower window is inferred."
         )
 
     if discovery_incomplete:
@@ -843,7 +938,6 @@ def sweep_handshake_anomalies(
         "discovery": discovery,
         "coverage_status": coverage_status,
         "coverage_warnings": coverage_warnings,
-        "suggested_next_actions": suggested_next_actions,
         "finding_summary": finding_summary,
         "interfaces": interfaces,
         "skipped": skipped,
@@ -851,6 +945,9 @@ def sweep_handshake_anomalies(
         "note": note,
         "reason": reason,
     }
+    result["suggested_next_actions"] = build_sweep_followup_actions({
+        **result, "max_wait_cycles": max_wait_cycles, "max_interfaces": max_interfaces,
+    })
     operation_metrics.set_value(
         "sweep_result_build_ms",
         (time.perf_counter() - result_build_started) * 1000.0,

@@ -12,6 +12,7 @@ import sys
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from src.npi_lsf import (  # type: ignore
+        MAX_WORKER_REQUEST_BYTES,
         WorkerError,
         execute_worker_request,
         parse_worker_request_bytes,
@@ -19,6 +20,7 @@ if __package__ in (None, ""):
     )
 else:
     from .npi_lsf import (
+        MAX_WORKER_REQUEST_BYTES,
         WorkerError,
         execute_worker_request,
         parse_worker_request_bytes,
@@ -40,12 +42,21 @@ def main(argv: list[str] | None = None) -> int:
     response_path = Path(args.response)
 
     try:
-        request = parse_worker_request_bytes(request_path.read_bytes())
+        with request_path.open("rb") as stream:
+            data = stream.read(MAX_WORKER_REQUEST_BYTES + 1)
+        request = parse_worker_request_bytes(data)
     except Exception:  # noqa: BLE001
+        try:
+            import json
+            raw = json.loads(data.decode("utf-8"))
+            version = raw.get("protocol_version") if isinstance(raw, dict) else None
+        except Exception:
+            version = None
         try:
             write_worker_response(
                 response_path,
-                WorkerError(error_code="request_invalid", stage="request"),
+                WorkerError(protocol_version=version if version in {"4.0", "5.0"} else "5.0",
+                            error_code="request_invalid", stage="request"),
             )
         except Exception:  # noqa: BLE001
             return 2

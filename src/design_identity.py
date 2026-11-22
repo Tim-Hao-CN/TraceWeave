@@ -24,6 +24,7 @@ from .sv_preprocessor import extract_preprocessor_options
 
 IDENTITY_VERSION = "1"
 _INCLUDE = re.compile(r'^\s*`include\s+([^\r\n]+)', re.MULTILINE)
+_INCLUDE_LOOKUP_MEMO_LIMIT = 4096
 
 
 def _digest(value: object) -> str:
@@ -72,7 +73,23 @@ class DesignIdentity:
             check_cancelled()
             if os.path.realpath(path) != record.path or not _content_current(record):
                 return False
-        return all(_resolve(name, dirs) == chosen for name, dirs, chosen in self.includes)
+        # Repeated directives may have the exact same ordered search path.
+        # Share only within this validation: a later call must observe new
+        # shadow candidates and changed aliases, including previously absent
+        # includes. Keep the expected choice check for every captured entry.
+        resolved = {}
+        for name, directories, chosen in self.includes:
+            check_cancelled()
+            key = (name, directories)
+            try:
+                actual = resolved[key]
+            except KeyError:
+                actual = _resolve(name, directories)
+                if len(resolved) < _INCLUDE_LOOKUP_MEMO_LIMIT:
+                    resolved[key] = actual
+            if actual != chosen:
+                return False
+        return True
 
 
 class DesignIdentityReader:
@@ -80,10 +97,59 @@ class DesignIdentityReader:
 
     def __init__(self, max_entries: int = 32768, max_bytes: int = 16 * 1024 * 1024):
         self._facts: OrderedDict[str, tuple] = OrderedDict()
+        self._identities: OrderedDict[str, tuple[DesignIdentity, int]] = OrderedDict()
         self._lock = threading.Lock()
         self.max_entries = max_entries
         self.max_bytes = max_bytes
         self._bytes = 0
+        # Immutable digest/stat/include facts only. This small tier avoids
+        # reconstructing an unchanged include graph on every continuation;
+        # every hit still validates bytes, aliases and include resolution.
+        self._identity_bytes = 0
+        self._identity_max_bytes = min(max_bytes, 8 * 1024 * 1024)
+        self._identity_max_entries = min(max_entries, 4)
+
+    def _cached_identity(self, key):
+        with self._lock:
+            cached = self._identities.get(key)
+        if cached is None:
+            return None
+        current = cached[0].current()
+        with self._lock:
+            if self._identities.get(key) is cached:
+                if current:
+                    self._identities.move_to_end(key)
+                else:
+                    self._identity_bytes -= self._identities.pop(key)[1]
+        return cached[0] if current else None
+
+    def _remember_identity(self, key, identity):
+        # Charge each retained string object once. Include search tuples share
+        # the same immutable directory strings; charging their contents per
+        # include would overestimate a SoC identity by tens of megabytes.
+        seen = set()
+        def strings(values):
+            total = 0
+            for value in values:
+                if value is not None and id(value) not in seen:
+                    seen.add(id(value))
+                    total += 64 + 4 * len(value)
+            return total
+        size = 1024
+        for path, record in identity.records:
+            size += 1024 + strings((path, record.path, record.sha256, *record.objective_exclusions))
+        for name, dirs, chosen in identity.includes:
+            size += 256 + 8 * len(dirs) + strings((name, *dirs, chosen))
+        if not self._identity_max_entries or size > self._identity_max_bytes:
+            return
+        with self._lock:
+            previous = self._identities.pop(key, None)
+            self._identity_bytes -= previous[1] if previous else 0
+            self._identities[key] = (identity, size)
+            self._identity_bytes += size
+            while (len(self._identities) > self._identity_max_entries
+                   or self._identity_bytes > self._identity_max_bytes):
+                self._identity_bytes -= self._identities.popitem(last=False)[1][1]
 
     def _read(self, path, reader):
         canonical = os.path.realpath(path)
@@ -111,11 +177,20 @@ class DesignIdentityReader:
     def capture(self, compile_log: str, compile_result: dict, *, reader=read_source_content) -> DesignIdentity:
         check_cancelled()
         inputs = [str(f["path"]) for f in compile_result.get("files", {}).get("user", []) if f.get("path")]
+        # Option replay resolves environment variables, command files and
+        # directory aliases. Refresh it before memo lookup: unchanged source
+        # bytes alone cannot prove that an include search path is unchanged.
+        options = extract_preprocessor_options(compile_result, inputs[0] if inputs else compile_log)
+        context_key = _digest({"version": IDENTITY_VERSION, "compile_log": compile_log,
+                               "context": compile_result, "cwd": os.getcwd(),
+                               "options": [options.macros, options.include_dirs, options.complete]})
+        cached = self._cached_identity(context_key)
+        if cached is not None:
+            return cached
         issues = set()
         includes_complete = True
         if not inputs or compile_result.get("parse_warnings"):
             issues.add("compile_inputs_incomplete")
-        options = extract_preprocessor_options(compile_result, inputs[0] if inputs else compile_log)
         if not options.complete:
             issues.add("compile_options_incomplete")
         support = _compile_evidence_support_paths(compile_result) | _include_support_paths(compile_result)
@@ -170,4 +245,6 @@ class DesignIdentityReader:
         result = DesignIdentity(digest, tuple(records), tuple(resolutions), tuple(sorted(issues)), includes_complete)
         if result.complete and not result.current():
             return DesignIdentity(digest, result.records, result.includes, ("input_changed_during_capture",), includes_complete)
+        if result.complete:
+            self._remember_identity(context_key, result)
         return result

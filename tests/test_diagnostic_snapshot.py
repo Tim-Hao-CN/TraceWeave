@@ -278,6 +278,41 @@ def _reset_session_state():
 
 
 class TestDiagnosticSnapshot:
+    @pytest.mark.parametrize("has_cached_scan", [False, True])
+    def test_scan_opt_out_preserves_manual_evidence_without_missing_step(
+        self, monkeypatch, has_cached_scan
+    ):
+        monkeypatch.setattr(server, "STRUCTURAL_SCAN_IN_WORKFLOW", False)
+        _prefill_all()
+        if not has_cached_scan:
+            server._result_cache["scan_structural_risks"] = None
+            server._result_provenance["scan_structural_risks"] = None
+
+        result = server._handle_diagnostic_snapshot({})
+
+        assert all(step["tool"] != "scan_structural_risks" for step in result.missing_steps or [])
+        assert result.structural_scan.available is has_cached_scan
+        assert result.structural_scan.suggested_call is None
+        assert result.structural_scan.summary["workflow_enabled"] is False
+        if has_cached_scan:
+            assert result.structural_scan.summary["total_risks"] == 3
+            assert "status" not in result.structural_scan.summary
+        else:
+            assert result.structural_scan.summary["status"] == "skipped_by_policy"
+            assert result.structural_scan.summary["coverage_status"] == "not_run"
+            assert "unchecked" in result.structural_scan.summary["reason"]
+
+    def test_scan_opt_out_keeps_stale_manual_results_stale(self, monkeypatch):
+        monkeypatch.setattr(server, "STRUCTURAL_SCAN_IN_WORKFLOW", False)
+        _prefill_all()
+        server._result_provenance["scan_structural_risks"]["compile_log"] = "/tmp/other_compile.log"
+
+        result = server._handle_diagnostic_snapshot({})
+
+        assert result.structural_scan.stale is True
+        assert result.structural_scan.summary["workflow_enabled"] is False
+        assert all(step["tool"] != "scan_structural_risks" for step in result.missing_steps or [])
+
     def test_empty_session_returns_all_unavailable(self):
         result = server._handle_diagnostic_snapshot({})
 
@@ -315,12 +350,14 @@ class TestDiagnosticSnapshot:
         assert result.simulator == "xcelium"
         assert len(result.missing_steps) == 3
         assert {step["tool"] for step in result.missing_steps} == {
-            "build_tb_hierarchy",
+            "scan_structural_risks",
             "parse_sim_log",
             "recommend_failure_debug_next_steps",
         }
         assert result.log_analysis.suggested_call["arguments"]["log_path"] == sim.sim_logs[0].path
-        assert result.recommended_next.suggested_call is None
+        assert result.hierarchy.suggested_call is None
+        assert result.design_context.suggested_call["tool"] == "get_tb_subtree"
+        assert result.recommended_next.suggested_call["arguments"]["compile_log"] == sim.compile_logs[0].path
 
     def test_all_available(self):
         _prefill_all()
@@ -340,6 +377,11 @@ class TestDiagnosticSnapshot:
             "total_risks": 3,
             "high_risk_count": 2,
             "semantic_status": "not_run",
+            "semantic_backend": "none",
+            "semantic_category_coverage": [],
+            "semantic_result_groups": [],
+            "semantic_backend_attempts": [],
+            "semantic_native_execution": {},
             "semantic_fact_count": 0,
             "analysis_mode": "auto",
             "lexical_coverage_status": "complete",
@@ -413,7 +455,7 @@ class TestDiagnosticSnapshot:
         assert result.protocol_health.available is True
         assert result.protocol_health.summary["coverage_status"] == "zero_coverage"
         assert result.protocol_health.suggested_call == retry
-        assert "sweep_handshakes" in [s["tool"] for s in result.missing_steps]
+        assert "sweep_handshakes" not in [s["tool"] for s in (result.missing_steps or [])]
 
     def test_unscoped_zero_coverage_is_not_retried_or_called_a_pass(self):
         _prefill_all()
@@ -455,16 +497,38 @@ class TestDiagnosticSnapshot:
         assert result.protocol_health.suggested_call is None
         assert "sweep_handshakes" not in [s["tool"] for s in (result.missing_steps or [])]
 
-    def test_sweep_recommended_when_waveform_and_failures(self):
+    def test_sweep_option_when_waveform_and_protocol_symptom(self):
         _prefill_all()
         server._result_cache["sweep_handshakes"] = None  # not run yet
+        server._result_cache["parse_sim_log"].protocol_symptom_hint = "Possible protocol symptom."
 
         result = server._handle_diagnostic_snapshot({})
 
         assert result.protocol_health is not None
         assert result.protocol_health.available is False
         assert result.protocol_health.suggested_call["arguments"]["wave_path"].endswith(".vcd")
-        assert "sweep_handshakes" in [s["tool"] for s in result.missing_steps]
+        assert result.protocol_health.summary["coverage_status"] == "not_run"
+        assert "sweep_handshakes" not in [s["tool"] for s in (result.missing_steps or [])]
+
+    def test_unchecked_waveform_without_protocol_symptom_has_no_sweep_nudge(self):
+        _prefill_all()
+        server._result_cache["sweep_handshakes"] = None
+
+        result = server._handle_diagnostic_snapshot({})
+
+        assert result.protocol_health.summary["coverage_status"] == "not_run"
+        assert result.protocol_health.suggested_call is None
+        assert "sweep_handshakes" not in [s["tool"] for s in (result.missing_steps or [])]
+
+    def test_sweep_for_another_waveform_is_stale_and_not_retried(self):
+        _prefill_all()
+        server._result_cache["sweep_handshakes"].wave_path = "/tmp/earlier-run.vcd"
+
+        result = server._handle_diagnostic_snapshot({})
+
+        assert result.protocol_health.stale is True
+        assert result.protocol_health.summary["wave_path"] == "/tmp/earlier-run.vcd"
+        assert result.protocol_health.suggested_call is None
 
     def test_sweep_not_recommended_on_clean_run(self):
         _prefill_all()
@@ -473,7 +537,8 @@ class TestDiagnosticSnapshot:
 
         result = server._handle_diagnostic_snapshot({})
 
-        assert result.protocol_health is None
+        assert result.protocol_health.summary["coverage_status"] == "not_run"
+        assert result.protocol_health.suggested_call is None
         assert "sweep_handshakes" not in [s["tool"] for s in (result.missing_steps or [])]
 
     def test_sweep_not_recommended_without_waveform(self):
@@ -582,10 +647,14 @@ class TestDiagnosticSnapshot:
         }
         result = server._handle_diagnostic_snapshot({})
 
-        assert result.hierarchy.suggested_call["arguments"]["compile_log"] == sim.compile_logs[0].path
+        assert result.hierarchy.suggested_call is None
+        assert result.design_context.suggested_call["arguments"] == {
+            "compile_log": sim.compile_logs[0].path, "simulator": "xcelium"}
         assert result.log_analysis.suggested_call["arguments"]["log_path"] == sim.sim_logs[0].path
         assert result.log_analysis.suggested_call["arguments"]["simulator"] == "xcelium"
-        assert result.recommended_next.suggested_call is None
+        assert result.recommended_next.suggested_call["arguments"] == {
+            "compile_log": sim.compile_logs[0].path, "simulator": "xcelium",
+            "log_path": sim.sim_logs[0].path, "wave_path": sim.wave_files[0].path}
 
     def test_fresh_sections_have_stale_false(self):
         _prefill_all()
@@ -1007,11 +1076,10 @@ class TestDiagnosticSnapshot:
 
         assert [step["tool"] for step in result.missing_steps] == [
             "scan_structural_risks",
-            "sweep_handshakes",
             "recommend_failure_debug_next_steps",
         ]
 
-    def test_snapshot_does_not_request_scan_when_hierarchy_is_stale(self):
+    def test_snapshot_requests_scan_from_discovery_when_hierarchy_is_stale(self):
         _prefill_all()
         server._result_cache["scan_structural_risks"] = None
         server._result_provenance["scan_structural_risks"] = None
@@ -1023,7 +1091,11 @@ class TestDiagnosticSnapshot:
         result = server._handle_diagnostic_snapshot({})
 
         assert result.hierarchy.stale is True
-        assert all(step["tool"] != "scan_structural_risks" for step in result.missing_steps)
+        scans = [step for step in result.missing_steps if step["tool"] == "scan_structural_risks"]
+        assert len(scans) == 1
+        assert scans[0]["arguments"] == {
+            "compile_log": "/tmp/verif/work/elab.log", "simulator": "xcelium"}
+        assert all(step["tool"] != "build_tb_hierarchy" for step in result.missing_steps)
 
 
 class TestDiagnosticSnapshotCaseIdentity:

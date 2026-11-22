@@ -13,6 +13,7 @@ This server provides waveform-debug workflow tools, including:
 
 import asyncio
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 import hashlib
 import inspect
 import json
@@ -56,6 +57,7 @@ from config import (
     MAX_CYCLES_PER_QUERY,
     MAX_WAVE_WINDOW_CYCLES,
     SIGNAL_SEARCH_MAX_KEYWORDS,
+    STRUCTURAL_SCAN_IN_WORKFLOW,
     TRANSITIONS_MAX_RETURNED,
     DEFAULT_MAX_GROUPS,
     DEFAULT_WAVE_WINDOW_PS,
@@ -70,7 +72,7 @@ import src.cancellation as cancellation
 import src.operation_metrics as operation_metrics
 from src.cancellation import OperationCancelled
 from src.clock_edge_cache import discard_clock_edges
-from src.log_parser import SimLogParser, diff_failure_events, get_error_context
+from src.log_parser import SimLogParser, diff_failure_events, get_error_context, observe_failure_events
 from src.vcd_parser import VCDParser
 from src.fsdb_parser import FSDBParser
 from src.fst_runtime import FST_BASIC_TOOLS, FST_SUPPORTED_TOOLS, FstError, fst_runtime_info
@@ -97,6 +99,7 @@ from src.hierarchy_handles import (
 from src.hierarchy_recovery import (
     BoundedSourceReader, HierarchyRecoveryRuntime, RecoveryBlocked, RecoveryLimits,
 )
+from src.legacy_context_observations import verify_legacy_source_observations
 from src.source_graph_adapter import (
     AdapterStatus,
     build_source_graph_frontier_plan,
@@ -131,7 +134,7 @@ from src.verify_condition import (
     _resolve_signal_path,
 )
 from src.handshake_suggest import suggest_handshakes, suggest_protocol_bundles
-from src.handshake_sweep import sweep_handshake_anomalies
+from src.handshake_sweep import sweep_handshake_anomalies, build_sweep_followup_actions, sweep_coverage_gaps
 from src.window_verify import verify_window
 from src.txn_reconstruct import reconstruct_transactions
 from src.tlul import inspect_tlul
@@ -149,7 +152,12 @@ from src.tb_hierarchy_builder import (
 from src.verdi_backend import probe_verdi_backend
 from src.structural_scanner import ALL_CATEGORIES, scan_structural_risks
 from src.structural_scan_runtime import StructuralScanRuntime
+from src.structural_native_runtime import StructuralNativeRuntime
 from src.design_identity import DesignIdentity, DesignIdentityReader
+import src.design_context_runtime as design_context_runtime
+from src.design_backend_binding import prepare_backend_binding, ExecutionBindingChanged
+from src.kdb_anchor import KdbBindingChanged
+from src.compile_input_capture import CaptureAborted, CaptureLimits
 from src.structural_semantic_runtime import SemanticScanRuntime, validate_semantic_options
 from src.structural_semantics import SEMANTIC_CATEGORIES
 from src.x_trace import inspect_upstream_values, trace_x_source
@@ -160,7 +168,7 @@ from src.cycle_query import (
     annotate_center_transients,
     get_signals_by_cycle,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 import src.schemas as schemas
 from src.evidence_output import serialize_compact_result
 from src.mcp_validation import recover_tool_input_errors
@@ -208,6 +216,10 @@ _log_snapshot_history: dict[tuple[str, ...], list[str]] = {}
 # cache entry - see _invalidate_downstream / _clear_simulation_result_state.
 _handle_store = HandleStore()
 
+# Explicit design handles have their own bounded process lifetime. Discovery
+# does not select, clear or silently rebind another caller's design context.
+_design_context_store = design_context_runtime.DesignContextStore()
+
 _hierarchy_recovery_runtime = HierarchyRecoveryRuntime()
 
 # Small process-session cache of parsed compile evidence.  It is populated
@@ -217,6 +229,7 @@ _COMPILE_CONTEXT_CACHE_MAX = 4
 _compile_context_cache: dict[str, dict] = {}
 _compile_source_index_runtime = CompileSourceIndexRuntime()
 _structural_scan_runtime = StructuralScanRuntime()
+_structural_native_runtime = StructuralNativeRuntime()
 _design_identity_reader = DesignIdentityReader()
 _semantic_scan_runtime = SemanticScanRuntime()
 
@@ -240,9 +253,9 @@ _PREREQUISITES: dict[str, list[str]] = {
     "parse_sim_log": ["get_sim_paths"],
     "diff_sim_failure_results": ["get_sim_paths"],
     "get_error_context": ["get_sim_paths"],
-    "recommend_failure_debug_next_steps": ["get_sim_paths", "build_tb_hierarchy"],
-    "analyze_failures": ["get_sim_paths", "build_tb_hierarchy"],
-    "analyze_failure_event": ["get_sim_paths", "build_tb_hierarchy"],
+    "recommend_failure_debug_next_steps": ["get_sim_paths"],
+    "analyze_failures": ["get_sim_paths"],
+    "analyze_failure_event": ["get_sim_paths"],
     "explain_signal_driver": ["build_tb_hierarchy"],
     "find_signal_loads": ["build_tb_hierarchy"],
     "trace_signal_path": ["build_tb_hierarchy"],
@@ -275,8 +288,8 @@ _PREREQUISITE_REASONS: dict[str, str] = {
         "file paths, and FSDB runtime status."
     ),
     "build_tb_hierarchy": (
-        "build_tb_hierarchy must be called first to build the testbench "
-        "hierarchy used for source-aware analysis."
+        "This legacy handle requires an explicit build_tb_hierarchy view. "
+        "Independent design_handle queries use prepare_design_context."
     ),
 }
 
@@ -376,6 +389,12 @@ def _check_prerequisites(tool_name: str, args: dict | None = None) -> dict | Non
         if _session_state[step] is None and not _restore_prerequisite_state_from_cache(
             step, tool_name, args
         ):
+            if step == "build_tb_hierarchy" and tool_name not in _HANDLE_TOOL_NAMES:
+                return schemas.PrerequisiteBlockResult(
+                    ok=False, error_code="missing_prerequisite", missing_step="compile_metadata",
+                    required_before=tool_name,
+                    reason="Provide compile_log, or kdb_path with top_hint, for native-first querying. An explicit design_handle retains strict source identity.",
+                    suggested_call={"tool": "get_sim_paths", "arguments": {}})
             block = {
                 "ok": False,
                 "error_code": "missing_prerequisite",
@@ -388,19 +407,21 @@ def _check_prerequisites(tool_name: str, args: dict | None = None) -> dict | Non
     return None
 
 
-def _build_suggested_call(step: str) -> dict:
+def _build_suggested_call(
+    step: str, *, sim_paths: schemas.SimPathsResult | None = None,
+) -> dict:
     if step == "get_sim_paths":
         return {"tool": "get_sim_paths", "arguments": {}}
-    if step == "build_tb_hierarchy":
-        sim_state = _session_state.get("get_sim_paths")
+    if step in {"build_tb_hierarchy", "prepare_design_context"}:
+        sim_state = _session_state.get("get_sim_paths") or _result_provenance.get("get_sim_paths")
         if sim_state and sim_state.get("compile_log"):
             args: dict = {"compile_log": sim_state["compile_log"]}
             if sim_state.get("simulator"):
                 args["simulator"] = sim_state["simulator"]
-            return {"tool": "build_tb_hierarchy", "arguments": args}
-        return {"tool": "build_tb_hierarchy", "arguments": {}}
+            return {"tool": step, "arguments": args}
+        return {"tool": step, "arguments": {}}
     if step == "parse_sim_log":
-        sim_result = _result_cache.get("get_sim_paths")
+        sim_result = sim_paths if sim_paths is not None else _result_cache.get("get_sim_paths")
         if sim_result and sim_result.sim_logs:
             return {
                 "tool": "parse_sim_log",
@@ -420,9 +441,9 @@ def _build_suggested_call(step: str) -> dict:
                 args["wave_path"] = sim_result.wave_files[0].path
             if sim_result.simulator:
                 args["simulator"] = sim_result.simulator
-        hier_state = _session_state.get("build_tb_hierarchy")
-        if hier_state and hier_state.get("compile_log"):
-            args["compile_log"] = hier_state["compile_log"]
+        sim_state = _session_state.get("get_sim_paths") or _result_provenance.get("get_sim_paths") or {}
+        if sim_state.get("compile_log"):
+            args["compile_log"] = sim_state["compile_log"]
         return {"tool": "recommend_failure_debug_next_steps", "arguments": args}
     if step == "sweep_handshakes":
         args: dict = {}
@@ -586,6 +607,8 @@ _NPI_SKIPPED_BY_POLICY = "npi_skipped_by_policy"
 
 
 def _resolve_session_simulator(args: dict) -> str:
+    if args.get("_native_query") is not None:
+        return args["_native_query"].context.simulator
     explicit = args.get("simulator")
     if explicit and explicit != "auto":
         return explicit
@@ -811,12 +834,14 @@ async def _resolve_connectivity_hierarchy_context(
 ) -> tuple[dict | None, str, dict | None, str | None]:
     """Prefer a full hierarchy, then optionally prove a bounded one."""
 
+    prepared = args.get("_prepared_design") or args.get("_native_query")
     bound = args.get("_bound_context")
     if bound is not None:
         return bound.hierarchy, bound.snapshot, None, None
 
-    hierarchy_result, snapshot = _resolve_hierarchy_context(
-        args["compile_log"], simulator
+    hierarchy_result, snapshot = (
+        (None, prepared.context.identity_sha256) if prepared is not None
+        else _resolve_hierarchy_context(args["compile_log"], simulator)
     )
     if hierarchy_result is not None or args.get("allow_bounded_bootstrap") is not True:
         return hierarchy_result, snapshot, None, None
@@ -845,11 +870,14 @@ async def _resolve_connectivity_hierarchy_context(
             code,
         )
 
-    cached = _resolve_cached_compile_context(
-        compile_log=args["compile_log"],
-        simulator=simulator,
+    cached = ({
+        "compile_result": prepared.context.compile_result(),
+        "simulator": prepared.context.simulator,
+        "snapshot_sha256": prepared.context.identity_sha256,
+    } if prepared is not None else _resolve_cached_compile_context(
+        compile_log=args["compile_log"], simulator=simulator,
         supplementary_compile_logs=supplementary_logs,
-    )
+    ))
     if cached is not None:
         compile_result = cached["compile_result"]
         context_simulator = str(cached.get("simulator") or simulator)
@@ -1079,20 +1107,23 @@ def get_hierarchy_recovery_limits() -> RecoveryLimits:
     )
 
 
-def _build_recovery_context(ctx: dict, limits: RecoveryLimits):
+def _build_recovery_context(ctx: dict, limits: RecoveryLimits, *, prepared=None):
     """Pure worker: build and revalidate; never publish shared session state."""
     from src.divergence_compare import file_identity
     paths = [ctx["compile_log"], *ctx["supplementary_compile_logs"]]
     if any(file_identity(path) is None for path in paths):
         raise RecoveryBlocked("hierarchy_recovery_log_unavailable")
     logs_id = log_identity(ctx)
-    detected = detect_simulator(ctx["compile_log"])
+    detected = prepared.simulator if prepared is not None else detect_simulator(ctx["compile_log"])
     if (detected in {"vcs", "xcelium", "verilator"}
             and ctx["simulator"] not in {"auto", detected}):
         raise RecoveryBlocked("compile_context_changed")
-    compile_result, simulator = _parse_merged_compile_context(
-        compile_log=ctx["compile_log"], simulator=ctx["simulator"],
-        supplementary_compile_logs=ctx["supplementary_compile_logs"])
+    if prepared is not None:
+        compile_result, simulator = prepared.compile_result(), prepared.simulator
+    else:
+        compile_result, simulator = _parse_merged_compile_context(
+            compile_log=ctx["compile_log"], simulator=ctx["simulator"],
+            supplementary_compile_logs=ctx["supplementary_compile_logs"])
     if simulator not in {"vcs", "xcelium", "verilator"}:
         raise RecoveryBlocked("compile_context_ambiguous")
     if ctx["simulator"] not in {"auto", simulator}:
@@ -1134,6 +1165,95 @@ def _build_recovery_context(ctx: dict, limits: RecoveryLimits):
     return bound
 
 
+@dataclass(frozen=True)
+class _DesignRecoveryReference:
+    design_handle: str
+    context: dict
+    metrics: dict
+    gaps: tuple[str, ...]
+
+
+def _recovered_compile_context(ctx, context, logs_id):
+    """Retain historical tokens, verifying their original meaning."""
+    if ctx["simulator"] not in ("auto", context.simulator):
+        raise RecoveryBlocked("compile_context_changed")
+    result = context.compile_result()
+    evidence = result.get("compile_evidence") or {}
+    tops = tuple(dict.fromkeys(result.get("top_modules") or ()))
+    top = result.get("primary_top") or (tops[0] if len(tops) == 1 else None)
+    if (evidence.get("merge_conflicts") or evidence.get("merge_status") == "conflict"
+            or not top or (not ctx.get("top_hint") and len(tops) != 1)):
+        raise RecoveryBlocked("compile_context_ambiguous")
+    if ctx.get("top_hint") not in (None, top) or context.selected_top != top:
+        raise RecoveryBlocked("compile_context_changed")
+    exact = {**ctx, "simulator": context.simulator, "top_hint": top,
+             "compile_log_identity_sha256": logs_id,
+             "snapshot_sha256": compute_snapshot_fingerprint(
+                 ctx["compile_log"], context.simulator, ctx["supplementary_compile_logs"]),
+             "hierarchy_handle": compute_handle(
+                 ctx["compile_log"], context.simulator, ctx["supplementary_compile_logs"])}
+    for field in ("compile_log_identity_sha256", "snapshot_sha256", "hierarchy_handle"):
+        if ctx.get(field) not in (None, exact[field]):
+            raise RecoveryBlocked("compile_context_changed")
+    if log_identity(ctx) != logs_id:
+        raise RecoveryBlocked("compile_context_changed")
+    return exact
+
+
+def _prepare_driver_recovery(ctx, limits, store):
+    """Worker returns an unpublished design ticket, or source compatibility tree."""
+    deadline = time.monotonic() + limits.timeout_sec
+
+    def remaining():
+        cancellation.check_cancelled()
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise CaptureAborted("timeout")
+        return value
+
+    def capture_limits():
+        return CaptureLimits(max_files=limits.max_source_files,
+                             max_bytes=limits.max_source_bytes, timeout_sec=remaining())
+
+    from src.divergence_compare import file_identity
+    if any(file_identity(path) is None for path in
+           (ctx["compile_log"], *ctx["supplementary_compile_logs"])):
+        raise RecoveryBlocked("hierarchy_recovery_log_unavailable")
+    logs_id = log_identity(ctx)
+    # Auto-detection is bounded by the capture too; a FIFO log cannot block
+    # an unguarded preliminary simulator probe.
+    context = design_context_runtime.prepare_design_context(
+        ctx["compile_log"], supplementary_compile_logs=ctx["supplementary_compile_logs"],
+        simulator="auto", limits=capture_limits())
+    exact = _recovered_compile_context(ctx, context, logs_id)
+    for code in ("file_limit", "byte_limit", "reference_limit", "dependency_work_limit"):
+        if "source_capture_" + code in context.gaps:
+            raise CaptureAborted(code)
+    binding = prepare_backend_binding(context, timeout_sec=remaining())
+    if not binding.npi_candidate:
+        # Source compatibility still uses the old full hierarchy until the
+        # semantic planner migration. No native query has been attempted.
+        bound = _build_recovery_context(ctx, replace(limits, timeout_sec=remaining()), prepared=context)
+        if not context.current(timeout_sec=remaining()):
+            raise RecoveryBlocked("compile_context_changed")
+        bound.hierarchy["_hierarchy_recovery_preparation_metrics"] = {
+            **dict(context.metrics), **dict(binding.metrics)}
+        return bound
+    if ctx.get("source_snapshot_sha256") is not None:
+        context = verify_legacy_source_observations(
+            context, ctx["source_snapshot_sha256"], limits=capture_limits())
+        # The additional historical observations change only identity, not
+        # compilation or KDB selection. Do not discover the same KDB again.
+        binding = replace(binding, context_identity_sha256=context.identity_sha256)
+    ticket = store.prepare_registration(context, timeout_sec=remaining())
+    binding.require_current(timeout_sec=min(5, remaining()))
+    exact = _recovered_compile_context(ctx, context, logs_id)
+    if not context.metadata_current():
+        raise RecoveryBlocked("compile_context_changed")
+    remaining()
+    return ticket, binding, exact
+
+
 async def _resolve_explicit_driver_context(raw: dict):
     """Recover only an unavailable explicit context, once, under hard bounds."""
     started = time.perf_counter()
@@ -1142,6 +1262,15 @@ async def _resolve_explicit_driver_context(raw: dict):
     ctx["compile_log"] = os.path.abspath(ctx["compile_log"])
     ctx["supplementary_compile_logs"] = [os.path.abspath(p) for p in ctx["supplementary_compile_logs"]]
     store = _handle_store
+    design_store = _design_context_store
+    runtime = _hierarchy_recovery_runtime
+    recovery_key = hashlib.sha256(json.dumps(ctx, sort_keys=True).encode()).hexdigest()
+
+    def ensure_owner():
+        if (store is not _handle_store or design_store is not _design_context_store
+                or runtime is not _hierarchy_recovery_runtime):
+            raise design_context_runtime.ContextUnavailable("design_context_generation_changed")
+
     try:
         limits = get_hierarchy_recovery_limits()
         receipt.update(timeout_sec=limits.timeout_sec, max_source_files=limits.max_source_files,
@@ -1149,36 +1278,81 @@ async def _resolve_explicit_driver_context(raw: dict):
         with anyio.fail_after(limits.timeout_sec):
             bound, reason = await _run_in_cancellable_thread(
                 lambda: resolve_divergence_context(ctx, store))
+            ensure_owner()
             if bound is None and reason != "hierarchy_unavailable":
                 raise RecoveryBlocked(reason)
             if bound is not None:
                 receipt["status"] = "hit_existing"
+            elif (handle := design_store.find_recovery(recovery_key)) is not None:
+                with design_store.pin(handle) as entry:
+                    exact = await _run_in_cancellable_thread(
+                        lambda: _recovered_compile_context(ctx, entry.context, log_identity(ctx)))
+                    ensure_owner()
+                    bound = _DesignRecoveryReference(handle, exact, {}, entry.context.gaps)
+                receipt["status"] = "hit_design_context"
             else:
                 receipt["attempted"] = True
                 # All explicit tokens, ordered logs, top, current log identity
                 # and limits participate in live sharing. No recent-case state.
-                key = json.dumps([ctx, log_identity(ctx), limits.__dict__], sort_keys=True)
+                logs_id = await _run_in_cancellable_thread(lambda: log_identity(ctx))
+                ensure_owner()
+                key = json.dumps([ctx, logs_id, limits.__dict__, id(design_store)], sort_keys=True)
 
                 async def build():
-                    recovered = await _run_in_cancellable_thread(lambda: _build_recovery_context(ctx, limits))
-                    # No await between successful identity validation and this
-                    # event-loop-owned publication. Cancelled workers never land.
+                    recovered = await _run_in_cancellable_thread(
+                        lambda: _prepare_driver_recovery(ctx, limits, design_store))
+                    await anyio.lowlevel.checkpoint()
+                    ensure_owner()
+                    if isinstance(recovered, tuple):
+                        ticket, binding, exact = recovered
+                        handle = design_store.publish(ticket, binding=binding, recovery_key=recovery_key)
+                        return _DesignRecoveryReference(
+                            handle, exact, {**dict(ticket.context.metrics), **dict(binding.metrics)},
+                            ticket.context.gaps)
                     store.register(recovered.context["hierarchy_handle"], recovered.hierarchy)
                     return recovered
 
-                bound, coalesced = await _hierarchy_recovery_runtime.run(key, build, timeout_sec=limits.timeout_sec)
-                receipt.update(status="rebuilt", coalesced=coalesced,
-                    **bound.hierarchy.get("_hierarchy_recovery_reads", {}))
-            receipt.update(hierarchy_handle=bound.context["hierarchy_handle"],
-                compile_context=bound.context,
+                remaining = limits.timeout_sec - (time.perf_counter() - started)
+                if remaining <= 0:
+                    raise TimeoutError
+                bound, coalesced = await runtime.run(key, build, timeout_sec=remaining)
+                ensure_owner()
+                receipt.update(coalesced=coalesced)
+                if isinstance(bound, _DesignRecoveryReference):
+                    receipt["status"] = "prepared_design"
+                else:
+                    receipt.update(status="rebuilt", **bound.hierarchy.get("_hierarchy_recovery_reads", {}),
+                                   preparation_metrics=bound.hierarchy.get("_hierarchy_recovery_preparation_metrics"))
+            if isinstance(bound, _DesignRecoveryReference):
+                receipt.update(design_handle=bound.design_handle, hierarchy_available=False,
+                               preparation_metrics=bound.metrics, context_gaps=list(bound.gaps))
+            else:
+                receipt.update(hierarchy_handle=bound.context["hierarchy_handle"], hierarchy_available=True)
+            receipt.update(
+                # Keep the exact request as the legacy replay key. The new
+                # design_handle is the current process identity; do not invent
+                # a historical source token when none was supplied.
+                compile_context=ctx if isinstance(bound, _DesignRecoveryReference) else bound.context,
                 identity_basis="validated_historical_source" if ctx.get("source_snapshot_sha256") else "current_sources",
                 note=("Source identity matches the supplied historical fingerprint; this does not establish waveform/source correspondence."
                       if ctx.get("source_snapshot_sha256") else
-                      "Established the current source context; historical simulation or session sources are not established."))
+                      "Established the current source context; historical simulation or session sources are not established.")
+                     + " Historical compile-log tokens contain stat identity, not archived log bytes.")
             return bound, "ready", receipt
     except TimeoutError:
         reason = "hierarchy_recovery_timeout"
     except RecoveryBlocked as exc:
+        reason = exc.code
+    except CaptureAborted as exc:
+        reason = {"input_changed": "compile_context_changed", "timeout": "hierarchy_recovery_timeout",
+                  "file_limit": "hierarchy_recovery_source_file_limit",
+                  "byte_limit": "hierarchy_recovery_source_byte_limit"}.get(
+                      exc.code, "hierarchy_recovery_" + exc.code)
+    except KdbBindingChanged:
+        reason = "kdb_identity_changed"
+    except ExecutionBindingChanged:
+        reason = "design_context_execution_changed"
+    except design_context_runtime.ContextUnavailable as exc:
         reason = exc.code
     except OperationCancelled as exc:
         raise asyncio.CancelledError from exc
@@ -1419,13 +1593,45 @@ def _update_session_state(tool_name: str, args: dict, result: dict):
 
 
 def reset_session_state():
+    global _design_context_store, _source_fallback_runtime, _native_failure_memory
+    if "_source_fallback_runtime" in globals():
+        _source_fallback_runtime.close()
+    from src.source_fallback_runtime import SourceFallbackRuntime
+    from src.native_query import NativeFailureMemory
+    _source_fallback_runtime = SourceFallbackRuntime()
+    _native_failure_memory = NativeFailureMemory()
+    _design_context_store = design_context_runtime.DesignContextStore()
     _session_state["get_sim_paths"] = None
     _session_state["build_tb_hierarchy"] = None
     _clear_simulation_result_state()
     _clear_formal_result_state()
+    if "_property_runs" in globals():
+        _property_runs.entries.clear()
+    if "_property_plans" in globals():
+        _property_plans.clear()
 
 
-SERVER_INSTRUCTIONS = """
+from src.source_fallback_runtime import SourceFallbackRuntime
+from src.native_query import NativeFailureMemory
+_source_fallback_runtime = SourceFallbackRuntime()
+_native_failure_memory = NativeFailureMemory()
+
+from src.property_runtime import PropertyRunRegistry, explain_properties
+from src.property_plan import PropertyPlanStore
+_property_runs = PropertyRunRegistry()
+_property_plans = PropertyPlanStore()
+
+
+_STRUCTURAL_SCAN_WORKFLOW_INSTRUCTION = (
+    "Run scan_structural_risks on the selected compile_log as usual."
+    if STRUCTURAL_SCAN_IN_WORKFLOW else
+    "Structural scanning is excluded from the default workflow by "
+    "TRACEWEAVE_STRUCTURAL_SCAN_IN_WORKFLOW=0. Do not call or resume "
+    "scan_structural_risks unless the user explicitly requests a structural scan. "
+    "This policy does not disable explicit scans; skipped checks are not passes."
+)
+
+SERVER_INSTRUCTIONS = ("""
 Choose the workflow from the artifact type:
 
 - For JasperGold/formal-run artifact discovery, start with get_formal_paths.
@@ -1456,9 +1662,16 @@ Simulation waveform debug workflow:
      identity, supported tools and recording gaps. Missing observations and
      partial coverage never establish a clean analysis.
 
-2. MUST call build_tb_hierarchy AND scan_structural_risks before analyzing failures.
-   Both independently parse the same compile_log — call them in parallel.
-   - build_tb_hierarchy: builds testbench hierarchy for source-aware analysis.
+2. """ + _STRUCTURAL_SCAN_WORKFLOW_INSTRUCTION + """
+   Pass the selected compile_log to connectivity, hierarchy/source, trace and failure tools:
+   native_first queries healthy NPI without capturing or validating full source.
+   Ordinary native unavailability automatically prepares source in that request;
+   native_route returns the real source_design_handle. Source association stays
+   unverified. Explicit prepare_design_context remains available for deliberate
+   source analysis, strict source identity and recovery; changed/expired source
+   handles require explicit preparation. Scan coverage remains independent.
+   - build_tb_hierarchy remains an explicit compatibility/full-tree option.
+     If a structural scan is also requested, run both in parallel on the same log.
      Use the selected primary compile_log and simulator from step 1. In a split
      VCS flow, pass complementary logs only through supplementary_compile_logs.
      Returns a slim payload (project, stats, tree_skeleton truncated to depth 2,
@@ -1480,10 +1693,12 @@ Simulation waveform debug workflow:
      * dump_tb_section is a heavy escape hatch — prefer the targeted tools
        above.
    - scan_structural_risks: detects static structural risks (slice_overlap, multi_drive, etc.).
-     Use the same compile_log and simulator. Do not wait for parse_sim_log results.
+     Follow the workflow policy above when deciding whether to scan. For a requested
+     scan, use the same compile_log and simulator; do not wait for parse_sim_log results.
      Structural risks that overlap with failing signal paths are high-priority root cause candidates.
 
-3. Call parse_sim_log with sim_logs[0].path and simulator from step 1 when sim_logs is non-empty.
+3. Call parse_sim_log(log_path=sim_logs[0].path, simulator=simulator) when sim_logs is non-empty.
+   Use the discovered suggested_calls entry; sim_log is a get_sim_paths input only.
    - Prefer normalized failure_events[].time_ps over re-parsing raw message text.
    - Use grouped errors to choose the first group_index to inspect.
    - first_group_context contains a small window (~12 lines each side) of raw log
@@ -1499,17 +1714,17 @@ Simulation waveform debug workflow:
    - For large error counts (>100), use detail_level="summary" first, then inspect specific groups with get_error_context or detail_level="full".
    - Default detail_level is "summary" to keep MCP responses below harness budget.
 
-4. MUST call sweep_handshakes after parse_sim_log on a failing run that has a
-   waveform — before recommend, analyze_failures, or any manual waveform reading.
-   This is the runtime-layer counterpart of scan_structural_risks (step 2): a
-   default-flow protocol-health scan over every AHB and valid/ready interface in
-   ONE call, returning a per-interface stall/deadlock/payload-hold fact table
-   (facts to judge, not a verdict).
-   - A scoreboard/data-compare failure is frequently the symptom of a lower-level
-     protocol problem, so run this BEFORE reading RTL line-by-line or scrubbing the
-     waveform by hand.
-   - Do not skip by default — same rule as scan_structural_risks. Skip only when
-     there is no waveform or the user explicitly asks.
+4. Choose waveform tools and their order from the current run, symptom and known
+   target. sweep_handshakes is an optional batch investigation, useful for opaque
+   timeout/hang or compare symptoms when the responsible interface is unknown.
+   - If the module is known, pass scope and an evidence-backed time window. If
+     the interface or signals are known, use inspect_handshake or targeted
+     waveform queries directly. Recommendation does not require a prior sweep.
+   - For build/elaboration failures, inspect the current diagnostics and source
+     inputs. A waveform from an earlier run does not establish behavior of the
+     changed source. Unknown run/phase association remains unknown.
+   - An unperformed sweep means protocol behavior is unchecked. Its absence or
+     incomplete coverage never requires automatic scanning or repeated retries.
    - Always interpret flagged_count together with coverage_status:
      zero_coverage means no protocol interfaces were checked and is NOT a pass;
      truncated/degraded means partial coverage, so flagged_count=0 is not a
@@ -1527,10 +1742,11 @@ Simulation waveform debug workflow:
 5. Call recommend_failure_debug_next_steps to get a default target and role-ranked signals.
 
 6. Call search_signals to confirm full hierarchical signal paths when needed.
-   - Derive keywords from build_tb_hierarchy output, error messages, recommend_failure_debug_next_steps, or RTL source.
+   - Derive keywords from on-demand hierarchy/source results, error messages, recommend_failure_debug_next_steps, or RTL source.
    - When reading RTL source, verify the path is in the compile set first —
      call get_tb_file_detail(path=...) or lookup_tb_files(...) with the
-     hierarchy_handle returned in step 2. The compile_log is the single
+      design_handle returned in step 2 (or an explicit legacy hierarchy_handle).
+      The compile_log is the single
      source of truth for which file version was actually compiled.
 
 7. Call analyze_failures with log_path, wave_path, simulator, and confirmed signal_paths.
@@ -1549,9 +1765,23 @@ Simulation waveform debug workflow:
    - get_signal_at_time for exact values
    - get_waveform_summary for waveform sanity checks
 
+   If connectivity ends with unsupported, shallow_only, an unresolved boundary,
+   or incomplete coverage, continue with the client's source-file reading tools.
+   First verify compiled file ownership with lookup_tb_files/get_tb_file_detail
+   using the same design_handle; metadata-only lookup remains useful when semantic
+   details are unavailable. Read the actual assignments, port bindings, parameters,
+   generate conditions and bit ranges, then trace candidate connections manually.
+   Cite file:line for each inferred hop and label it as source inference, separately
+   from TraceWeave backend facts. Use waveform/log evidence to check runtime values,
+   active branches and clock phases before assigning a root cause. Missing tool
+   coverage does not prove disconnection; retain unresolved elaboration/identity
+   gaps and respect confirmed tool exclusions, cancellation and user stop limits.
+   Do not repeat an unchanged unsupported query or require a full hierarchy build
+   merely to continue reading verified source files.
+
 9. Call get_diagnostic_snapshot at any time to check workflow state.
    - Does NOT execute any sub-steps; only reads cached results
-""".strip()
+""").strip()
 
 app = Server("traceweave", version=__version__, instructions=SERVER_INSTRUCTIONS)
 
@@ -1854,9 +2084,107 @@ async def _run_in_cancellable_thread(fn: Callable):
 
 
 async def _call_connectivity_backend(backend, fn: Callable):
-    if getattr(backend, "uses_external_worker", False):
-        return await _run_in_cancellable_thread(fn)
-    return fn()
+    started = time.monotonic()
+    try:
+        if getattr(backend, "uses_external_worker", False):
+            return await _run_in_cancellable_thread(fn)
+        return fn()
+    finally:
+        metrics = getattr(backend, "_native_metrics", None)
+        if metrics is not None:
+            metrics["npi_ms"] += (time.monotonic() - started) * 1000
+
+
+async def _handle_prepare_design_context(args: dict):
+    """Read/validate in a worker, then publish only on the requesting loop."""
+    try:
+        options = schemas.PrepareDesignContextOptions.model_validate(args)
+    except ValidationError:
+        return schemas.ToolErrorResult(
+            error="Invalid design context arguments.",
+            error_code="invalid_design_context_arguments",
+        )
+    started = time.monotonic()
+    deadline = started + options.timeout_sec
+    store = _design_context_store
+
+    def remaining():
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise CaptureAborted("timeout")
+        return budget
+
+    def prepare():
+        context = design_context_runtime.prepare_design_context(
+            options.compile_log,
+            supplementary_compile_logs=options.supplementary_compile_logs,
+            simulator=options.simulator,
+            top_hint=options.top_hint,
+            backend_preference=options.backend_preference,
+            kdb_path=options.kdb_path,
+            max_include_depth=options.max_include_depth,
+            limits=CaptureLimits(
+                max_files=options.max_files, max_bytes=options.max_bytes,
+                max_references=options.max_references, timeout_sec=remaining(),
+            ),
+        )
+        if options.context_identity_sha256 not in (None, context.identity_sha256):
+            raise design_context_runtime.ContextUnavailable("design_context_changed")
+        register_started = time.monotonic()
+        ticket = store.prepare_registration(context, timeout_sec=remaining())
+        return ticket, (time.monotonic() - register_started) * 1000
+
+    try:
+        with anyio.fail_after(remaining()):
+            ticket, registration_ms = await _run_in_cancellable_thread(prepare)
+            # Observe cancellation queued alongside worker completion before
+            # any shared state is changed. No await follows publication.
+            await anyio.lowlevel.checkpoint()
+            remaining()
+            if store is not _design_context_store:
+                raise design_context_runtime.ContextUnavailable("design_context_generation_changed")
+            context = ticket.context
+            result = schemas.PrepareDesignContextResult(
+                design_handle=ticket.handle,
+                context_identity_sha256=context.identity_sha256,
+                identity_verification=("matched_recovery_identity"
+                    if options.context_identity_sha256 is not None else "current_inputs"),
+                simulator=context.simulator,
+                selected_top=context.selected_top,
+                backend_preference=context.backend_preference,
+                preparation_status="partial" if context.gaps else "prepared",
+                source_snapshot_status="complete" if context.snapshot.complete else "partial",
+                include_resolution_status="complete" if context.include_resolution_complete else "partial",
+                capabilities=["compile_metadata", "source_observations"],
+                gaps=list(context.gaps),
+                metrics={
+                    **dict(context.metrics), "registration_ms": registration_ms,
+                    "retained_metadata_bytes": ticket.size,
+                    "total_ms": (time.monotonic() - started) * 1000,
+                },
+                recovery_context={
+                    "compile_log": context.ordered_compile_logs[0],
+                    "supplementary_compile_logs": list(context.ordered_compile_logs[1:]),
+                    "simulator": context.simulator, "top_hint": context.selected_top,
+                    "backend_preference": context.backend_preference,
+                    "kdb_path": context.requested_kdb_path,
+                    "context_identity_sha256": context.identity_sha256,
+                },
+            )
+            remaining()
+            store.publish(ticket)
+            return result
+    except TimeoutError:
+        code = "design_context_timeout"
+    except CaptureAborted as exc:
+        code = "design_context_changed" if exc.code == "input_changed" else "design_context_" + exc.code
+    except design_context_runtime.ContextUnavailable as exc:
+        code = exc.code
+    except OSError:
+        code = "compile_log_unavailable"
+    except ValueError:
+        code = "invalid_design_context"
+    return schemas.ToolErrorResult(error="Design context preparation did not complete.", error_code=code)
 
 
 async def _structural_query_context(compile_log, simulator, scope, mode, config):
@@ -2727,6 +3055,11 @@ def _finalize_public_connectivity_status(
                 status["kdb_error_count"] = npi_kdb_status["error_count"]
             if "error_log" in npi_kdb_status:
                 status["kdb_error_log"] = npi_kdb_status["error_log"]
+    if "kdb_load_status" in status:
+        if any(a.get("reason") in {"npi_load_failed", "npi_lsf_npi_unavailable"} for a in attempts):
+            status["kdb_load_status"] = "failed"
+        elif npi_kdb_status is not None or actual_backend == "verdi_npi":
+            status["kdb_load_status"] = "loaded"
     if actual_backend == "verdi_npi" and not status.get("kdb_degraded"):
         status["parser_match"] = "exact"
     return status
@@ -2928,13 +3261,34 @@ async def _bind_wave_design_root(args, simulator, signal_key="signal_path"):
     from src.wave_design_binding import bind_root
     if not args.get("wave_path") or not str(args.get(signal_key, "")).startswith("TOP."):
         return None
-    bound = args.get("_bound_context")
-    hierarchy, _ = ((bound.hierarchy, bound.snapshot) if bound is not None
-                    else _resolve_hierarchy_context(args["compile_log"], simulator))
-    if hierarchy is None:
-        return None
+    prepared = args.get("_prepared_design") or args.get("_native_query")
+    if prepared is not None:
+        compile_result = prepared.context.compile_result()
+        if compile_result is None:
+            from src.wave_design_binding import bind_kdb_root
+            from src.hierarchy_source_ir import HierarchyQueryBudget
+            remaining = prepared.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            if not getattr(prepared, "top_proven", False):
+                proof = await _query_prepared_hierarchy(prepared, "find_tb_instance",
+                    {"path": prepared.context.selected_top}, HierarchyQueryBudget(timeout_sec=remaining))
+                hits = proof.get("hits", ())
+                if (len(hits) != 1 or hits[0]["path"] != prepared.context.selected_top
+                        or hits[0].get("parent") is not None or proof.get("facts_origin") != "verdi_npi"):
+                    raise ValueError("wave_design_mapping_requires_native_top_proof")
+                prepared.top_proven = True
+            return await _run_in_wave_thread(args["wave_path"], lambda: bind_kdb_root(
+                _get_parser(args["wave_path"]), args[signal_key], kdb_top=prepared.context.selected_top))
+    else:
+        bound = args.get("_bound_context")
+        hierarchy, _ = ((bound.hierarchy, bound.snapshot) if bound is not None
+                        else _resolve_hierarchy_context(args["compile_log"], simulator))
+        if hierarchy is None:
+            return None
+        compile_result = hierarchy["compile_result"]
     return await _run_in_wave_thread(args["wave_path"], lambda: bind_root(
-        _get_parser(args["wave_path"]), args[signal_key], hierarchy["compile_result"],
+        _get_parser(args["wave_path"]), args[signal_key], compile_result,
         top_hint=args.get("top_hint")))
 
 
@@ -2971,7 +3325,7 @@ async def _attach_driver_dependencies(result, backend, args, simulator):
                 context = await _run_in_wave_thread(args['wave_path'], lambda: inventory(
                     step, _get_parser(args['wave_path']), binding=args.get('_wave_design_binding'),
                     engine=entry.query_engine if entry else None, deadline=deadline))
-    except OperationCancelled:
+    except (OperationCancelled, KdbBindingChanged, ExecutionBindingChanged, CaptureAborted):
         raise
     except TimeoutError:
         context = unavailable(backend.name, 'dependency_timeout')
@@ -2981,6 +3335,197 @@ async def _attach_driver_dependencies(result, backend, args, simulator):
         context['complete'] = False
         context['gaps'] = sorted(set(context['gaps']) | {'driver_set_incomplete'})
     result['dependency_context'] = context
+
+
+def _select_prepared_backend(entry, deferred):
+    """Use the handle's fixed candidate and policy without a new probe."""
+    from src.connectivity_backend import select_backend
+    binding = entry.binding
+    binding.require_policy_current()
+    status = binding.backend_status(npi_failure=entry.npi_failure)
+    status["connectivity_route"] = (
+        "source_graph" if entry.context.backend_preference == "source" else binding.route.mode
+    )
+    if binding.route.error_code:
+        status["connectivity_route_error"] = binding.route.error_code
+    if not binding.npi_candidate or entry.npi_failure is not None:
+        return deferred, status, None
+    try:
+        backend = select_backend(status, fallback=deferred)
+    except (OperationCancelled, KdbBindingChanged, ExecutionBindingChanged, CaptureAborted,
+            design_context_runtime.ContextUnavailable, TimeoutError):
+        raise
+    except Exception:
+        return deferred, status, "npi_backend_initialization_failed"
+    if getattr(backend, "name", None) == "verdi_npi":
+        if getattr(entry, "native", False):
+            if hasattr(backend, "bind_native_inputs"):
+                backend.bind_native_inputs(entry.context)
+            elif entry.context.compile_result_json is not None:
+                backend.bind_compile_context(entry.context.compile_result())
+            else:
+                raise ValueError("backend lacks native input binding")
+        else:
+            backend.bind_compile_context(entry.context.compile_result())
+        backend.bind_kdb_anchor(binding.anchor)
+        if getattr(entry, "native", False):
+            backend._request_deadline = entry.deadline
+            backend._native_metrics = entry.metrics
+    return backend, status, None
+
+
+async def _query_prepared_source(*, operation, args, simulator, config):
+    """Shared on-demand source route; every result belongs to one artifact."""
+    from src.prepared_source_connectivity import (
+        SourceQueryBudget, build_prepared_source_plan, semantic_expansion_root,
+    )
+    from src.source_graph_contract import SemanticScopeSearch
+
+    context = args["_prepared_design"].context
+    budget = SourceQueryBudget(args["_design_query_started"] + args.get("timeout_sec", 30))
+    async def validate_execution():
+        budget.remaining()
+        if (get_source_graph_execution_config() != config
+                or args.get("_prepared_source_execution", config) != config):
+            raise ExecutionBindingChanged()
+        await _validate_design_binding(args["_prepared_design"].binding,
+                                       timeout_sec=min(5, budget.remaining()))
+
+    await validate_execution()
+    if operation == "path":
+        budget.edges = 4096
+    worker_cap = min(config.timeout_sec, args.get("timeout_sec", 30))
+    signals = ((args["from_signal"], args["to_signal"]) if operation == "path"
+               else (args["signal_path"],))
+    started = time.perf_counter()
+    budget.remaining()
+    plan = await _run_in_cancellable_thread(lambda: build_prepared_source_plan(
+        context=context, operation=operation, args=args, config=config))
+    receipt = _blocked_source_graph_receipt("blocked", code="source_context_unavailable", stage="target_scope")
+    reason = "source_graph_context_unavailable"
+    result = None
+    attempts, aggregate = [], {}
+    for depth in range(3):
+        budget.remaining()
+        await validate_execution()
+        await _validate_design_source(context, timeout_sec=min(30, budget.remaining()))
+        if plan.status is AdapterStatus.BLOCKED:
+            if "limit" in plan.receipt.blocker.code or "budget" in plan.receipt.blocker.code:
+                raise CaptureAborted("source_scope_limit")
+            reason = "source_graph_" + plan.receipt.blocker.code
+            receipt = _blocked_source_graph_receipt("blocked", code=plan.receipt.blocker.code,
+                stage=plan.receipt.blocker.stage, adapter=plan.receipt.to_dict())
+            break
+        attempts.append(compute_source_graph_build_key(plan.request).digest)
+        with anyio.fail_after(budget.remaining()):
+            outcome = await get_source_graph_runtime(config).prepare(plan.request, timeout_seconds=worker_cap)
+        budget.remaining()
+        await validate_execution()
+        if outcome.status is PrepareStatus.CANCELLED:
+            raise asyncio.CancelledError
+        if outcome.status is PrepareStatus.TIMED_OUT:
+            raise TimeoutError("source worker deadline")
+        _record_source_graph_prepare_metrics(outcome)
+        receipt = _source_graph_receipt_from_prepare(plan, outcome,
+            adapter_wall_ms=(time.perf_counter() - started) * 1000 if depth == 0 else 0)
+        for key, value in receipt["metrics"].items():
+            if key.endswith("_ms") or key in {"actual_build_count", "frontend_launch_count", "coalesced_waiter_count"}:
+                aggregate[key] = aggregate.get(key, 0) + value
+        if outcome.status is not PrepareStatus.READY:
+            if outcome.blocker is not None and outcome.blocker.code == "semantic_scope_budget_exceeded":
+                raise CaptureAborted("source_scope_limit")
+            reason = _SOURCE_GRAPH_PREPARE_REASONS.get(outcome.status, "source_graph_prepare_failed")
+            result = None
+            break
+        budget.account_projection(outcome.entry)
+        if dict(outcome.entry.ir.metadata).get("semantic_scope_limited") == "1":
+            raise CaptureAborted("source_scope_limit")
+        backend = _source_graph_backend_for_plan(outcome.entry, plan)
+        backend.query_budget = budget
+        query_started = time.perf_counter()
+        budget.remaining()
+        try:
+            with anyio.fail_after(budget.remaining()):
+                result = (await _call_signal_path_backend(backend, args=args, simulator=simulator)
+                          if operation == "path" else await _call_public_connectivity_operation(
+                              backend, operation=operation, args=args, simulator=simulator))
+        except SourceGraphQueryBlocked as exc:
+            reason = "source_graph_" + exc.code
+            receipt["blocker"] = {"code": exc.code, "stage": "query"}
+            result = None
+            break
+        budget.remaining()
+        await validate_execution()
+        result["backend"] = backend.name
+        query = result.pop("_source_graph_query_receipt")
+        _merge_source_graph_query_receipt(receipt, query, query_wall_ms=(time.perf_counter() - query_started) * 1000)
+        aggregate["query_wall_ms"] = aggregate.get("query_wall_ms", 0) + receipt["metrics"]["query_wall_ms"]
+        budget.account_query(query)
+        receipt.update(final_artifact_fingerprint_sha256=outcome.entry.build_key.digest,
+                       single_artifact_provenance=True, final_artifact_scope_match=True)
+        reason = "source_graph_coverage_inconclusive"
+        found = query.get("status") == "found"
+        frontiers = tuple(query.get("expansion_frontiers", ()))
+        limited = dict(outcome.entry.ir.metadata).get("semantic_scope_limited") == "1"
+        truncated = any(query.get(key, False) for key in (
+            "query_truncated", "state_truncated", "edge_truncated", "assignment_truncated",
+            "evidence_truncated", "frontier_truncated", "traversal_truncated", "output_truncated"))
+        if found or query.get("coverage_status") == "complete":
+            break
+        if budget.exhausted or limited or truncated:
+            receipt["blocker"] = {"code": "source_query_budget_exceeded", "stage": "query"}
+            reason = "source_graph_source_query_budget_exceeded"
+            break
+        if depth == 2 or (operation != "path" and not frontiers):
+            break
+        root = await _run_in_cancellable_thread(
+            lambda: semantic_expansion_root(outcome.entry, (*signals, *frontiers)))
+        if root is None:
+            break
+        budget.remaining()
+        await validate_execution()
+        await _validate_design_source(context, timeout_sec=min(30, budget.remaining()))
+        plan = await _run_in_cancellable_thread(lambda: build_prepared_source_plan(
+            context=context, operation=operation, args=args, config=config, base=plan,
+            search=SemanticScopeSearch(roots=(root,), depth=depth + 1,
+                                       max_instances=budget.instances, max_members=budget.members)))
+        # No prefix facts survive into a different artifact.
+        result = None
+    budget.remaining()
+    receipt.update(artifact_attempt_count=len(attempts), scope_expansion_count=max(0, len(attempts)-1),
+                   attempted_artifact_fingerprints_sha256=attempts,
+                   request_timeout_sec=args.get("timeout_sec", 30),
+                   request_remaining_sec=budget.remaining(),
+                   semantic_instances_charged=64-budget.instances,
+                   semantic_members_charged=4096-budget.members)
+    receipt.setdefault("metrics", {}).update(aggregate)
+    if result is None:
+        if operation == "path":
+            from src.connectivity_backend import StaticConnectivityBackend
+            backend = StaticConnectivityBackend()
+            backend.bind_compile_context(context.compile_result())
+            budget.remaining()
+            result = await _call_signal_path_backend(backend, args=args, simulator=simulator)
+            result["backend"] = backend.name
+            receipt["fallback_used"] = True
+        else:
+            claims = {"positive_fact_confidence": None, "target_bit_coverage": "none",
+                      "global_coverage_status": "inconclusive", "exhaustive_search": False,
+                      "exclusive_driver_proved": False if operation == "driver" else None,
+                      "negative_claim_allowed": False}
+            result = {"signal_path": args["signal_path"], "backend": "source_graph",
+                      "resolved_rtl_name": args["signal_path"].rsplit(".", 1)[-1],
+                      "claim_semantics": claims, "unsupported_reason": reason}
+            if operation == "driver":
+                result.update(wave_path=args["wave_path"], driver_status="unknown", confidence="unverified",
+                              recursive=args.get("recursive", False))
+            else:
+                result.update(loads=[], completeness="shallow_only")
+    elif operation == "driver" and result.get("driver_status") in {"resolved", "partial"}:
+        await _attach_driver_dependencies(result, backend, args, simulator)
+    budget.remaining()
+    await validate_execution()
+    return _strip_connectivity_internal_receipts(result), receipt, reason
 
 
 async def _route_public_connectivity(
@@ -2998,19 +3543,24 @@ async def _route_public_connectivity(
     )
 
     bound = args.get("_bound_context")
-    backend_status = await _run_in_cancellable_thread(
-        lambda: (probe_verdi_backend(bound.compile_result, compile_log_path=args["compile_log"])
-                 if bound is not None else _safe_probe_backend(args["compile_log"], simulator))
-    )
+    prepared = args.get("_prepared_design") or args.get("_native_query")
     deferred = DeferredConnectivityFallbackBackend()
     npi_selection_reason: str | None = None
-    try:
-        npi_backend = select_backend(backend_status, fallback=deferred)
-    except Exception:  # noqa: BLE001
-        # Backend construction must not deny Source Graph its fallback slot.
-        # Keep exception text out of both public receipts and metrics.
-        npi_backend = deferred
-        npi_selection_reason = "npi_backend_initialization_failed"
+    if prepared is not None:
+        npi_backend, backend_status, npi_selection_reason = _select_prepared_backend(prepared, deferred)
+    else:
+        backend_status = await _run_in_cancellable_thread(
+            lambda: (probe_verdi_backend(bound.compile_result, compile_log_path=args["compile_log"])
+                     if bound is not None else _safe_probe_backend(args["compile_log"], simulator))
+        )
+        try:
+            npi_backend = select_backend(backend_status, fallback=deferred)
+        except (OperationCancelled, KdbBindingChanged, ExecutionBindingChanged, CaptureAborted,
+                design_context_runtime.ContextUnavailable, TimeoutError):
+            raise
+        except Exception:  # noqa: BLE001
+            npi_backend = deferred
+            npi_selection_reason = "npi_backend_initialization_failed"
     npi_selected = getattr(npi_backend, "name", None) == "verdi_npi"
     if bound is not None and hasattr(npi_backend, "bind_compile_context"):
         npi_backend.bind_compile_context(bound.compile_result)
@@ -3031,6 +3581,8 @@ async def _route_public_connectivity(
             )
         except OperationCancelled as exc:
             raise asyncio.CancelledError from exc
+        except (KdbBindingChanged, ExecutionBindingChanged, CaptureAborted, TimeoutError, design_context_runtime.ContextUnavailable):
+            raise
         except Exception:  # noqa: BLE001
             npi_result = None
             fallback_reason = "npi_query_failed"
@@ -3042,6 +3594,11 @@ async def _route_public_connectivity(
                 )
             )
         if npi_result is not None:
+            from src.native_query import native_budget_exhausted
+            positive = (_npi_driver_result_has_positive_fact(npi_result) if operation == "driver"
+                        else bool(npi_result.get("loads")))
+            if args.get("_native_query") is not None and native_budget_exhausted(npi_result) and not positive:
+                raise design_context_runtime.ContextUnavailable("native_analysis_limit")
             npi_kdb_status = _npi_kdb_status(npi_backend)
             execution = npi_result.get("_npi_execution_status")
             if isinstance(execution, dict):
@@ -3111,21 +3668,44 @@ async def _route_public_connectivity(
         attempts.append(
             _backend_attempt(
                 "verdi_npi",
-                "failed" if npi_selection_reason else "unavailable",
+                "failed" if npi_selection_reason else (
+                    "skipped" if fallback_reason in {"source_backend_requested", "npi_previous_load_failure"}
+                    else "unavailable"
+                ),
                 reason=fallback_reason,
             )
         )
 
+    if args.get("_native_query") is not None:
+        from src.native_query import NativeFallback
+        raise NativeFallback(attempts)
+
     config = get_source_graph_execution_config()
+    if prepared is not None and config.enabled and config.valid:
+        clean, source_receipt, source_reason = await _query_prepared_source(
+            operation=operation, args=args, simulator=simulator, config=config)
+        actual = clean.get("backend", "source_graph")
+        usable = source_receipt.get("query_status") == "found"
+        attempts.append(_backend_attempt("source_graph", "success" if usable else "inconclusive",
+            reason=None if usable else source_reason, coverage_status=source_receipt.get("coverage_status")))
+        if actual == "static":
+            attempts.append(_backend_attempt("static", "success"))
+        status = _finalize_public_connectivity_status(
+            backend_status=backend_status, selected_backend=selected_backend, actual_backend=actual,
+            attempts=attempts, fallback_reason=fallback_reason if usable else source_reason,
+            npi_backend=npi_backend if npi_selected else None, npi_execution=npi_execution,
+            source_graph_receipt=source_receipt, npi_kdb_status=npi_kdb_status)
+        return clean, status
+
     source_graph_receipt: dict
     source_graph_reason: str
     bootstrap_receipt: dict | None = None
     bootstrap_active = False
     inconclusive_source: dict | None = None
     if args.get("allow_bounded_bootstrap") is True:
-        existing_hierarchy, _ = _resolve_hierarchy_context(
+        existing_hierarchy, _ = ((None, "") if prepared is not None else _resolve_hierarchy_context(
             args["compile_log"], simulator
-        )
+        ))
         bootstrap_active = existing_hierarchy is None
     if not config.enabled:
         source_graph_reason = "source_graph_disabled"
@@ -3485,6 +4065,9 @@ async def _route_public_connectivity(
                                 )
                             except OperationCancelled as exc:
                                 raise asyncio.CancelledError from exc
+                            except (KdbBindingChanged, ExecutionBindingChanged, CaptureAborted,
+                                    design_context_runtime.ContextUnavailable, TimeoutError):
+                                raise
                             except Exception:  # noqa: BLE001
                                 expanded = None
                             current_adapter_ms = (
@@ -3692,7 +4275,9 @@ async def _route_public_connectivity(
     source_graph_receipt["fallback_used"] = True
     final_reason = source_graph_reason
     static_backend = StaticConnectivityBackend()
-    if bound is not None:
+    if prepared is not None:
+        static_backend.bind_compile_context(prepared.context.compile_result())
+    elif bound is not None:
         static_backend.bind_compile_context(bound.compile_result)
     static_result = await _call_public_connectivity_operation(
         static_backend,
@@ -3820,14 +4405,21 @@ async def _route_public_signal_path(
         select_backend,
     )
 
-    backend_status = _safe_probe_backend(args["compile_log"], simulator)
+    prepared = args.get("_prepared_design") or args.get("_native_query")
     deferred = DeferredConnectivityFallbackBackend()
     npi_selection_reason: str | None = None
-    try:
-        npi_backend = select_backend(backend_status, fallback=deferred)
-    except Exception:  # noqa: BLE001
-        npi_backend = deferred
-        npi_selection_reason = "npi_backend_initialization_failed"
+    if prepared is not None:
+        npi_backend, backend_status, npi_selection_reason = _select_prepared_backend(prepared, deferred)
+    else:
+        backend_status = _safe_probe_backend(args["compile_log"], simulator)
+        try:
+            npi_backend = select_backend(backend_status, fallback=deferred)
+        except (OperationCancelled, KdbBindingChanged, ExecutionBindingChanged, CaptureAborted,
+                design_context_runtime.ContextUnavailable, TimeoutError):
+            raise
+        except Exception:  # noqa: BLE001
+            npi_backend = deferred
+            npi_selection_reason = "npi_backend_initialization_failed"
     npi_selected = getattr(npi_backend, "name", None) == "verdi_npi"
     selected_backend = "verdi_npi" if npi_selected else "source_graph"
     attempts: list[dict] = []
@@ -3845,6 +4437,8 @@ async def _route_public_signal_path(
             )
         except OperationCancelled as exc:
             raise asyncio.CancelledError from exc
+        except (KdbBindingChanged, ExecutionBindingChanged, CaptureAborted, TimeoutError, design_context_runtime.ContextUnavailable):
+            raise
         except Exception:  # noqa: BLE001
             npi_result = None
             fallback_reason = "npi_query_failed"
@@ -3921,12 +4515,35 @@ async def _route_public_signal_path(
         attempts.append(
             _backend_attempt(
                 "verdi_npi",
-                "failed" if npi_selection_reason else "unavailable",
+                "failed" if npi_selection_reason else (
+                    "skipped" if fallback_reason in {"source_backend_requested", "npi_previous_load_failure"}
+                    else "unavailable"
+                ),
                 reason=fallback_reason,
             )
         )
 
+    if args.get("_native_query") is not None:
+        from src.native_query import NativeFallback
+        raise NativeFallback(attempts)
+
     config = get_source_graph_execution_config()
+    if prepared is not None and config.enabled and config.valid:
+        clean, source_receipt, source_reason = await _query_prepared_source(
+            operation="path", args=args, simulator=simulator, config=config)
+        actual = clean.get("backend", "source_graph")
+        usable = source_receipt.get("query_status") == "found"
+        attempts.append(_backend_attempt("source_graph", "success" if usable else "inconclusive",
+            reason=None if usable else source_reason, coverage_status=source_receipt.get("coverage_status")))
+        if actual == "static":
+            attempts.append(_backend_attempt("static", "success"))
+        status = _finalize_public_connectivity_status(
+            backend_status=backend_status, selected_backend=selected_backend, actual_backend=actual,
+            attempts=attempts, fallback_reason=fallback_reason if usable else source_reason,
+            npi_backend=npi_backend if npi_selected else None, npi_execution=npi_execution,
+            source_graph_receipt=source_receipt, npi_kdb_status=npi_kdb_status)
+        return clean, status
+
     source_graph_receipt: dict
     source_graph_reason: str
     if not config.enabled:
@@ -3952,8 +4569,9 @@ async def _route_public_signal_path(
     else:
         operation_metrics.set_value("source_graph_phase", "adapter")
         adapter_started = time.perf_counter()
-        hierarchy_result, hierarchy_snapshot_sha256 = _resolve_hierarchy_context(
-            args["compile_log"], simulator
+        hierarchy_result, hierarchy_snapshot_sha256 = (
+            (None, prepared.context.identity_sha256) if prepared is not None
+            else _resolve_hierarchy_context(args["compile_log"], simulator)
         )
         if hierarchy_result is None:
             adapter_wall_ms = (time.perf_counter() - adapter_started) * 1000.0
@@ -4035,6 +4653,9 @@ async def _route_public_signal_path(
                         )
                     except OperationCancelled as exc:
                         raise asyncio.CancelledError from exc
+                    except (KdbBindingChanged, ExecutionBindingChanged, CaptureAborted,
+                            design_context_runtime.ContextUnavailable, TimeoutError):
+                        raise
                     except RuntimeError:
                         outcome = None
                         source_graph_reason = "source_graph_runtime_config_changed"
@@ -4124,6 +4745,9 @@ async def _route_public_signal_path(
                                 )
                             except OperationCancelled as exc:
                                 raise asyncio.CancelledError from exc
+                            except (KdbBindingChanged, ExecutionBindingChanged, CaptureAborted,
+                                    design_context_runtime.ContextUnavailable, TimeoutError):
+                                raise
                             except SourceGraphQueryBlocked as exc:
                                 source_graph_reason = f"source_graph_{exc.code}"
                             except (KeyError, ValueError):
@@ -4231,6 +4855,8 @@ async def _route_public_signal_path(
     operation_metrics.set_value("source_graph_phase", "fallback")
     source_graph_receipt["fallback_used"] = True
     static_backend = StaticConnectivityBackend()
+    if prepared is not None:
+        static_backend.bind_compile_context(prepared.context.compile_result())
     try:
         static_result = await _call_signal_path_backend(
             static_backend,
@@ -4293,6 +4919,8 @@ async def _run_trace_x_attempt(
     abort_on_backend_fallback: bool,
     upstream_scope_guard: Callable[[list[str]], object] | None = None,
     root_binding=None,
+    parser_observer=None,
+    backend_guard=None,
 ) -> tuple[dict, dict]:
     """Run one backend-consistent X-trace attempt.
 
@@ -4306,7 +4934,10 @@ async def _run_trace_x_attempt(
 
     async def _value_lookup(path: str, at_ps: int) -> dict:
         def _work():
-            return _get_parser(wave_path).get_value_at_time(
+            parser = _get_parser(wave_path)
+            if parser_observer is not None:
+                parser_observer(parser)
+            return parser.get_value_at_time(
                 root_binding.to_wave(path) if root_binding else path, at_ps)
 
         return await _run_in_wave_request(wave_path, _work)
@@ -4317,8 +4948,11 @@ async def _run_trace_x_attempt(
         at_ps: int,
     ) -> list[dict]:
         def _work():
+            parser = _get_parser(wave_path)
+            if parser_observer is not None:
+                parser_observer(parser)
             observations = inspect_upstream_values(
-                _get_parser(wave_path),
+                parser,
                 [root_binding.to_wave(p) for p in upstream_names] if root_binding else upstream_names,
                 root_binding.to_wave(current_signal_path) if root_binding else current_signal_path,
                 at_ps,
@@ -4334,6 +4968,8 @@ async def _run_trace_x_attempt(
 
     async def _driver_lookup(path: str) -> dict:
         nonlocal kdb_status
+        if backend_guard is not None:
+            backend_guard()
 
         def _query_backend():
             return backend.find_driver(
@@ -4361,6 +4997,8 @@ async def _run_trace_x_attempt(
             raw = await _run_in_cancellable_thread(_query_backend)
         else:
             raw = await _call_connectivity_backend(backend, _query_backend)
+        if backend_guard is not None:
+            backend_guard()
         if not isinstance(raw, dict):
             raise TypeError("connectivity backend find_driver must return a mapping")
 
@@ -4389,6 +5027,10 @@ async def _run_trace_x_attempt(
             and _npi_kdb_degraded(kdb_status=current_kdb_status)
             and not _npi_driver_result_has_positive_fact(raw)
         )
+        from src.native_query import native_budget_exhausted
+        if (getattr(backend, "_native_metrics", None) is not None
+                and native_budget_exhausted(raw) and not _npi_driver_result_has_positive_fact(raw)):
+            raise design_context_runtime.ContextUnavailable("native_analysis_limit")
         if abort_on_backend_fallback and (
             fallback_reason
             or fallback_deferred
@@ -4430,6 +5072,8 @@ async def _run_trace_x_attempt(
         value_lookup=_value_lookup,
         upstream_lookup=_upstream_lookup,
         upstream_scope_guard=upstream_scope_guard,
+        **({"propagate_value_errors": (design_context_runtime.ContextUnavailable,)}
+           if parser_observer is not None else {}),
     )
     result = await attempt if inspect.isawaitable(attempt) else attempt
     if not isinstance(result, dict):
@@ -4443,14 +5087,31 @@ async def _handle_trace_x_source(args: dict, simulator: str):
     """Route X-trace through NPI -> one Source Graph artifact -> Static."""
 
     mode = args.get("mode", "snapshot")
+    prepared = args.get("_prepared_design") or args.get("_native_query")
     if mode == "history":
         from src.x_history import trace_x_history
+        if prepared is not None:
+            from src.prepared_trace_context import PreparedTraceContext, NativeTraceContext
+            history_args = {k: v for k, v in args.items() if k not in {
+                "design_handle", "_prepared_design", "supplementary_compile_logs",
+                "_design_query_started", "_prepared_source_execution", "_native_query", "_trace_budget", "_trace_deadline",
+            }}
+            return await trace_x_history(
+                sys.modules[__name__], {**history_args, "simulator": simulator},
+                bound_context=(NativeTraceContext(prepared) if args.get("_native_query") else
+                    PreparedTraceContext(prepared, args["design_handle"], args.get("_prepared_source_execution"), args.get("_trace_budget"), native_input_contract=args.get("_trace_deadline") is not None)),
+                started_at=args.get("_design_query_started"),
+            )
         return await trace_x_history(sys.modules[__name__], {**args, "simulator": simulator})
     if mode != "snapshot":
         raise ValueError("trace_x_source mode must be snapshot or history")
     if any(k in args for k in ("history_start_ps", "signal_bits", "phase", "max_nodes", "max_events", "max_read_bytes", "timeout_sec", "compile_context")):
         raise ValueError("history parameters require mode=history")
     original_signal = args['signal_path']
+    wave_guard = None
+    if prepared is not None:
+        from src.prepared_trace_context import PreparedTraceWave
+        wave_guard = PreparedTraceWave(args["wave_path"])
     root_binding = await _bind_wave_design_root(args, simulator)
     if root_binding:
         args = {**args, 'signal_path': root_binding.to_design(original_signal)}
@@ -4467,24 +5128,29 @@ async def _handle_trace_x_source(args: dict, simulator: str):
     signal_path = args["signal_path"]
     top_hint = args.get("top_hint")
     max_depth = args.get("max_depth", DEFAULT_X_TRACE_MAX_DEPTH)
-    backend_status = _safe_probe_backend(compile_log, simulator)
     deferred = DeferredConnectivityFallbackBackend()
     npi_selection_reason: str | None = None
-    try:
-        selector_parameters = inspect.signature(select_backend).parameters.values()
-        supports_injected_fallback = any(
-            parameter.name == "fallback"
-            or parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in selector_parameters
-        )
-        npi_backend = (
-            select_backend(backend_status, fallback=deferred)
-            if supports_injected_fallback
-            else select_backend(backend_status)
-        )
-    except Exception:  # noqa: BLE001
-        npi_backend = deferred
-        npi_selection_reason = "npi_backend_initialization_failed"
+    if prepared is not None:
+        npi_backend, backend_status, npi_selection_reason = _select_prepared_backend(prepared, deferred)
+    else:
+        backend_status = _safe_probe_backend(compile_log, simulator)
+        try:
+            selector_parameters = inspect.signature(select_backend).parameters.values()
+            supports_injected_fallback = any(
+                parameter.name == "fallback"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in selector_parameters
+            )
+            npi_backend = (
+                select_backend(backend_status, fallback=deferred)
+                if supports_injected_fallback
+                else select_backend(backend_status)
+            )
+        except (OperationCancelled, KdbBindingChanged, ExecutionBindingChanged, CaptureAborted, TimeoutError, design_context_runtime.ContextUnavailable):
+            raise
+        except Exception:  # noqa: BLE001
+            npi_backend = deferred
+            npi_selection_reason = "npi_backend_initialization_failed"
     npi_selected = getattr(npi_backend, "name", None) == "verdi_npi"
     selected_backend = "verdi_npi" if npi_selected else "source_graph"
     attempts: list[dict] = []
@@ -4494,13 +5160,16 @@ async def _handle_trace_x_source(args: dict, simulator: str):
     npi_reason: str | None = None
     probe_npi_reason = backend_status.pop("_npi_selection_reason", None)
 
-    def _finalize_trace(
+    async def _finalize_trace(
         result: dict,
         *,
         actual_backend: str,
         fallback_reason: str | None,
         source_graph_receipt: dict | None,
     ):
+        if wave_guard is not None:
+            await _run_in_wave_request(wave_path, lambda: wave_guard.observe(_get_parser(wave_path)))
+            wave_guard.require_current()
         finalized = _finalize_public_connectivity_status(
             backend_status=backend_status,
             selected_backend=selected_backend,
@@ -4512,6 +5181,10 @@ async def _handle_trace_x_source(args: dict, simulator: str):
             source_graph_receipt=source_graph_receipt,
             npi_kdb_status=npi_kdb_status,
         )
+        if prepared is not None and actual_backend == "verdi_npi" and npi_kdb_status is None:
+            # A clean or absent waveform signal can finish without asking a
+            # driver. Backend selection alone is not evidence of a KDB load.
+            finalized["kdb_load_status"] = backend_status["kdb_load_status"]
         configured_mode = getattr(npi_backend, "execution_mode", None)
         if finalized.get("execution_mode") is None and configured_mode in {
             "local",
@@ -4525,6 +5198,10 @@ async def _handle_trace_x_source(args: dict, simulator: str):
         finalized["whole_trace_restart_reasons"] = list(restart_reasons)
         finalized["single_backend_provenance"] = True
         result["backend_status"] = finalized
+        if prepared is not None and actual_backend == "source_graph" and any(
+                n.get("trace_stop_reason") in {"driver_traversal_incomplete", "source_graph_input_boundary"}
+                for n in result.get("propagation_chain", ())):
+            result["root_cause"] = None
         result["trace_restarted"] = bool(restart_reasons)
         if root_binding:
             from src.scope_metadata import file_identity
@@ -4547,9 +5224,13 @@ async def _handle_trace_x_source(args: dict, simulator: str):
                 max_depth=max_depth,
                 simulator=simulator,
                 abort_on_backend_fallback=True,
+                **({"parser_observer": wave_guard.observe} if wave_guard else {}),
+                **({"backend_guard": prepared.binding.require_policy_current} if prepared else {}),
             )
         except OperationCancelled as exc:
             raise asyncio.CancelledError from exc
+        except (KdbBindingChanged, ExecutionBindingChanged, CaptureAborted, design_context_runtime.ContextUnavailable, TimeoutError):
+            raise
         except _TraceBackendFallback as exc:
             npi_reason = _sanitize_npi_fallback_reason(exc.reason)
             npi_execution = dict(exc.execution_status) or None
@@ -4594,7 +5275,7 @@ async def _handle_trace_x_source(args: dict, simulator: str):
                     coverage_status="partial" if degraded else None,
                 )
             )
-            return _finalize_trace(
+            return await _finalize_trace(
                 result,
                 actual_backend="verdi_npi",
                 fallback_reason=None,
@@ -4607,12 +5288,37 @@ async def _handle_trace_x_source(args: dict, simulator: str):
         attempts.append(
             _backend_attempt(
                 "verdi_npi",
-                "failed" if npi_selection_reason else "unavailable",
+                "failed" if npi_selection_reason else (
+                    "skipped" if prepared is not None and (
+                        prepared.binding.disposition == "source_policy" or prepared.npi_failure
+                    ) else "unavailable"
+                ),
                 reason=npi_reason,
             )
         )
 
-    config = get_source_graph_execution_config()
+    if args.get("_native_query") is not None:
+        from src.native_query import NativeFallback
+        raise NativeFallback(attempts)
+
+    config = args.get("_prepared_source_execution") or get_source_graph_execution_config()
+    trace_plan_state = None
+    if prepared is not None:
+        from src.prepared_source_trace import PreparedTracePlan, PreparedTraceArtifactGuard
+        trace_plan_state = PreparedTracePlan(prepared.context, config,
+            min(args.get("_trace_deadline", float("inf")), args["_design_query_started"] + config.timeout_sec), max_depth)
+
+    async def validate_source_trace():
+        if trace_plan_state is None:
+            return
+        remaining = trace_plan_state.budget.remaining
+        remaining()
+        if get_source_graph_execution_config() != config:
+            raise ExecutionBindingChanged()
+        await _validate_design_source(prepared.context, timeout_sec=min(30, remaining()))
+        await _validate_design_binding(prepared.binding, timeout_sec=min(5, remaining()))
+        remaining()
+
     source_graph_receipt: dict
     source_graph_reason: str
     source_graph_attempted = False
@@ -4644,10 +5350,11 @@ async def _handle_trace_x_source(args: dict, simulator: str):
             _backend_attempt("source_graph", "blocked", reason=source_graph_reason)
         )
     else:
-        hierarchy_result, hierarchy_snapshot_sha256 = _resolve_hierarchy_context(
-            compile_log, simulator
+        hierarchy_result, hierarchy_snapshot_sha256 = (
+            (None, prepared.context.identity_sha256) if prepared is not None
+            else _resolve_hierarchy_context(compile_log, simulator)
         )
-        if hierarchy_result is None:
+        if hierarchy_result is None and prepared is None:
             source_graph_reason = "source_graph_hierarchy_context_unavailable"
             source_graph_receipt = _blocked_source_graph_receipt(
                 "blocked",
@@ -4658,7 +5365,8 @@ async def _handle_trace_x_source(args: dict, simulator: str):
                 _backend_attempt("source_graph", "blocked", reason=source_graph_reason)
             )
         else:
-            compile_result = hierarchy_result.get("compile_result")
+            compile_result = (prepared.context.compile_result() if prepared is not None
+                              else hierarchy_result.get("compile_result"))
             if not isinstance(compile_result, dict):
                 source_graph_reason = "source_graph_compile_context_unavailable"
                 source_graph_receipt = _blocked_source_graph_receipt(
@@ -4677,8 +5385,10 @@ async def _handle_trace_x_source(args: dict, simulator: str):
                     operation_metrics.set_value("source_graph_phase", "adapter")
                     adapter_started = time.perf_counter()
                     try:
+                        await validate_source_trace()
                         plan = await _run_in_cancellable_thread(
-                            lambda: build_source_graph_trace_plan(
+                            lambda: trace_plan_state.build(scope_targets) if trace_plan_state is not None
+                            else build_source_graph_trace_plan(
                                 compile_log=compile_log,
                                 compile_result=compile_result,
                                 hierarchy_result=hierarchy_result,
@@ -4696,6 +5406,9 @@ async def _handle_trace_x_source(args: dict, simulator: str):
                         )
                     except OperationCancelled as exc:
                         raise asyncio.CancelledError from exc
+                    except (KdbBindingChanged, ExecutionBindingChanged, CaptureAborted,
+                            design_context_runtime.ContextUnavailable, TimeoutError):
+                        raise
                     except Exception:  # noqa: BLE001
                         plan = None
                     adapter_wall_ms = (time.perf_counter() - adapter_started) * 1000.0
@@ -4744,6 +5457,7 @@ async def _handle_trace_x_source(args: dict, simulator: str):
                         break
 
                     assert plan.request is not None
+                    await validate_source_trace()
                     operation_metrics.set_value("source_graph_phase", "prepare")
                     try:
                         runtime = get_source_graph_runtime(config)
@@ -4753,6 +5467,9 @@ async def _handle_trace_x_source(args: dict, simulator: str):
                         )
                     except OperationCancelled as exc:
                         raise asyncio.CancelledError from exc
+                    except (KdbBindingChanged, ExecutionBindingChanged, CaptureAborted,
+                            design_context_runtime.ContextUnavailable, TimeoutError):
+                        raise
                     except RuntimeError:
                         outcome = None
                         source_graph_reason = "source_graph_runtime_config_changed"
@@ -4791,6 +5508,11 @@ async def _handle_trace_x_source(args: dict, simulator: str):
                         )
                         break
 
+                    if prepared is not None and outcome.status is PrepareStatus.TIMED_OUT:
+                        raise TimeoutError("source trace preparation deadline")
+                    await validate_source_trace()
+                    if trace_plan_state is not None:
+                        trace_plan_state.observe(outcome)
                     _record_source_graph_prepare_metrics(outcome)
                     _accumulate_source_graph_trace_metrics(
                         trace_metrics,
@@ -4830,8 +5552,12 @@ async def _handle_trace_x_source(args: dict, simulator: str):
                     assert outcome.entry is not None
                     selected_artifact_fingerprint = outcome.entry.build_key.digest
                     attempted_artifact_fingerprints[-1] = selected_artifact_fingerprint
+                    source_backend = _source_graph_backend_for_plan(outcome.entry, plan)
+                    if trace_plan_state is not None:
+                        source_backend.query_budget = trace_plan_state.budget
                     trace_backend = SourceGraphTraceConnectivityBackend(
-                        backend=_source_graph_backend_for_plan(outcome.entry, plan),
+                        backend=source_backend,
+                        guard=(PreparedTraceArtifactGuard(outcome.entry, plan) if prepared is not None else None),
                         artifact_scope=(outcome.entry.artifact_scope_receipt.scope),
                         hierarchy_result=hierarchy_result,
                         artifact_fingerprint_sha256=(selected_artifact_fingerprint),
@@ -4851,9 +5577,13 @@ async def _handle_trace_x_source(args: dict, simulator: str):
                             simulator=simulator,
                             abort_on_backend_fallback=False,
                             upstream_scope_guard=(trace_backend.require_scope),
+                            **({"parser_observer": wave_guard.observe} if wave_guard else {}),
+                            **({"backend_guard": prepared.binding.require_policy_current} if prepared else {}),
                         )
                     except OperationCancelled as exc:
                         raise asyncio.CancelledError from exc
+                    except (KdbBindingChanged, ExecutionBindingChanged, CaptureAborted, design_context_runtime.ContextUnavailable, TimeoutError):
+                        raise
                     except SourceGraphTraceScopeExpansion as exc:
                         attempted_query_count += len(
                             trace_backend.ledger.query_fingerprints_sha256
@@ -4867,7 +5597,8 @@ async def _handle_trace_x_source(args: dict, simulator: str):
                             for path in exc.signal_paths
                             if path not in scope_targets
                         ]
-                        if not new_targets:
+                        changed_scope = trace_plan_state.expand(exc) if trace_plan_state is not None else False
+                        if not new_targets and not changed_scope:
                             source_graph_reason = "source_graph_scope_expansion_stalled"
                             source_graph_receipt["blocker"] = {
                                 "code": "scope_expansion_stalled",
@@ -4885,6 +5616,8 @@ async def _handle_trace_x_source(args: dict, simulator: str):
                             len(scope_targets) + len(new_targets)
                             > config.frontier_max_instances
                         ):
+                            if prepared is not None:
+                                raise CaptureAborted("source_scope_limit")
                             source_graph_reason = "source_graph_frontier_instance_limit"
                             source_graph_receipt["blocker"] = {
                                 "code": "frontier_instance_limit",
@@ -4957,6 +5690,7 @@ async def _handle_trace_x_source(args: dict, simulator: str):
                         )
                         break
                     else:
+                        await validate_source_trace()
                         final_query_count = len(
                             trace_backend.ledger.query_fingerprints_sha256
                         )
@@ -5019,7 +5753,7 @@ async def _handle_trace_x_source(args: dict, simulator: str):
                             )
                         )
                         operation_metrics.set_value("source_graph_phase", "complete")
-                        return _finalize_trace(
+                        return await _finalize_trace(
                             source_result,
                             actual_backend="source_graph",
                             fallback_reason=npi_reason,
@@ -5049,9 +5783,12 @@ async def _handle_trace_x_source(args: dict, simulator: str):
     operation_metrics.set_value(
         "source_graph_trace_restart_count", len(restart_reasons)
     )
+    static_backend = StaticConnectivityBackend()
+    if prepared is not None:
+        static_backend.bind_compile_context(prepared.context.compile_result())
     try:
         static_result, _ = await _run_trace_x_attempt(
-            backend=StaticConnectivityBackend(),
+            backend=static_backend,
             wave_path=wave_path,
             **({"root_binding": root_binding} if root_binding else {}),
             signal_path=signal_path,
@@ -5061,6 +5798,8 @@ async def _handle_trace_x_source(args: dict, simulator: str):
             max_depth=max_depth,
             simulator=simulator,
             abort_on_backend_fallback=False,
+            **({"parser_observer": wave_guard.observe} if wave_guard else {}),
+            **({"backend_guard": prepared.binding.require_policy_current} if prepared else {}),
         )
     except OperationCancelled as exc:
         raise asyncio.CancelledError from exc
@@ -5070,7 +5809,7 @@ async def _handle_trace_x_source(args: dict, simulator: str):
         if source_graph_attempted or artifact_attempt_count
         else npi_reason or source_graph_reason
     )
-    return _finalize_trace(
+    return await _finalize_trace(
         static_result,
         actual_backend="static",
         fallback_reason=final_reason,
@@ -5375,14 +6114,32 @@ def _signal_selection_schema() -> dict:
     return {"$ref": "#/$defs/WaveformSignalInput"}
 
 
+def _strip_schema_titles(schema: dict) -> None:
+    """Drop generated display labels, preserving property names and examples."""
+    schema.pop("title", None)
+    for keyword in ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas"):
+        for child in schema.get(keyword, {}).values():
+            if isinstance(child, dict):
+                _strip_schema_titles(child)
+    for keyword in ("items", "additionalProperties", "unevaluatedProperties", "contains",
+                    "propertyNames", "not", "if", "then", "else"):
+        child = schema.get(keyword)
+        if isinstance(child, dict):
+            _strip_schema_titles(child)
+    for keyword in ("allOf", "anyOf", "oneOf", "prefixItems"):
+        for child in schema.get(keyword, []):
+            if isinstance(child, dict):
+                _strip_schema_titles(child)
+
+
 def _signal_selection_definitions() -> dict:
     """Keep reusable inputs once per tool, including nested recursive types."""
     expression = schemas.WaveformExpression.model_json_schema()
     definitions = expression.pop("$defs", {})
     definitions["WaveformExpression"] = expression
     definitions["WaveformSignalInput"] = {
-        "description": "A signal path string, a fixed bit selection, or an explicit {expr,...} object. "
-                       "Use bindings for exact dump paths and types for SV semantics; wave_bits explicitly opts into unsigned vectors.",
+        "description": "Paths/selections/{expr,...}; explicit types or "
+                       "unsigned dump vectors via wave_bits.",
         "anyOf": [{"type": "string"}, {"$ref": "#/$defs/WaveformSelection"},
                   {"$ref": "#/$defs/WaveformExpression"}]
     }
@@ -5391,50 +6148,55 @@ def _signal_selection_definitions() -> dict:
 
 async def _resolve_packed_fields(args):
     """Semantic work stays outside the wave lock; dump validation stays inside."""
+    from src.npi_packed_layout import validate_packed_query
+    from src.hierarchy_source_ir import HierarchyQueryBudget
+    validate_packed_query({key: args[key] for key in ("source_signal", "fields")})
+    status, native = None, None
     def blocked(reason):
-        return schemas.PackedFieldsResult(status="mapping_required", reasons=[reason])
+        return schemas.PackedFieldsResult(status="mapping_required", reasons=[reason],
+            evidence={"native_query": native} if native is not None else {}, backend_status=status)
     fields = args["fields"]
-    if not isinstance(fields, list) or not 1 <= len(fields) <= 128 or not all(isinstance(f, str) and f for f in fields):
-        raise ValueError("fields must contain 1..128 names")
     simulator = _resolve_session_simulator(args)
     root_binding = await _bind_wave_design_root(args, simulator)
     if root_binding:
         args = {**args, 'source_signal': root_binding.to_design(args['source_signal'])}
-    hierarchy, snapshot = _resolve_hierarchy_context(args["compile_log"], simulator)
-    if hierarchy is None:
-        return blocked("current_hierarchy_required")
-    config = get_source_graph_execution_config()
-    if not config.enabled or not config.valid:
-        return blocked("semantic_runtime_unavailable")
-    # Use the established identity/scope adapter, without an NPI driver query
-    # or a guessed layout from names, widths, or port-binding-only artifacts.
-    from src.source_graph_adapter import build_source_graph_plan as exact_plan
-    def plan_now():
-        return exact_plan(compile_log=args["compile_log"], compile_result=hierarchy["compile_result"],
-                          hierarchy_result=hierarchy, hierarchy_snapshot_sha256=snapshot,
-                          operation=QueryOperation.DRIVER, signal_path=args["source_signal"],
-                          top_hint=args.get("top_hint"), max_hops=0,
-                          frontend_version=config.frontend_version,
-                          runtime_plusarg_allowlist=config.runtime_plusarg_allowlist)
-    plan = await _run_in_cancellable_thread(plan_now)
-    if plan.status is AdapterStatus.BLOCKED:
-        return blocked(plan.receipt.blocker.code)
-    if not compute_source_graph_build_key(plan.request).cross_request_reusable:
-        return blocked("compile_identity_incomplete")
-    outcome = await get_source_graph_runtime(config).prepare(plan.request, timeout_seconds=config.timeout_sec)
-    if outcome.status is PrepareStatus.CANCELLED:
-        raise asyncio.CancelledError
-    if outcome.status is not PrepareStatus.READY:
-        return blocked("semantic_" + outcome.status.value)
-    # Revalidate current compile bytes after the worker/cache lookup as well.
-    current = await _run_in_cancellable_thread(plan_now)
-    if current.request != plan.request:
-        return blocked("compile_identity_changed")
-    try:
-        result = await _run_in_cancellable_thread(lambda: packed_field_selections(
-            outcome.entry, args["source_signal"], args["signal_path"], fields))
-    except (ValueError, KeyError) as exc:
-        return blocked(str(exc))
+    prepared, result = args.get("_prepared_design") or args.get("_native_query"), None
+    if prepared is not None:
+        budget = HierarchyQueryBudget(timeout_sec=args.get("timeout_sec", 30))
+        budget.deadline = args.get("_design_query_started", budget.started) + args.get("timeout_sec", 30)
+        if prepared.context.selected_top is None:
+            return blocked("compile_tops_unresolved")
+        native = await _query_prepared_hierarchy(prepared, "resolve_packed_fields",
+            {"source_signal": args["source_signal"], "fields": fields}, budget)
+        status = schemas.BackendStatus.model_validate(native.pop("backend_status"))
+        if native.get("status") == "resolved":
+            result = {"status": "resolved", "fields": {
+                name: {"path": args["signal_path"], "bits": bits} for name, bits in native["field_bits"].items()},
+                "evidence": {"source_signal": args["source_signal"], "declared_range": native["declared_range"],
+                    "layout_source": "verdi_npi_bit_identity", "artifact_identity": native["artifact_identity"],
+                    "native_query": native, "validity": ("kdb_only; source_association_unverified" if args.get("_native_query") else "current_compile_snapshot; re-resolve after input changes")}}
+        elif native["analysis_limits"]:
+            return blocked(native["analysis_limits"][0])
+    if result is None:
+        if args.get("_native_query") is not None:
+            from src.native_query import NativeFallback
+            raise NativeFallback(status.model_dump().get("attempted_backends", []) if status else [])
+        result, reason = await _resolve_source_packed_fields(args, simulator)
+        if status is not None:
+            raw_status = status.model_dump(mode="json", exclude_unset=True)
+            raw_status.update(actual_backend="source_graph" if result is not None else None,
+                single_backend_provenance=True,
+                attempted_backends=[*raw_status.get("attempted_backends", []),
+                    _backend_attempt("source_graph", "success" if result is not None else "blocked",
+                        reason=reason, coverage_status="complete" if result is not None else None)])
+            if result is not None and "source_graph" in result.get("evidence", {}):
+                raw_status["source_graph"] = result["evidence"]["source_graph"]
+            status = schemas.BackendStatus.model_validate(raw_status)
+        if result is None:
+            return blocked(reason)
+        if native is not None:
+            result["evidence"]["native_query"] = native
+
     def validate_dump():
         if root_binding:
             from src.scope_metadata import file_identity
@@ -5449,7 +6211,95 @@ async def _resolve_packed_fields(args):
         await _run_in_wave_request(args["wave_path"], validate_dump)
     except (KeyError, ValueError) as exc:
         return blocked(str(exc))
-    return schemas.PackedFieldsResult.model_validate(result)
+    return schemas.PackedFieldsResult.model_validate({**result, "backend_status": status})
+
+
+async def _resolve_source_packed_fields(args, simulator):
+    """Prepare typed semantic scopes directly from the captured design context."""
+    config = get_source_graph_execution_config()
+    if not config.enabled or not config.valid:
+        return None, "semantic_runtime_unavailable"
+    prepared = args.get("_prepared_design") or args.get("_native_query")
+    if prepared is not None:
+        from src.prepared_source_connectivity import SourceQueryBudget, build_prepared_source_plan
+        from src.source_graph_contract import SemanticScopeSearch
+        budget = SourceQueryBudget(args["_design_query_started"] + args.get("timeout_sec", 30))
+
+        async def validate():
+            budget.remaining()
+            if (get_source_graph_execution_config() != config
+                    or args.get("_prepared_source_execution", config) != config):
+                raise ExecutionBindingChanged()
+            await _validate_design_binding(prepared.binding, timeout_sec=min(5, budget.remaining()))
+            await _validate_design_source(prepared.context, timeout_sec=min(30, budget.remaining()))
+            budget.remaining()
+
+        await validate()
+        started = time.perf_counter()
+        plan = await _run_in_cancellable_thread(lambda: build_prepared_source_plan(
+            context=prepared.context, operation="driver",
+            args={"signal_path": args["source_signal"], "max_depth": 0}, config=config,
+            search=SemanticScopeSearch(purpose="packed_layout")))
+        await validate()
+        if plan.status is AdapterStatus.BLOCKED:
+            return None, plan.receipt.blocker.code
+        if not compute_source_graph_build_key(plan.request).cross_request_reusable:
+            return None, "compile_identity_incomplete"
+        adapter_ms = (time.perf_counter() - started) * 1000
+        with anyio.fail_after(budget.remaining()):
+            outcome = await get_source_graph_runtime(config).prepare(
+                plan.request, timeout_seconds=min(config.timeout_sec, args.get("timeout_sec", 30)))
+        if outcome.status is PrepareStatus.CANCELLED:
+            raise asyncio.CancelledError
+        if outcome.status is PrepareStatus.TIMED_OUT:
+            raise TimeoutError("source layout deadline")
+        await validate()
+        _record_source_graph_prepare_metrics(outcome)
+        if outcome.status is not PrepareStatus.READY:
+            return None, "semantic_" + outcome.status.value
+        try:
+            result = await _run_in_cancellable_thread(lambda: packed_field_selections(
+                outcome.entry, args["source_signal"], args["signal_path"], args["fields"]))
+        except (ValueError, KeyError) as exc:
+            return None, getattr(exc, "code", str(exc))
+        await validate()
+        result["evidence"]["source_graph"] = _source_graph_receipt_from_prepare(
+            plan, outcome, adapter_wall_ms=adapter_ms)
+        return result, None
+    hierarchy, snapshot = _resolve_hierarchy_context(args["compile_log"], simulator)
+    blocker = "current_hierarchy_required"
+    if hierarchy is None:
+        return None, blocker or "source_context_unavailable"
+    # Use the established identity/scope adapter, without an NPI driver query
+    # or a guessed layout from names, widths, or port-binding-only artifacts.
+    from src.source_graph_adapter import build_source_graph_plan as exact_plan
+    def plan_now():
+        return exact_plan(compile_log=args["compile_log"], compile_result=hierarchy["compile_result"],
+                          hierarchy_result=hierarchy, hierarchy_snapshot_sha256=snapshot,
+                          operation=QueryOperation.DRIVER, signal_path=args["source_signal"],
+                          top_hint=args.get("top_hint"), max_hops=0,
+                          frontend_version=config.frontend_version,
+                          runtime_plusarg_allowlist=config.runtime_plusarg_allowlist)
+    plan = await _run_in_cancellable_thread(plan_now)
+    if plan.status is AdapterStatus.BLOCKED:
+        return None, plan.receipt.blocker.code
+    if not compute_source_graph_build_key(plan.request).cross_request_reusable:
+        return None, "compile_identity_incomplete"
+    outcome = await get_source_graph_runtime(config).prepare(plan.request, timeout_seconds=config.timeout_sec)
+    if outcome.status is PrepareStatus.CANCELLED:
+        raise asyncio.CancelledError
+    if outcome.status is not PrepareStatus.READY:
+        return None, "semantic_" + outcome.status.value
+    # Revalidate current compile bytes after the worker/cache lookup as well.
+    current = await _run_in_cancellable_thread(plan_now)
+    if current.request != plan.request:
+        return None, "compile_identity_changed"
+    try:
+        result = await _run_in_cancellable_thread(lambda: packed_field_selections(
+            outcome.entry, args["source_signal"], args["signal_path"], args["fields"]))
+    except (ValueError, KeyError) as exc:
+        return None, str(exc)
+    return result, None
 
 
 def _bounded_bootstrap_input_properties() -> dict:
@@ -5496,13 +6346,43 @@ _SIGNAL_READBACK_HINT = (
 async def list_tools():
     _tools = [
         Tool(
+            name="explain_property",
+            description=(
+                "Explain located SVA text/source as a bounded typed graph of matches, obligations, "
+                "clocks, locals and recursion. One target or ordered items with unique IDs; units "
+                "share declarations/macros/parameters/clocks within explicit scopes. Select "
+                "target/instance_path/line; definitions/fragments imply no active assert. Optional "
+                "pyslang in the Source Graph interpreter; isolated worker, no simulation/proof/LLM "
+                "or wave lock. Read syntax_status, semantic_status, context_status and gaps. "
+                "run_anchor links exact get_sim_paths/get_formal_paths discovery; otherwise mode "
+                "unknown. Formal discovery proves neither enabled roles nor outcomes. Gaps include "
+                "source/recovery; label extra AI reasoning as inference. No failed log required."
+            ),
+            inputSchema=schemas.ExplainPropertyOptions.model_json_schema(),
+        ),
+        Tool(
+            name="prepare_design_context",
+            description=(
+                "Capture compile inputs, source content identities and include dependencies from "
+                "VCS, Xcelium or Verilator logs. Returns an explicit process-scoped design_handle, "
+                "coverage gaps, preparation costs and recovery identity. Does not build a hierarchy, "
+                "run Slang or check/load a KDB. Input capture completeness is separate from "
+                "include resolution and semantic coverage. Replay recovery_context as this tool's "
+                "arguments to require the same compile/source identity after eviction or restart; "
+                "identity mismatch publishes no handle. Driver/load/path, X-trace and all six hierarchy/source "
+                "tools accept design_handle; their first semantic query fixes a KDB candidate and reports validation costs. "
+                "Metadata-only queries do not select a backend. An optional kdb_path declares a candidate without "
+                "asserting source association. Legacy hierarchy handles retain their existing views."
+            ),
+            inputSchema=schemas.PrepareDesignContextOptions.model_json_schema(),
+        ),
+        Tool(
             name="get_sim_paths",
             description=(
-                "Discover compile logs, simulation logs, and waveform files under a verif directory. "
-                "If case_name is omitted, the tool returns available cases. "
-                "For non-standard layouts you may pass explicit sim_log / wave_file / compile_log "
-                "paths; any provided field is used as-is and the omitted ones are still auto-discovered "
-                "(a sim_log path also anchors discovery of the matching waveform and compile/elab logs)."
+                "Discover compile/sim logs and waveforms under verif_root. Omit case_name to list cases. "
+                "Explicit sim_log/wave_file/compile_log override those paths; others are auto-discovered. "
+                "sim_log anchors related wave/build logs. suggested_calls supplies "
+                "parse_sim_log(log_path, simulator) when known."
             ),
             inputSchema={
                 "type": "object",
@@ -5517,8 +6397,7 @@ async def list_tools():
                     },
                     "sim_log": {
                         "type": "string",
-                        "description": "Optional explicit simulation log path (absolute, or relative to verif_root). "
-                        "Used verbatim, and its directory anchors discovery of the waveform and compile/elab logs for the same case.",
+                        "description": "Explicit sim log, absolute or relative to verif_root; anchors related wave/build logs.",
                     },
                     "wave_file": {
                         "type": "string",
@@ -5526,8 +6405,7 @@ async def list_tools():
                     },
                     "compile_log": {
                         "type": "string",
-                        "description": "Optional explicit compile/elaborate log path, absolute or relative to verif_root. "
-                        "Used verbatim when given; otherwise discovered from the case dir, the parent top, or a sibling build/elab dir.",
+                        "description": "Explicit compile/elaborate log, absolute or relative to verif_root; otherwise search case, parent top and sibling build/elab dirs.",
                     },
                 },
                 "required": ["verif_root"],
@@ -5575,7 +6453,8 @@ async def list_tools():
             name="parse_sim_log",
             description=(
                 "Group runtime failures from VCS, Xcelium, or Verilator logs. "
-                "Requires simulator. Includes first-group context. candidate_previous_logs excludes compile/elaboration logs with bounded sampling. "
+                "Pass log_path and simulator, using get_sim_paths.suggested_calls. "
+                "Includes first-group context. candidate_previous_logs excludes compile/elaboration logs with bounded sampling. "
                 "Verilator compiler/host diagnostics are excluded; unknown time stays null."
             ),
             inputSchema={
@@ -5587,7 +6466,7 @@ async def list_tools():
                     },
                     "log_path": {
                         "type": "string",
-                        "description": "Absolute path to the simulation log, for example irun.log",
+                        "description": "Absolute sim log from get_sim_paths.sim_logs[].path; use log_path here, sim_log in discovery.",
                     },
                     "simulator": {"type": "string", "description": "vcs / xcelium / verilator"},
                     "max_groups": {
@@ -6002,13 +6881,18 @@ async def list_tools():
         Tool(
             name="scan_structural_risks",
             description=(
-                "Scan compiled RTL/TB sources for structural risks. fast runs lexical rules; auto (default) "
-                "also reuses compatible semantic facts without a cold frontend build; deep explicitly requests "
-                "a bounded, license-free semantic pass for ties, open inputs and constant comparisons. "
-                "This is a heuristic detector: it reports suspicious patterns, not confirmed root causes. "
-                "Always read coverage_status: only complete with total_risks=0 supports a clean-scan observation; "
-                "zero_coverage scanned no supported sources, and degraded covers only part of the source set. "
-                "Read lexical_coverage_status and semantic.status separately; not_run is not a semantic pass."
+                "Scan compiled RTL/TB for structural risks. fast runs lexical rules only. auto (default) "
+                "also tries existing/cached KDBs through Verdi NPI, then reuses compatible source semantic "
+                "results for missing categories without a cold Slang build. deep also allows bounded Slang "
+                "supplementation. NPI may request a license locally or through configured LSF; scans never build "
+                "a KDB. Native checks cover elaborated input-port bindings and explicitly requested bit-level "
+                "multiple_driver / undriven_signal checks; Slang also supports both driver categories. "
+                "Driver facts describe the observed static model, not runtime contention; an undriven fact requires "
+                "a complete empty inventory for the reported bits. Unsupported constructs remain gaps. "
+                "Read lexical_coverage_status, semantic.category_coverage, result_groups and gaps separately; "
+                "zero_coverage scanned no supported sources. "
+                "Zero risks, cached facts and not_run do not establish semantic completeness. These are investigation "
+                "facts, not confirmed defects or root causes."
             ),
             inputSchema={
                 "type": "object",
@@ -6022,6 +6906,8 @@ async def list_tools():
                         "description": "vcs / xcelium / verilator / auto (default: auto)",
                         "default": "auto",
                     },
+                    "top_hint": {"type": "string", "minLength": 1,
+                                 "description": "Select an elaborated top when compile metadata lacks a unique top; verified against compile evidence and KDB."},
                     "scan_scope": {
                         "type": "string",
                         "description": "Scan scope version. Currently only scope1 is supported.",
@@ -6033,8 +6919,10 @@ async def list_tools():
                         "description": "Optional list of risk categories to scan. If omitted, all categories are scanned.",
                     },
                     "analysis_mode": {"type": "string", "enum": ["fast", "auto", "deep"], "default": "auto"},
-                    "semantic_categories": {"type": "array", "minItems": 1, "items": {"type": "string", "enum": list(SEMANTIC_CATEGORIES)}, "description": "Defaults to constant_connection, open_input, constant_comparison. Request propagated_constant and/or constant_control explicitly for bounded cross-hierarchy analysis."},
+                    "semantic_categories": {"type": "array", "minItems": 1, "items": {"type": "string", "enum": list(SEMANTIC_CATEGORIES)}, "description": "Replaces defaults: constant_connection, open_input, constant_comparison. Explicit multiple_driver / undriven_signal checks use bit-level static driver inventories through NPI or Slang. Request propagated_constant / constant_control explicitly for bounded cross-hierarchy propagation."},
                     "semantic_scope": {"type": "string", "description": "Exact elaborated instance path and its descendants; omitted scans all elaborated tops."},
+                    "semantic_continuation": {"type": "string", "minLength": 32, "maxLength": 32,
+                        "description": "Process-local token from semantic.continuation. Resume the same native inventory with unchanged compile log, top, scope and categories. Work budgets may change. Tokens expire after 10 minutes and are consumed on success."},
                     "semantic_timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 120, "default": 15},
                     "semantic_max_rss_mib": {"type": "integer", "minimum": 64, "maximum": 4096, "default": 512},
                     "semantic_max_instances": {"type": "integer", "minimum": 1, "maximum": 100000, "default": 25000},
@@ -6112,8 +7000,11 @@ async def list_tools():
                         "type": "object",
                         "description": "Normalized failure_event from parse_sim_log for the same log",
                     },
+                    "design_handle": {"type": "string", "description": "Prepared design for bounded source correlation; no full hierarchy required."},
                     "compile_log": {"type": "string"},
+                    "supplementary_compile_logs": {"type": "array", "items": {"type": "string"}, "maxItems": 16},
                     "top_hint": {"type": "string"},
+                    "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 300, "default": 30},
                 },
                 "required": ["log_path", "wave_path", "simulator", "failure_event"],
             },
@@ -6121,7 +7012,7 @@ async def list_tools():
         Tool(
             name="recommend_failure_debug_next_steps",
             description=(
-                "Prioritize a failure using log, waveform, and hierarchy; "
+                "Prioritize a failure using log, waveform, and bounded source correlation; "
                 "recommend signals, instances, and failure class. "
                 "Also suggests a diff_sim_failure_results call to use on the next run."
             ),
@@ -6135,8 +7026,11 @@ async def list_tools():
                     "log_path": {"type": "string"},
                     "wave_path": {"type": "string"},
                     "simulator": {"type": "string", "description": "vcs / xcelium / verilator"},
+                    "design_handle": {"type": "string", "description": "Prepared design for bounded source correlation; no full hierarchy required."},
                     "compile_log": {"type": "string"},
+                    "supplementary_compile_logs": {"type": "array", "items": {"type": "string"}, "maxItems": 16},
                     "top_hint": {"type": "string"},
+                    "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 300, "default": 30},
                 },
                 "required": ["log_path", "wave_path", "simulator"],
             },
@@ -6145,17 +7039,20 @@ async def list_tools():
             name="get_diagnostic_snapshot",
             description=(
                 "Cold-start accelerator that aggregates cached tool results into a single summary view. "
-                "It never triggers sub-steps and only reads cache. "
+                "It never runs analysis sub-steps; an optional legacy Xcelium KDB hint reads compile metadata. "
                 "Returns availability status, compact summaries, and suggested calls for missing steps. "
                 "The result cache is process-global and survives across cases, so at the start of a new "
                 "session pass your target case (verif_root and/or case_dir): the snapshot validates the "
                 "cache against it and reports a clean cold start if the cache belongs to a different case. "
+                "Prepared design_context summaries are observed metadata, not revalidated source/KDB facts. "
+                "Pass design_handle to select one explicitly; multiple matching contexts remain ambiguous. "
                 "If you pass no target, a cached sim_paths is returned with summary.carried_over=true to "
                 "signal it may belong to a previous case — confirm it or re-run get_sim_paths."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "design_handle": {"type": "string", "description": "Explicit prepared context for this cache-only summary."},
                     "verif_root": {
                         "type": "string",
                         "description": (
@@ -6180,31 +7077,7 @@ async def list_tools():
         Tool(
             name="explain_signal_driver",
             description=(
-                "Trace a waveform signal to its RTL driver and file:line (assignments, "
-                "procedural blocks, module outputs); recursive=true crosses instances.\n\n"
-                "Default traceweave.driver.compact.v1 is lossless: all retained evidence is in "
-                "this response. In result.driver_chain/bit_provenance, "
-                "statement_semantics_ref indexes evidence_tables.statement_semantics; "
-                "statement_evidence_ref indexes {locations_ref,evidence_indices_ref} pairs in "
-                "evidence_tables. Preserve row/index order; table entries and location occurrences "
-                "are not writer counts. output_format='full' restores the original shape/indentation.\n\n"
-                "include_dependencies=true adds one-hop data/control/clock/reset candidates with "
-                "exact waveform selections and gaps. No sampled values or active-branch verdict: "
-                "sample the relevant window/clock phase. Omit for source lookup only.\n\n"
-                "Default route: trusted Verdi NPI -> bounded Source Graph -> Legacy Static. "
-                "Source Graph preserves per-bit port mappings and instance hierarchy; Static "
-                "cannot resolve composite port mappings. allow_bounded_bootstrap without full "
-                "hierarchy returns proved positive Source Graph facts only; inconclusive results "
-                "never trigger a full-source Static scan.\n\n"
-                "Read backend_status.actual_backend, traversal limits/reasons, and source_info_origin "
-                "per hop. claim_semantics separates positive_fact_confidence/target_bit_coverage "
-                "from global_coverage_status; legacy confidence combines fact confidence and coverage. "
-                "Partial/truncated facts are not exhaustive. Require exclusive_driver_proved for "
-                "uniqueness and negative_claim_allowed for no driver. Structural multiple_driver "
-                "does not prove value conflict; unknown does not prove floating.\n\n"
-                "driver_status='testbench_driven' with cross_check.conflict=true identifies a "
-                "consumer/load alias. Investigate the TB/BFM/virtual-interface driver; do not blame "
-                "the DUT consumer or infer a mis-wire."
+                "Trace a signal to RTL drivers/file:line; recursive crosses instances. Route: trusted NPI -> bounded Source Graph -> Static. Read actual_backend, source_info_origin, traversal and claim_semantics: partial facts are not exhaustive; uniqueness requires exclusive_driver_proved, absence requires negative_claim_allowed. multiple_driver does not prove value conflict. testbench_driven with cross_check.conflict identifies a consumer alias; investigate TB/BFM. Default traceweave.driver.compact.v1 is lossless: statement_semantics_ref indexes evidence_tables.statement_semantics; statement_evidence_ref indexes {locations_ref,evidence_indices_ref} pairs. Preserve order; entries/locations are not writer counts. full restores the original shape. include_dependencies adds one-hop data/control/clock/reset candidates, without sampled values or active-branch verdict. Verify runtime hypotheses with waveforms. Unresolved source inferences must be cited separately from backend facts. Explicit compile_context retains historical recovery; inspect hierarchy_recovery."
             ),
             inputSchema={
                 "type": "object",
@@ -6213,6 +7086,7 @@ async def list_tools():
                     "wave_path": {"type": "string"},
                     "compile_log": {"type": "string"},
                     "compile_context": schemas.DivergenceContext.model_json_schema(),
+                    "design_handle": {"type": "string", "minLength": 1},
                     **_bounded_bootstrap_input_properties(),
                     "simulator": {
                         "type": "string",
@@ -6234,36 +7108,14 @@ async def list_tools():
                         "description": "Maximum recursive depth when recursive=true",
                     },
                 },
-                "required": ["signal_path", "wave_path", "compile_log"],
+                "required": ["signal_path", "wave_path"],
+                "anyOf": [{"required": ["compile_log"]}, {"required": ["design_handle"]}],
             },
         ),
         Tool(
             name="find_signal_loads",
             description=(
-                "List places that consume (load) a signal: child instance input ports, "
-                "RHS of assigns/procedural assignments, and always-block sensitivity lists. "
-                "When a Verdi KDB is detected, an NPI backend transparently engages and "
-                "resolves the cross-hierarchy / interface-positional / generate-block cases "
-                "that the static source-regex backend cannot reach. If NPI is unavailable or "
-                "cannot return a trustworthy result, TraceWeave next attempts the bounded, "
-                "on-demand Source Graph; Legacy Static remains the normal final fallback "
-                "(shallow_only). When allow_bounded_bootstrap=true and no full hierarchy exists, "
-                "only proved positive Source Graph facts are returned; an inconclusive/blocker "
-                "does not trigger a whole-source Static rescan. backend_status preserves the complete attempt chain and Source "
-                "Graph coverage/build receipt. claim_semantics separates confidence in returned "
-                "positive load facts from whole-artifact coverage; exhaustive_search is required "
-                "before treating the list as all loads, and negative_claim_allowed is required "
-                "before claiming there are none. A complete Source Graph not_connected is distinct "
-                "from an inconclusive no-match, which falls through to Static only on the normal full-hierarchy route. "
-                "Every backend publishes enumeration.{returned_count, output_limit, "
-                "output_truncated, search_exhaustive, incomplete_reasons, "
-                "continuation_supported}. High-fanout output is capped at 256; capped "
-                "positive loads remain usable but are not a complete list, and no backend "
-                "currently promises a continuation token. "
-                "Each load query normalizes trailing numeric selects for Legacy Static matching, while "
-                "Source Graph validates the selected bits against the declaration. Each load "
-                "carries source_info_origin ('compile_log', 'npi', or 'source_graph') so consumers can tell "
-                "which provenance produced its file:line."
+                "Find consuming ports, assignment RHS and sensitivity lists. Route: trusted NPI -> bounded Source Graph -> Static. Read actual_backend, source_info_origin and claim_semantics. Returned positive facts need not cover all loads: require exhaustive_search for completeness and negative_claim_allowed for absence. enumeration reports returned/output limits, truncation, search coverage and continuation support; at most 256 loads, no promised continuation. Source Graph validates selected bits; Static normalizes numeric selects. A complete not_connected differs from inconclusive no-match. Legacy bounded bootstrap never invokes a full-source Static rescan. Cite manual source inferences separately and verify runtime behavior with waveform evidence."
             ),
             inputSchema={
                 "type": "object",
@@ -6271,6 +7123,7 @@ async def list_tools():
                     "signal_path": {"type": "string"},
                     "wave_path": {"type": "string", "description": "Optional waveform for an evidence-checked wave/design root binding."},
                     "compile_log": {"type": "string"},
+                    "design_handle": {"type": "string", "minLength": 1},
                     **_bounded_bootstrap_input_properties(),
                     "simulator": {
                         "type": "string",
@@ -6300,23 +7153,14 @@ async def list_tools():
                         "description": "Restrict result to a subset of load kinds.",
                     },
                 },
-                "required": ["signal_path", "compile_log"],
+                "required": ["signal_path"],
+                "anyOf": [{"required": ["compile_log"]}, {"required": ["design_handle"]}],
             },
         ),
         Tool(
             name="trace_signal_path",
             description=(
-                "Find a structural connectivity path between two signals. A "
-                "trusted Verdi NPI result wins; otherwise TraceWeave tries a "
-                "bounded, dual-endpoint Source Graph before Legacy Static. "
-                "Source Graph follows only projected IR facts across bindings and "
-                "supported combinational dependencies. claim_semantics reports confidence in a "
-                "proved positive path independently from global coverage; a found path is not an "
-                "exhaustive enumeration. A no-path result is exact only when "
-                "negative_claim_allowed=true; an inconclusive result falls through "
-                "to unsupported_reason='static_backend_no_path_api'. This is "
-                "connectivity, NOT temporal driver direction — use "
-                "explain_signal_driver for driver semantics."
+                "Find structural connectivity between signals through trusted NPI, bounded dual-endpoint Source Graph, then Static. A found path is positive evidence, not exhaustive enumeration or temporal driver direction. Absence requires negative_claim_allowed; incomplete/unsupported cannot prove disconnection. Static may report static_backend_no_path_api. Read actual_backend, coverage and claim_semantics; use driver/load queries or cite verified source inferences at unresolved boundaries. Do not repeat an unchanged unsupported call."
             ),
             inputSchema={
                 "type": "object",
@@ -6325,6 +7169,7 @@ async def list_tools():
                     "wave_path": {"type": "string", "description": "Optional waveform for an evidence-checked wave/design root binding."},
                     "to_signal": {"type": "string"},
                     "compile_log": {"type": "string"},
+                    "design_handle": {"type": "string", "minLength": 1},
                     "simulator": {
                         "type": "string",
                         "description": "vcs / xcelium / verilator / auto; session default.",
@@ -6341,7 +7186,8 @@ async def list_tools():
                         ),
                     },
                 },
-                "required": ["from_signal", "to_signal", "compile_log"],
+                "required": ["from_signal", "to_signal"],
+                "anyOf": [{"required": ["compile_log"]}, {"required": ["design_handle"]}],
             },
         ),
         Tool(
@@ -6387,28 +7233,7 @@ async def list_tools():
         Tool(
             name="trace_x_source",
             description=(
-                "Start from a real signal path; supported RTL expressions are extracted internally. "
-                "When a signal shows X/Z at a target time, trace its propagation "
-                "chain through upstream driver logic. Uses the selected connectivity "
-                "route (trusted local/LSF NPI, bounded Source Graph, then Static). "
-                "A Source Graph trace may expand to bounded direct-child frontiers "
-                "when an unresolved parent net can be driven by a child output. Any "
-                "backend or artifact change discards the partial chain and restarts "
-                "from the original signal, so one returned chain never mixes "
-                "provenance. Connectivity queries run outside waveform locks. "
-                "backend_status reports selected versus actual backend; "
-                "trace_restarted reports a whole-trace retry. Source Graph chain nodes preserve "
-                "claim_semantics, so an exact positive edge can be used without implying global "
-                "coverage or exclusive drive. NPI testbench-driven/cross-check evidence is "
-                "preserved on the node. Default mode=snapshot keeps the same-time chain. "
-                "mode=history requires history_start_ps and returns history.nodes/edges/frontier: "
-                "observed X/Z intervals, supported register sampling/hold and combinational evidence. "
-                "Same-edge data predecessors may extend a labelled candidate path while retaining "
-                "the scheduling gap; ambiguous controls or clocks still stop expansion. "
-                "Typed NPI async boundaries expose control assertions and clock observations "
-                "without inferring the reset/set assignment value or a causal relation. "
-                "Missing history, ambiguous scheduling, CDC or unsupported asynchronous controls "
-                "remain boundaries; observed dump onset is never asserted to be the true first origin."
+                "Trace X/Z upstream from a real signal. snapshot follows same-time propagation; history requires history_start_ps and returns observed intervals, sampling/hold evidence and partial frontiers. Native/backend/artifact changes discard the chain and restart at the original target/window. Connectivity runs outside wave locks. Read actual_backend, trace_restarted and node claim_semantics: a positive edge does not prove exclusive drive or global coverage. Keep TB-driver cross-checks. Same-edge predecessors retain scheduling gaps; ambiguous controls/clocks, CDC, missing history and unsupported asynchronous controls stop expansion. Async evidence does not infer assignment values or causality; dump onset is not a proven first origin. Cite source inference separately and verify timing against waveforms."
             ),
             inputSchema={
                 "type": "object",
@@ -6420,6 +7245,8 @@ async def list_tools():
                         "description": "Trace start time." + _TIMESPEC_HINT,
                     },
                     "compile_log": {"type": "string"},
+                    "design_handle": {"type": "string", "minLength": 1,
+                                      "description": "Explicit independent context; replaces compile_log and legacy hierarchy prerequisite."},
                     "simulator": {
                         "type": "string",
                         "description": "vcs / xcelium / verilator / auto; session default.",
@@ -6440,21 +7267,19 @@ async def list_tools():
                     "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 120, "default": 30},
                     "compile_context": schemas.DivergenceContext.model_json_schema(),
                 },
-                "required": ["wave_path", "signal_path", "time_ps", "compile_log"],
+                "required": ["wave_path", "signal_path", "time_ps"],
+                "anyOf": [{"required": ["compile_log"]}, {"required": ["design_handle"]}],
                 "allOf": [{"if": {"properties": {"mode": {"const": "history"}}, "required": ["mode"]},
                            "then": {"required": ["history_start_ps"]}}],
             },
         ),
         # ── Hierarchy handle tools (phase 4) ────────────────────────────
-        # All six share the same access pattern: resolve `handle` via the
-        # in-process HandleStore (registered by build_tb_hierarchy), then
-        # return a typed slice or a HandleErrorResult.
+        # Legacy handles resolve through HandleStore. Prepared queries keep
+        # compile ownership distinct from NPI semantic observations.
         Tool(
             name="get_tb_subtree",
             description=(
-                "Return a slice of the component_tree starting at `root` (dotted instance path) "
-                "with up to `depth` levels. Use after build_tb_hierarchy to drill into a branch "
-                "without pulling the whole tree into context."
+                "Return root plus depth levels; max_nodes includes root. New routes return schema_version=2; legacy handle shape is retained. bounded count is a lower bound at unvisited frontiers; exact traverses undisplayed descendants within work/time budgets. Raw NPI locations with *_location_unbound gaps are unverified locators. Inspect coverage/count limits; source fallback uses a bounded semantic artifact."
             ),
             inputSchema={
                 "type": "object",
@@ -6463,6 +7288,7 @@ async def list_tools():
                         "type": "string",
                         "description": "hierarchy_handle from build_tb_hierarchy",
                     },
+                    "design_handle": {"type": "string", "minLength": 1},
                     "root": {
                         "type": "string",
                         "default": "",
@@ -6478,21 +7304,24 @@ async def list_tools():
                         "default": 500,
                         "description": "hard cap on emitted nodes",
                     },
+                    "count_mode": {"type": "string", "enum": ["bounded", "exact"], "default": "bounded",
+                                   "description": "design_handle only; exact counting may traverse undisplayed descendants."},
+                    "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 300, "default": 30,
+                                    "description": "design_handle only; includes context validation, binding and query."},
                 },
-                "required": ["handle"],
+                "oneOf": [{"required": ["handle"]}, {"required": ["design_handle"]}],
             },
         ),
         Tool(
             name="lookup_tb_files",
             description=(
-                "Query the compiled file set by objective scan facts. At least one filter is "
-                "required. Use this to disambiguate multi-version files (basename collisions "
-                "are also reported via build_tb_hierarchy.ambiguous_basenames)."
+                "AND compiled-file filters; at least one required. Name/path-only filters use metadata without KDB/backend work; semantic fields stay null. has_module/contains_uvm/file_type need semantic evidence: unknown is not a negative match. Read ownership_basis, unknown_filter_files, semantic_work_scope and separate declaration/import/UVM coverage. bounded stops at an omitted match; exact inspects all candidates within budgets. New schema_version=2; legacy handle shape remains."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "handle": {"type": "string"},
+                    "design_handle": {"type": "string", "minLength": 1},
                     "basename": {
                         "type": "string",
                         "description": "exact basename match",
@@ -6505,27 +7334,31 @@ async def list_tools():
                     },
                     "contains_uvm": {
                         "type": "boolean",
-                        "description": "scan saw `import uvm_pkg::` or `extends uvm_*`",
+                        "description": "proved UVM usage; unknown semantic coverage cannot prove false",
                     },
                     "file_type": {
                         "type": "string",
-                        "description": "module | interface | package | class | program (from SV scan)",
+                        "description": "classification from the selected source provider, not compiler file-type hints",
                     },
                     "limit": {"type": "integer", "default": 50},
+                    "count_mode": {"type": "string", "enum": ["bounded", "exact"], "default": "bounded",
+                                   "description": "design_handle only; exact counting may inspect all matching compile members."},
+                    "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 300, "default": 30,
+                                    "description": "design_handle only; includes context validation, binding and query."},
                 },
-                "required": ["handle"],
+                "oneOf": [{"required": ["handle"]}, {"required": ["design_handle"]}],
             },
         ),
         Tool(
             name="find_tb_instance",
             description=(
-                "Locate instance(s) in the component_tree by exact path OR by module name. "
-                "`path` and `module` are mutually exclusive."
+                "Find by exact path OR module, never both. Exact paths do not enumerate children; module searches are bounded. exact count requests complete counting within budgets. New schema_version=2 carries semantic identities, separate instance/definition locations, count and coverage limits; legacy handle shape remains. Raw *_location_unbound paths are unverified source locators."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "handle": {"type": "string"},
+                    "design_handle": {"type": "string", "minLength": 1},
                     "path": {
                         "type": "string",
                         "description": "exact dotted instance path",
@@ -6535,51 +7368,62 @@ async def list_tools():
                         "description": "module name; returns all instances",
                     },
                     "limit": {"type": "integer", "default": 100},
+                    "count_mode": {"type": "string", "enum": ["bounded", "exact"], "default": "bounded",
+                                   "description": "design_handle only; output limit is separate from work limits."},
+                    "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 300, "default": 30,
+                                    "description": "design_handle only; includes context validation, binding and query."},
                 },
-                "required": ["handle"],
+                "oneOf": [{"required": ["handle"]}, {"required": ["design_handle"]}],
             },
         ),
         Tool(
             name="get_tb_file_detail",
             description=(
-                "Return symbols (modules/classes/interfaces) defined in a single compiled file. "
-                "If the path is not in the compile set, error includes basename-similar suggestions."
+                "Read module/class/interface declarations for an exact compiled path or alias. Nonmembers return basename suggestions without backend work. New schema_version=2 reports ownership_basis, semantic_work_scope, symbol_inventory_complete and semantic_gaps; legacy handle shape remains. Budgeted native namespace lookup may omit uninstantiated declarations/imports/variables; unprocessed files and unelaborated bodies cannot prove absence."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "handle": {"type": "string"},
-                    "path": {"type": "string"},
+                    "design_handle": {"type": "string", "minLength": 1},
+                    "path": {"type": "string", "minLength": 1},
+                    "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 300, "default": 30,
+                                    "description": "design_handle only; includes context validation, binding and query."},
                 },
-                "required": ["handle", "path"],
+                "required": ["path"],
+                "oneOf": [{"required": ["handle"]}, {"required": ["design_handle"]}],
             },
         ),
         Tool(
             name="get_tb_class_hierarchy",
             description=(
-                "Return UVM/class inheritance tree built from compiled-source scan results. "
-                "Use `root_class` to start from a specific class; empty = all roots."
+                "Static inheritance, not runtime UVM topology. root_class accepts symbol ID, qualified name or unambiguous short name. New schema_version=2; legacy shape remains. Derived discovery may need budgeted global inventory. total counts rendered nodes; class_inventory_* describes declaration coverage. External reference bases are not recovered declarations. declaration bases carry observed base_value_parameters/status/gaps; specialization bases carry actual type bindings. Generic defaults are not derived actuals; Slang canonical IDs are artifact-local. Raw npi_class_location_unbound paths are unverified locators."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "handle": {"type": "string"},
+                    "design_handle": {"type": "string", "minLength": 1},
                     "root_class": {"type": "string"},
                     "depth": {"type": "integer", "default": -1},
+                    "max_nodes": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 5000,
+                                  "description": "design_handle only; output limit is separate from inventory work."},
+                    "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 300, "default": 30,
+                                    "description": "design_handle only; includes context validation, binding and query."},
                 },
-                "required": ["handle"],
+                "oneOf": [{"required": ["handle"]}, {"required": ["design_handle"]}],
             },
         ),
         Tool(
             name="dump_tb_section",
             description=(
-                "Escape hatch: return a named raw section of the full hierarchy result. "
-                "Prefer targeted handle tools — this is intentionally heavy."
+                "Export one named section. compile_result/include_tree/filelist_tree use metadata without backend work. Semantic sections may traverse globally within work/time budgets; max_items limits display only. component_tree_full requests exact descendant counting. export_complete=false remains partial even with exact counts. Class sections describe static inheritance; declarations retain coverage gaps. New schema_version=2; legacy handle shape remains."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "handle": {"type": "string"},
+                    "design_handle": {"type": "string", "minLength": 1},
                     "section": {
                         "type": "string",
                         "enum": [
@@ -6592,8 +7436,13 @@ async def list_tools():
                             "class_hierarchy_full",
                         ],
                     },
+                    "max_items": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 5000,
+                                  "description": "design_handle only; hard output cap, not a guarantee of complete export."},
+                    "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 300, "default": 30,
+                                    "description": "design_handle only; includes context validation, binding and export."},
                 },
-                "required": ["handle", "section"],
+                "required": ["section"],
+                "oneOf": [{"required": ["handle"]}, {"required": ["design_handle"]}],
             },
         ),
         Tool(
@@ -6648,6 +7497,8 @@ async def list_tools():
                 "Reports actual event-page capability and read volume in reading. "
                 "When present, first_divergence_time_fs is exact; the integer-ps cursor "
                 "rounds up and may observe a later value. "
+                "Optional context_a/context_b accept independent design_handle values or exact legacy compile contexts. "
+                "They bind later driver actions without loading a backend; changed identities publish no cursor. "
                 "Reads existing waveforms only — does NOT rerun simulation."
             ),
             inputSchema={
@@ -6669,8 +7520,8 @@ async def list_tools():
                         "type": "string",
                         "description": "Full hierarchical signal path in wave_path_b.",
                     },
-                    "context_a": schemas.DivergenceContext.model_json_schema(),
-                    "context_b": schemas.DivergenceContext.model_json_schema(),
+                    "context_a": schemas.DivergenceQueryContext.model_json_schema(),
+                    "context_b": schemas.DivergenceQueryContext.model_json_schema(),
                     "start_time_ps": {
                         **_integer_or_string_schema(),
                         "description": "Start of comparison window. Default 0."
@@ -6701,13 +7552,19 @@ async def list_tools():
                 "Use real signal paths as roots; supported RTL expressions are extracted internally. "
                 "Verify a waveform difference and backtrace its active data/control dependencies "
                 "on both sides within explicit time/work limits. Uses the normal trusted NPI, "
-                "Source Graph, Static route. Each side requires its exact compile context and "
-                "a current build_tb_hierarchy result. Explicit signal/scope mappings are required "
+                "Source Graph, Static route. Each side independently accepts a design_handle "
+                "from prepare_design_context, or its exact legacy compile context with a current "
+                "build_tb_hierarchy result. A design_handle may omit compile_log and cannot be "
+                "combined with legacy identity tokens. Explicit signal/scope mappings are required "
                 "across different designs. Reports evidence, candidates and honest frontiers; "
                 "does not claim a unique root cause or rerun simulation. Clock mode requires "
                 "aligned clock_a/clock_b edges. History never extends before start_time_ps."
                 " Observations are reused only within this request and graph artifact; "
                 "a sub-ps event difference remains a sampling frontier for dynamic tracing."
+                " Independent-context source tracing uses captured compile inputs and bounded semantic "
+                "artifacts; changing an artifact restarts that side from its original root. "
+                "Identity changes discard both sides and the "
+                "root comparison before any evidence cursor is published."
             ),
             inputSchema=schemas.TraceDivergenceInput.model_json_schema(),
         ),
@@ -6854,9 +7711,7 @@ async def list_tools():
                 "deadlock signature ended_in_stall, x-while-valid, payload-hold, "
                 "write-data-hold, premature valid deassertion, backpressure) ordered by "
                 "a transparent mechanical key. "
-                "Use on opaque global symptoms (timeout/hang) when you don't know which "
-                "of many interfaces misbehaves — it collapses N suggest+inspect "
-                "round-trips into one. Always interpret flagged_count together with "
+                "Use for timeout/hang when the responsible interface is unknown. Interpret flagged_count with "
                 "coverage_status: zero_coverage means no protocol interfaces were "
                 "checked and is NOT a pass; truncated/degraded means partial coverage. "
                 "Read discovery for enumeration budgets, exact scope totals or lower bounds; "
@@ -6868,7 +7723,8 @@ async def list_tools():
                 "FSDB native transition-buffer truncation is propagated per row and "
                 "forces degraded coverage; zero findings then cover only returned prefixes. "
                 "Returns FACTS, not a root-cause verdict; re-rank as the symptom "
-                "warrants. Reads existing waveforms only."
+                "warrants. VCD first use parses the entire file; scope/window reduce "
+                "subsequent analysis work. Reads existing waveforms only."
             ),
             inputSchema={
                 "type": "object",
@@ -6904,7 +7760,7 @@ async def list_tools():
                     },
                     "max_interfaces": {
                         "type": "integer",
-                        "description": "Max interfaces to sweep (default 64). If discovery exceeds this the result is flagged truncated=true — raise it for full coverage.",
+                        "description": "Interface cap (default 64). Increase for a cap-only gap; discovery/transition gaps need scope/window changes.",
                         "default": 64,
                     },
                 },
@@ -6914,24 +7770,11 @@ async def list_tools():
         Tool(
             name="verify_window",
             description=(
-                "Check signal conditions or SV expression predicates over a clock window and return a precise "
-                "verdict (holds) plus a concrete witness/counterexample (cycle + sampled "
-                "values). You state the predicate; the tool checks it against the waveform "
-                "over the requested cycles. A term is {signal, op, value} "
-                "(op: eq/ne/gt/ge/lt/le/is_x/is_known) or a typed {expr,...} using SV truth "
-                "conversion. A predicate is a list of terms (implicit AND). Modes: "
-                "always(P), never(P), eventually(P), implication (A |-> B within N "
-                "cycles, the protocol-response template; set overlap=false for |=> = a "
-                "stability/hold property where B must STILL hold the NEXT cycle, e.g. "
-                "HTRANS/valid held through a wait state), and sequence (the per-accepted-beat "
-                "increment of a signal — address-stride checks like AHB haddr +stride; "
-                "supports modulo for WRAP bursts and restart_when for burst boundaries). "
-                "x/z cycles are reported as "
-                "unknown (never silently passed); an implication whose response window runs "
-                "past end-of-trace is reported inconclusive (never silently failed). On a "
-                "finding it sets violating_signal + a next_action to explain_signal_driver "
-                "(bus facts do not self-attribute master/slave). Use to "
-                "prove/disprove an RTL inference in one call. Reads existing waveforms only."
+                "Check existing waveforms. Template modes: always, never, eventually, implication, "
+                "numeric sequence. Terms {signal,op,value} or typed {expr,...} combine with AND. "
+                "Implication checks every edge by default; response bounds select exact delays. "
+                "Hold checks need overlap=false, within_cycles>=1. Inspect holds, vacuous, unknown "
+                "and coverage together; partial holds excludes nothing. Driver links are evidence."
             ),
             inputSchema={
                 "type": "object",
@@ -6952,6 +7795,7 @@ async def list_tools():
                             "eventually",
                             "implication",
                             "sequence",
+                            "property",
                         ],
                         "description": "Temporal template to evaluate.",
                     },
@@ -6995,7 +7839,7 @@ async def list_tools():
                     },
                     "delta": {
                         "type": "object",
-                        "description": "sequence only: check the per-accepted-beat increment of one signal. predicate is the accepted-beat gate (e.g. hready==1 && htrans active). E.g. AHB byte INCR: {signal:'top.haddr', value:1}. For WRAP bursts pass modulo = burst region bytes (size*len) so the wrap-around beat is accepted via (cur-prev) mod modulo. Pass restart_when (a predicate, e.g. htrans==NONSEQ) to re-seed at each new burst so burst boundaries are not flagged.",
+                        "description": "sequence: accepted-beat numeric increment, not SVA matching. predicate gates beats; modulo handles WRAP regions; restart_when re-seeds burst boundaries.",
                         "properties": {
                             "signal": {
                                 "type": "string",
@@ -7016,7 +7860,7 @@ async def list_tools():
                             },
                             "restart_when": {
                                 "type": "array",
-                                "description": "Optional AND-combined {signal,op,value} or {expr,...} terms. On accepted beats where true, re-seed for a new burst without checking its increment.",
+                                "description": "AND terms; on a matching accepted beat, re-seed without checking its increment.",
                                 "items": {"type": "object"},
                             },
                         },
@@ -7024,14 +7868,23 @@ async def list_tools():
                     },
                     "within_cycles": {
                         "type": "integer",
-                        "description": "implication only: B must hold within this many cycles of A. The response window is [i, i+within] when overlap=true (includes A's cycle) or [i+1, i+within] when overlap=false. Default 1.",
-                        "default": 1,
+                        "description": "implication deadline N: [i,i+N] if overlapping, [i+1,i+N] otherwise. Default 1; not an exact delay.",
                     },
                     "overlap": {
                         "type": "boolean",
-                        "description": "implication only. true (default, |->): the response window includes A's own cycle. false (|=>): the window starts the NEXT cycle [i+1, i+within] — use this for a stability/hold property ('B must STILL hold next cycle', e.g. HTRANS/valid held through a wait state) where A already implies B on its own cycle. With overlap=true such a property is a VACUOUS pass (flagged in result.vacuous + warnings); overlap=false requires within_cycles>=1.",
-                        "default": True,
+                        "description": "Include antecedent cycle (default true). false starts next cycle and requires within_cycles>=1. Hold checks need false; same-cycle satisfaction may be flagged vacuous.",
                     },
+                    "response_min_cycles": {"type": "integer", "minimum": 0, "maximum": 1000000,
+                        "description": "implication: minimum response offset from antecedent end; use with response_max_cycles instead of overlap/within_cycles."},
+                    "response_max_cycles": {"type": "integer", "minimum": 0, "maximum": 1000000,
+                        "description": "Inclusive maximum offset; min=max checks an exact delay."},
+                    "attempt_start_indices": {"type": "array", "minItems": 1, "maxItems": 4096,
+                        "uniqueItems": True, "items": {"type": "integer", "minimum": 0},
+                        "description": "implication: selected zero-based edges in the sampled window; other edges remain response evidence. Omit for every edge."},
+                    "sample_phase": {"type": "string", "enum": ["before", "after"],
+                        "description": "Default after. Before reads strictly before the physical edge, excluding same-timestamp updates; requires zero offset."},
+                    "sample_offset_ps": {"type": "integer", "minimum": 0,
+                        "description": "Default 1ps after, 0 before. Physical sampling does not certify all SVA scheduling regions."},
                     "edge": {
                         "type": "string",
                         "enum": ["posedge", "negedge"],
@@ -7376,8 +8229,6 @@ async def list_tools():
             else:
                 prop.pop("type", None)
                 prop.update(_signal_selection_schema())
-            prop["description"] = prop.get("description", "") + (
-                " Accepts a path, fixed selection or {expr,...}; see WaveformSignalInput and WaveformExpression.")
         if tool.name == 'verify_window':
             props = tool.inputSchema['properties']
             legacy = props['predicate']['items']
@@ -7409,35 +8260,66 @@ async def list_tools():
                 "max_wait_cycles": {"type": "integer", "minimum": 0, "default": 16},
             }, "required": ["wave_path", "clock"]}),
         Tool(name="resolve_packed_fields", description=(
-            "Resolve requested named packed members from the current content-anchored Source Graph "
-            "artifact and an exact dump declaration. Requires current hierarchy and complete semantic "
-            "type evidence; may run the bounded license-free worker. Returns mapping_required when "
-            "identity, active instance specialization, type or range cannot be proved. Returned explicit "
-            "selections are a compile snapshot: re-resolve after input changes. No waveform/source version inferred."),
+            "Resolve packed members using actual compiled type membership, instance specialization, bit identity and exact dump range. Unsupported NPI layouts may use bounded Source Graph. mapping_required means identity/type/range could not be proved. Returned selections are a compile observation: re-resolve after input changes; no waveform/source version association is inferred."),
             inputSchema={"type": "object", "properties": {
                 "wave_path": {"type": "string"}, "compile_log": {"type": "string"},
+                "design_handle": {"type": "string"},
+                "supplementary_compile_logs": {"type": "array", "items": {"type": "string"}, "maxItems": 16},
+                "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 300, "default": 30},
                 "simulator": {"type": "string"}, "top_hint": {"type": "string"},
                 "signal_path": {"type": "string", "description": "Exact dump declaration path."},
                 "source_signal": {"type": "string", "description": "Exact whole aggregate in the compiled hierarchy."},
                 "fields": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 128},
-            }, "required": ["wave_path", "compile_log", "signal_path", "source_signal", "fields"]}),
+            }, "required": ["wave_path", "signal_path", "source_signal", "fields"],
+            "anyOf": [{"required": ["compile_log"]}, {"required": ["design_handle"]}]}),
     ])
+    from src.native_query import NATIVE_TOOLS
+    native_properties = {
+        "compile_log": {"type": "string", "minLength": 1},
+        "supplementary_compile_logs": {"type": "array", "items": {"type": "string", "minLength": 1}, "maxItems": 16},
+        "simulator": {"type": "string", "enum": ["auto", "vcs", "xcelium", "verilator"], "default": "auto"},
+        "top_hint": {"type": "string", "minLength": 1},
+        "kdb_path": {"type": "string", "minLength": 1},
+        "backend_preference": {"type": "string", "enum": ["auto", "source"], "default": "auto"},
+        "retry_npi": {"type": "boolean", "default": False},
+        "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 300, "default": 30},
+    }
+    native_selector = {"anyOf": [{"required": ["compile_log"]}, {"required": ["kdb_path", "top_hint"]}],
+        "not": {"anyOf": [{"required": [k]} for k in ("handle", "design_handle", "compile_context")]}}
+    for tool in _tools:
+        if tool.name in NATIVE_TOOLS:
+            if tool.name in {"analyze_failure_event", "recommend_failure_debug_next_steps"}:
+                tool.description += " KDB-only log consumers require an explicit simulator."
+            tool.inputSchema["properties"].update(native_properties)
+            tool.inputSchema["required"] = [k for k in tool.inputSchema.get("required", []) if k != "compile_log"]
+            if "oneOf" in tool.inputSchema:
+                tool.inputSchema["oneOf"].append(native_selector)
+            elif "anyOf" in tool.inputSchema:
+                tool.inputSchema["anyOf"].append(native_selector)
+            tool.description = (
+                "compile_log or kdb_path+top_hint: NPI, then automatic source fallback. " + tool.description)
     for tool in _tools:
         properties = tool.inputSchema["properties"]
+        if tool.name == 'verify_window':
+            from src.property_check import PropertyCheckOptions
+            properties.update({k:{a:b for a,b in v.items() if a!='default'} for k,v in PropertyCheckOptions.model_json_schema()['properties'].items()
+                               if k not in {'wave_path','mode'}})
+            tool.inputSchema['required']=['wave_path','mode']
+            tool.inputSchema['allOf']=[{'if':{'properties':{'mode':{'const':'property'}}},
+                'then':{'required':['property_plan'],'anyOf':[{'required':[key]} for key in
+                    ('failure_event','failure_time_ps','log_path')]},'else':{'required':['clock']}}]
+            tool.description+=' property: use an explain_property include_check_plan handle plus failure event/time or log_path. Automatically locate history/attempts; scope/bindings resolve names. Read status, coverage and gaps; not_reproduced is not a global pass.'
         if tool.name == "get_waveform_summary":
-            tool.description += " Optional FST: see fst_backend/fst_reading capabilities and gaps."
+            tool.description += (
+                " VCD first use reads/parses the entire file, including for this summary. "
+                "Optional FST: see fst_backend/fst_reading capabilities and gaps.")
         if tool.name in selectable or tool.name == 'inspect_tlul':
             tool.inputSchema['$defs'] = _signal_selection_definitions()
             tool.description += (
-                " Expressions: {expr,bindings,types}; semantic (default) needs declared types. "
-                "typing=wave_bits explicitly uses unsigned dump vectors. scope only prefixes names. "
-                "Types may use {width:8} for unsigned [7:0]. Arrays need types.<name>.unpacked and "
-                "bindings.<name>.elements OR path_template with one {index} (1D, <=128 elements). "
-                "Range bounds are JSON integers."
-                " Derived results are in expressions: inspect coverage_status/gaps; partial or not_observed "
-                "cannot exclude a problem. Observed X/Z differs from missing data. observations_truncated "
-                "limits displayed evidence only. An error field means failure: use error_code/recovery "
-                "and correct the arguments before retrying.")
+                " Signals: paths, selections or {expr,bindings,types}; see input $defs for typing/arrays. "
+                "Check expressions.coverage_status/gaps: partial/not_observed cannot exclude issues; "
+                "X/Z is observed data. observations_truncated limits display only. "
+                "error means failure; follow error_code/recovery before retrying.")
         if tool.name in schemas.COMPACT_OUTPUT_TOOLS:
             properties.update(schemas.output_options_for_tool(tool.name).model_json_schema()["properties"])
         if tool.name == "explain_signal_driver":
@@ -7451,6 +8333,7 @@ async def list_tools():
                      else schemas.TransactionDisplayOptions)
             for key, prop in model.model_json_schema()["properties"].items():
                 properties[key] = {**properties.get(key, {}), **prop}
+        _strip_schema_titles(tool.inputSchema)
     # A/B harness toggle: hide the WHOLE handshake feature (suggestion and
     # inspection tools) from list_tools so a cold
     # "baseline" session cannot see or be hinted by it. Enabled by either
@@ -7486,7 +8369,7 @@ async def list_tools():
 
 
 @recover_tool_input_errors(app)
-@app.call_tool()
+@app.call_tool(validate_input=False)  # Wrapper validates every input with checked schemas.
 async def call_tool(name: str, arguments: dict):
     start = time.perf_counter()
     attribution = usage_telemetry.begin_call(arguments)
@@ -7580,7 +8463,750 @@ async def call_tool(name: str, arguments: dict):
             operation_metrics.pop(metrics_token)
 
 
+def _require_design_store_owner(store):
+    if store is not _design_context_store:
+        raise design_context_runtime.ContextUnavailable("design_context_generation_changed")
+
+
+async def _validate_design_source(context, *, timeout_sec=30):
+    with anyio.fail_after(timeout_sec):
+        current = await _run_in_cancellable_thread(context.current)
+    if not current:
+        raise design_context_runtime.ContextUnavailable("design_context_changed")
+
+
+async def _validate_design_binding(binding, *, timeout_sec=5):
+    with anyio.fail_after(timeout_sec):
+        await _run_in_cancellable_thread(binding.require_current)
+
+
+async def _prepare_pinned_design_entry(store, handle, entry, *, metrics,
+                                       remaining=lambda limit: limit, budget_binding=False):
+    """Validate and bind one entry while its caller owns the whole-query pin.
+
+    Shared by tracing consumers. No wave lock or native load is acquired here;
+    the caller must perform final identity validation before returning facts.
+    """
+    context = entry.context
+    phase = time.monotonic()
+    await _validate_design_source(context, timeout_sec=remaining(30))
+    metrics["source_validation_ms"] += (time.monotonic() - phase) * 1000
+    phase = time.monotonic()
+    with anyio.fail_after(remaining(30)):
+        async with entry.binding_lock:
+            metrics["binding_wait_ms"] += (time.monotonic() - phase) * 1000
+            reused = entry.binding is not None
+            if reused:
+                binding = entry.binding
+            else:
+                binding_budget = remaining(30)
+                binding = await _run_in_cancellable_thread(
+                    lambda: prepare_backend_binding(context, timeout_sec=binding_budget)
+                    if budget_binding else prepare_backend_binding(context)
+                )
+                phase = time.monotonic()
+                await _validate_design_source(context, timeout_sec=remaining(30))
+                metrics["source_validation_ms"] += (time.monotonic() - phase) * 1000
+                phase = time.monotonic()
+                await _validate_design_binding(binding, timeout_sec=remaining(5))
+                metrics["binding_validation_ms"] += (time.monotonic() - phase) * 1000
+                await anyio.lowlevel.checkpoint()
+                remaining(30)
+                _require_design_store_owner(store)
+                store.publish_binding(handle, binding)
+                metrics.update(dict(binding.metrics))
+    phase = time.monotonic()
+    await _validate_design_binding(binding, timeout_sec=remaining(5))
+    metrics["binding_validation_ms"] += (time.monotonic() - phase) * 1000
+    await anyio.lowlevel.checkpoint()
+    _require_design_store_owner(store)
+    return binding, reused
+
+
+async def _query_slang_hierarchy(entry, plan, arguments, budget):
+    """Use the shared isolated runtime for this provider's declared capability."""
+    from src.slang_hierarchy_source import capability_gap, build_instance_plan, SlangHierarchyProvider
+    from src.hierarchy_source_ir import HierarchyBudgetExceeded
+    from src.hierarchy_source_service import finish_hierarchy_query
+
+    def unavailable(gap, context_gaps=()):
+        raw = plan.execute()
+        raw["coverage_gaps"] = sorted(set(raw["coverage_gaps"]) | {gap} | set(context_gaps))
+        return raw, None
+
+    gap = ("compile_tops_unresolved" if entry.context.selected_top is None else
+           capability_gap(plan.operation, arguments))
+    if gap is not None:
+        return unavailable(gap)
+    if (plan.operation in {"get_tb_file_detail", "lookup_tb_files", "get_tb_class_hierarchy"}
+        or plan.operation == "dump_tb_section" and arguments.get("section") in {
+            "files_full", "interfaces", "class_hierarchy_full"}) and (
+        not entry.context.snapshot.complete
+        or set(entry.context.gaps) & {
+            "source_capture_byte_limit", "source_capture_file_limit",
+            "source_capture_reference_limit", "source_capture_dependency_work_limit",
+        }
+    ):
+        # A stable partial capture still proves compile membership. The legacy
+        # manifest adapter instead requires a complete hierarchy snapshot and
+        # reports an incomplete one as changed; do not ask it to repair this
+        # source capture. The pinned caller validates observed inputs before
+        # and after these metadata facts, including files that remain absent.
+        # NPI has already had its normal opportunity to provide native facts.
+        return unavailable("source_capture_incomplete", entry.context.gaps)
+    config = get_source_graph_execution_config()
+    if not config.valid or not config.enabled:
+        return unavailable("source_hierarchy_provider_unavailable")
+    budget.checkpoint()
+    remaining = budget.deadline - time.monotonic()
+    if remaining <= 0:
+        raise HierarchyBudgetExceeded("timeout_sec")
+    started = time.perf_counter()
+    with anyio.fail_after(remaining):
+        build = await _run_in_cancellable_thread(lambda: build_instance_plan(
+            entry.context, plan.operation, arguments, config, budget, catalog=plan.catalog))
+        budget.checkpoint()
+        if build.status is AdapterStatus.BLOCKED:
+            return unavailable("source_hierarchy_scope_unavailable")
+        adapter_ms = (time.perf_counter() - started) * 1000
+        outcome = await get_source_graph_runtime(config).prepare(build.request,
+            timeout_seconds=min(config.timeout_sec, budget.deadline - time.monotonic()))
+        if outcome.status is PrepareStatus.CANCELLED:
+            raise asyncio.CancelledError
+        if outcome.status is PrepareStatus.TIMED_OUT:
+            raise TimeoutError("source hierarchy worker deadline")
+        budget.checkpoint()
+        entry.binding.require_policy_current()
+        if get_source_graph_execution_config() != config:
+            raise ExecutionBindingChanged()
+        _record_source_graph_prepare_metrics(outcome)
+        receipt = _source_graph_receipt_from_prepare(build, outcome,
+            adapter_wall_ms=adapter_ms)
+        if outcome.status is not PrepareStatus.READY:
+            from src.slang_hierarchy_source import _LIMITS
+            if outcome.blocker is not None and outcome.blocker.code in _LIMITS:
+                raw = plan._unstarted(_LIMITS[outcome.blocker.code])
+                raw["coverage_gaps"] = sorted(set(raw["coverage_gaps"]) | {"source_hierarchy_projection_unstarted"})
+                return raw, receipt
+            raw, _ = unavailable("source_hierarchy_provider_unavailable")
+            return raw, receipt
+        def query():
+            if build.request.scope.semantic_search.purpose == "source_catalog":
+                from src.slang_source_provider import SlangSourceProvider
+                provider = SlangSourceProvider(outcome.entry, entry.context, budget,
+                    build.request.scope.semantic_search.source_files,
+                    capabilities=build.request.scope.semantic_search.source_capabilities)
+            else:
+                provider = SlangHierarchyProvider(outcome.entry, entry.context, budget)
+            result = plan.execute(provider)
+            limits = getattr(provider, "analysis_limits", ())
+            if limits:
+                result["analysis_limits"] = sorted(set(result["analysis_limits"]) | set(limits))
+                result["coverage_status"] = "partial"
+                if "export_complete" in result:
+                    result["export_complete"] = False
+                    result["warning"] = "section export is incomplete; inspect coverage and output limits"
+            return finish_hierarchy_query(result, budget)
+        raw = await _run_in_cancellable_thread(query)
+        if get_source_graph_execution_config() != config:
+            raise ExecutionBindingChanged()
+        entry.binding.require_policy_current()
+        receipt.update(final_artifact_fingerprint_sha256=outcome.entry.build_key.digest,
+                       single_artifact_provenance=True, final_artifact_scope_match=True)
+        return raw, receipt
+
+
+async def _query_prepared_hierarchy(entry, operation, arguments, budget, *, plan=None, allow_source=True):
+    """Public semantic queries over the prepared NPI query service.
+
+    Keep local native work synchronous, like driver/load/path. Only explicit
+    LSF placement uses a worker; this does not introduce a second local native
+    thread or change session ownership. Missing source providers stay explicit.
+    """
+    from src.connectivity_backend import DeferredConnectivityFallbackBackend
+    from src.hierarchy_source_codec import validate_source_result
+    from src.hierarchy_source_ir import HierarchyBudgetExceeded
+    from src.hierarchy_source_request import prepare_source_query
+    from src.npi_hierarchy_source import NpiHierarchyUnavailable
+
+    from src.native_query import NativeFallback, NATIVE_IDENTITY_ERRORS
+    from src.hierarchy_source_request import prepare_native_source_query
+    from src.hierarchy_source_metadata import observation_identity
+    native = getattr(entry, "native", False)
+    context = entry.context
+    identity = observation_identity(context)
+    plan = plan if plan is not None else (prepare_native_source_query if native else prepare_source_query)(context, operation, arguments, budget=budget)
+    backend, status, selection_reason = _select_prepared_backend(entry, DeferredConnectivityFallbackBackend())
+    selected = getattr(backend, "name", None) == "verdi_npi"
+    reason = selection_reason or status.pop("_npi_selection_reason", None) or "npi_kdb_unavailable"
+    raw, execution, attempts, kdb_status = None, None, [], None
+    source_receipt = None
+    if selected:
+        try:
+            entry.binding.require_policy_current()
+            raw = await _call_connectivity_backend(backend, lambda: backend.query_source(plan))
+        except HierarchyBudgetExceeded as exc:
+            raw = plan._unstarted(exc.reason)
+        except (OperationCancelled, KdbBindingChanged, ExecutionBindingChanged, CaptureAborted,
+                TimeoutError, design_context_runtime.ContextUnavailable):
+            raise
+        except NpiHierarchyUnavailable as exc:
+            if native and exc.reason in NATIVE_IDENTITY_ERRORS:
+                raise design_context_runtime.ContextUnavailable("native_identity_or_result_invalid") from exc
+            reason = _sanitize_npi_fallback_reason(exc.reason)
+            execution = getattr(exc, "execution_status", None)
+        except (TypeError, ValueError, KeyError) as exc:
+            if native:
+                raise design_context_runtime.ContextUnavailable("native_result_invalid") from exc
+            reason = "npi_query_failed"
+        except Exception:
+            reason = "npi_query_failed"
+        kdb_status = _npi_kdb_status(backend)
+        if raw is not None:
+            execution = raw.pop("_npi_execution_status", None)
+            raw = validate_source_result(operation, raw)
+            if operation == "resolve_packed_fields" and "source_signal" in raw:
+                if (raw["source_signal"] != arguments["source_signal"] or
+                        raw["status"] == "resolved" and set(raw["field_bits"]) != set(arguments["fields"])):
+                    raise ValueError("npi_packed_result_query_mismatch")
+            if (operation == "get_tb_subtree" and "node" in raw
+                    and raw["root"] != (arguments.get("root") or context.selected_top)):
+                raise ValueError("npi_source_result_root_mismatch")
+            section = arguments.get("section") if operation == "dump_tb_section" else None
+            if section is not None and "section" in raw and raw["section"] != section:
+                raise ValueError("npi_source_result_section_mismatch")
+            if section == "component_tree_full" and raw.get("data") is not None:
+                if raw.get("root") != context.selected_top or raw["data"].get("path") != context.selected_top:
+                    raise ValueError("npi_source_result_root_mismatch")
+            if (operation == "get_tb_class_hierarchy" and arguments.get("root_class") is not None
+                    and "roots" in raw and "error" not in raw and raw["roots"]):
+                root = raw["roots"][0]
+                if (len(raw["roots"]) != 1 or arguments["root_class"] not in
+                        (root["symbol_id"], root.get("declaration_id"), root["qualified_name"], root["name"])):
+                    raise ValueError("npi_source_result_class_root_mismatch")
+            if (operation in {"lookup_tb_files", "get_tb_file_detail"}
+                    or section in {"files_full", "interfaces"}) and "error" not in raw:
+                if raw.get("ownership_identity") != identity or (native and raw.get("ownership_basis") != "compile_metadata"):
+                    raise ValueError("npi_source_result_ownership_mismatch")
+                expected_file = (plan.catalog.find_file(arguments["path"])
+                                 if operation == "get_tb_file_detail" else None)
+                rows = ([raw] if operation == "get_tb_file_detail" else
+                        raw["matches"] if operation == "lookup_tb_files" else raw["data"])
+                for row in rows:
+                    if section == "interfaces":
+                        if row["source_file"] is None or plan.catalog.find_file(row["source_file"]) is None:
+                            raise ValueError("npi_source_result_file_mismatch")
+                        continue
+                    if native and row.get("source_status") != "not_captured":
+                        raise ValueError("native_source_content_claim_invalid")
+                    member = plan.catalog.find_file(row["path"])
+                    if (member is None or row["path"] != member.path
+                            or row["file_id"] != member.file_id
+                            or row["aliases"] != list(member.aliases)
+                            or expected_file is not None and member != expected_file):
+                        raise ValueError("npi_source_result_file_mismatch")
+            origin = raw["facts_origin"]
+            if origin == "verdi_npi":
+                anchor = entry.binding.anchor
+                expected = hashlib.sha256((anchor.identity_sha256 + "\0" + context.selected_top).encode()).hexdigest()
+                evidence = raw.get("kdb_binding") or {}
+                if (raw["artifact_identity"] != expected
+                        or (not native and raw.get("context_identity_sha256") != identity)
+                        or (native and "context_identity_sha256" in raw)
+                        or evidence.get("identity_sha256") != anchor.identity_sha256
+                        or evidence.get("load_status") != "loaded"):
+                    raise ValueError("npi_source_result_identity_mismatch")
+                from src.hierarchy_source_metadata import mark_unbound_source_locations
+                if native:
+                    from src.native_dispatch import mark_native_locations
+                    mark_native_locations(raw)
+                else:
+                    mark_unbound_source_locations(raw, context)
+            elif (origin != "compile_metadata" or raw["artifact_identity"] != identity
+                  or raw.get("context_identity_sha256") not in (None, identity)):
+                raise ValueError("npi_source_result_origin_mismatch")
+            attempts.append(_backend_attempt("verdi_npi", "success" if origin == "verdi_npi" else "inconclusive",
+                                             coverage_status=raw["coverage_status"]))
+        else:
+            attempts.append(_backend_attempt("verdi_npi", "failed", reason=reason))
+    else:
+        attempts.append(_backend_attempt("verdi_npi", "skipped" if reason in {
+            "source_backend_requested", "npi_previous_load_failure",
+        } else "unavailable", reason=reason))
+    if raw is None:
+        if native and allow_source:
+            raise NativeFallback(attempts)
+        try:
+            if allow_source:
+                raw, source_receipt = await _query_slang_hierarchy(entry, plan, arguments, budget)
+            else:
+                raw = plan.execute()
+        except HierarchyBudgetExceeded as exc:
+            raw = plan._unstarted(exc.reason)
+        available = raw["facts_origin"] == "slang"
+        attempts.append(_backend_attempt("source_graph", "success" if available else "blocked",
+            **({"coverage_status": raw["coverage_status"]} if available else
+               {"reason": "source_hierarchy_provider_unavailable"})))
+    actual = {"verdi_npi": "verdi_npi", "slang": "source_graph"}.get(raw["facts_origin"])
+    if not native:
+        raw["context_identity_sha256"] = identity
+    raw["backend_status"] = _finalize_public_connectivity_status(
+        backend_status=status, selected_backend="verdi_npi" if selected else "source_graph",
+        actual_backend=actual, attempts=attempts,
+        fallback_reason=reason if raw.get("semantic_status") == "unavailable" else None,
+        npi_backend=backend if selected else None, npi_execution=execution,
+        source_graph_receipt=source_receipt, npi_kdb_status=kdb_status,
+    )
+    # The codec validates trees iteratively. Do not round-trip a valid deep
+    # subtree through Pydantic's recursive Any serializer or discard nulls.
+    return validate_source_result(operation, raw)
+
+
+async def _failure_source_context(args, event):
+    """Copy one artifact's bounded candidates before acquiring a wave lock.
+
+    A source query uses the exact log scope (or bounded top when absent).
+    Native partial/empty results retain priority; neither route builds a tree.
+    """
+    entry = args.get("_prepared_design") or args.get("_native_query")
+    if entry is None or event is None:
+        return {}, None
+    from src.hierarchy_source_ir import HierarchyQueryBudget
+    from src.hierarchy_source_metadata import observation_identity
+    context = entry.context
+    identity = (context.compile_metadata_identity_sha256 if getattr(entry, "native", False)
+                else observation_identity(context))
+    identity_key = ("compile_metadata_identity_sha256" if getattr(entry, "native", False)
+                    else "context_identity_sha256")
+    if context.selected_top is None:
+        return {"source_correlation": {
+            "facts_origin": "log_only", "coverage_status": "partial",
+            "coverage_gaps": sorted(set(context.gaps) | {"compile_tops_unresolved"}),
+            identity_key: identity,
+            "full_hierarchy_fallback": False, "queries": [],
+        }}, None
+    budget = HierarchyQueryBudget(timeout_sec=args.get("timeout_sec", 30),
+                                  max_scopes=256, max_calls=8192, max_bytes=1024 * 1024)
+    budget.deadline = args.get("_design_query_started", budget.started) + args.get("timeout_sec", 30)
+    event_path = event.get("instance_path")
+    queries = []
+    if isinstance(event_path, str) and event_path and (
+            event_path == context.selected_top or event_path.startswith(context.selected_top + ".")):
+        queries.append(("find_tb_instance", {"path": event_path}))
+    queries.append(("get_tb_subtree", {"root": context.selected_top, "depth": 1,
+                                      "max_nodes": 128, "count_mode": "bounded"}))
+    candidates, receipts, gaps, status = {}, [], {"failure_candidate_scope_bounded"}, None
+    attempts = []
+    native_observed = False
+    for operation, arguments in queries:
+        result = await _query_prepared_hierarchy(entry, operation, arguments, budget,
+                                                  allow_source=not native_observed)
+        status = result["backend_status"]
+        receipts.append({"operation": operation, **{key: result[key] for key in (
+            "facts_origin", "artifact_identity", "coverage_status", "coverage_gaps", "analysis_limits",
+            "query_metrics", "kdb_binding", "backend_status", "error") if key in result}})
+        attempts.extend(status.get("attempted_backends", []))
+        status = {**status, "attempted_backends": list(attempts)}
+        gaps.update(result["coverage_gaps"])
+        gaps.update(result["analysis_limits"])
+        if result["facts_origin"] not in {"verdi_npi", "slang"}:
+            if native_observed:
+                gaps.add("failure_candidate_query_unavailable")
+                status = {**previous_status, "attempted_backends": list(attempts)}
+                break
+            return {"source_correlation": {
+                "facts_origin": "log_only", "coverage_status": "partial",
+                "coverage_gaps": sorted(gaps), "analysis_limits": result["analysis_limits"],
+                identity_key: identity,
+                "full_hierarchy_fallback": False, "queries": receipts,
+            }}, status
+        origin = result["facts_origin"]
+        native_observed = True
+        previous_status = status
+        rows = list(result.get("hits", []))
+        if result.get("node") is not None:
+            rows.extend([result["node"], *result["node"].get("children", [])])
+        for row in rows:
+            # Prefer the definition location. Unbound SDK paths remain raw
+            # evidence and are never converted into a guessed project path.
+            candidates[row["path"]] = {
+                "instance_path": row["path"], "class": row.get("module"),
+                "src": row.get("definition_file") or row.get("source_file"),
+                "source_evidence": {key: row.get(key) for key in (
+                    "kind", "definition_id", "definition_file", "definition_line",
+                    "source_file", "source_line", "gaps")},
+            }
+        if result["analysis_limits"] or origin == "slang":
+            break
+    return {"instance_candidates": list(candidates.values()), "source_correlation": {
+        "facts_origin": origin, "coverage_status": "partial", "coverage_gaps": sorted(gaps),
+        identity_key: identity, "candidate_count": len(candidates),
+        "selection": "exact_log_path_or_bounded_top" if origin == "slang" else "exact_log_path_and_top_direct_children", "full_hierarchy_fallback": False,
+        "queries": receipts}}, status
+
+
+async def _dispatch_design_query(name: str, args: dict, *, started=None, deadline=None, trace_budget=None,
+                                 publish=True, failure_events_observation=None):
+    """Own one independent context across binding, query and publication.
+
+    All source/KDB validation runs outside wave locks. Abandoned preparation
+    workers cannot publish registry state. NPI placement remains the existing
+    local/explicit-LSF policy; this boundary does not pool native sessions.
+    """
+    handle = args.get("design_handle")
+    if not isinstance(handle, str) or not handle:
+        return schemas.ToolErrorResult(error="Invalid design handle.", error_code="invalid_design_handle")
+    store = _design_context_store
+    started = time.monotonic() if started is None else started
+    metrics = dict.fromkeys(schemas.DesignQueryMetrics.model_fields, 0)
+    history_deadline = None
+    connectivity_query = name in {"explain_signal_driver", "find_signal_loads", "trace_signal_path"}
+    snapshot_query = name == "trace_x_source" and args.get("mode", "snapshot") == "snapshot"
+    enforce_total_deadline = connectivity_query or snapshot_query or name in {
+        "analyze_failure_event", "recommend_failure_debug_next_steps", "resolve_packed_fields",
+    }
+    prepared_source_execution = get_source_graph_execution_config()
+    if snapshot_query:
+        history_deadline = started + prepared_source_execution.timeout_sec
+    if connectivity_query:
+        from src.hierarchy_source_ir import HierarchyQueryBudget
+        try:
+            HierarchyQueryBudget(timeout_sec=args.get("timeout_sec", 30))
+        except (TypeError, ValueError) as exc:
+            return schemas.ToolErrorResult(error=str(exc), error_code="invalid_design_connectivity_arguments")
+        history_deadline = started + args.get("timeout_sec", 30)
+    source_budget, source_arguments = None, None
+    if name in {"find_tb_instance", "get_tb_subtree", "lookup_tb_files", "get_tb_file_detail",
+                "get_tb_class_hierarchy", "dump_tb_section"}:
+        from src.hierarchy_source_ir import HierarchyQueryBudget
+        from src.hierarchy_source_request import validate_source_query
+        try:
+            if "handle" in args:
+                raise ValueError("provide exactly one handle or design_handle")
+            source_arguments = {key: value for key, value in args.items() if key not in {"design_handle", "timeout_sec"}}
+            validate_source_query(name, source_arguments)
+            source_budget = HierarchyQueryBudget(timeout_sec=args.get("timeout_sec", 30))
+            # Include parameter validation in the same start used by receipts.
+            source_budget.deadline -= source_budget.started - started
+            source_budget.started = started
+        except (TypeError, ValueError) as exc:
+            code = {"find_tb_instance": "invalid_design_instance_arguments",
+                    "get_tb_subtree": "invalid_design_subtree_arguments",
+                    "lookup_tb_files": "invalid_design_file_arguments",
+                    "get_tb_file_detail": "invalid_design_file_arguments",
+                    "get_tb_class_hierarchy": "invalid_design_class_arguments",
+                    "dump_tb_section": "invalid_design_section_arguments"}[name]
+            return schemas.ToolErrorResult(error=str(exc), error_code=code)
+
+    def remaining(limit):
+        effective_deadline = source_budget.deadline if source_budget is not None else history_deadline
+        if deadline is not None:
+            effective_deadline = min(effective_deadline, deadline) if effective_deadline else deadline
+        if effective_deadline is None:
+            return limit
+        value = effective_deadline - time.monotonic()
+        if value <= 0:
+            raise TimeoutError
+        return min(limit, value)
+
+    try:
+        with store.pin(handle) as entry:
+            context = entry.context
+            if name in {"analyze_failure_event", "recommend_failure_debug_next_steps", "resolve_packed_fields"}:
+                from src.hierarchy_source_ir import HierarchyQueryBudget
+                # Validate the same finite deadline used by native work and
+                # final publication; local native calls remain synchronous.
+                try:
+                    HierarchyQueryBudget(timeout_sec=args.get("timeout_sec", 30))
+                    if name == "resolve_packed_fields":
+                        from src.npi_packed_layout import validate_packed_query
+                        validate_packed_query({key: args.get(key) for key in ("source_signal", "fields")})
+                except (TypeError, ValueError) as exc:
+                    return schemas.ToolErrorResult(error=str(exc), error_code=("invalid_packed_layout_arguments"
+                        if name == "resolve_packed_fields" else "invalid_failure_analysis_arguments"))
+                history_deadline = started + args.get("timeout_sec", 30)
+            supplied_logs = args.get("supplementary_compile_logs")
+            if (args.get("compile_context") is not None or args.get("kdb_path") is not None
+                    or (args.get("compile_log") is not None and not _same_realpath(
+                        args["compile_log"], context.ordered_compile_logs[0]))
+                    or args.get("simulator") not in (None, "auto", context.simulator)
+                    or args.get("top_hint") not in (None, context.selected_top)
+                    or args.get("backend_preference") not in (None, context.backend_preference)):
+                raise design_context_runtime.ContextUnavailable("design_context_arguments_mismatch")
+            if supplied_logs is not None and (
+                not isinstance(supplied_logs, list)
+                or len(supplied_logs) != len(context.ordered_compile_logs) - 1
+                or any(not isinstance(path, str) or not _same_realpath(path, expected)
+                       for path, expected in zip(supplied_logs, context.ordered_compile_logs[1:]))
+            ):
+                raise design_context_runtime.ContextUnavailable("design_context_arguments_mismatch")
+            if name == "trace_x_source" and args.get("mode") == "history":
+                history_args = {k: v for k, v in args.items() if k not in {
+                    "design_handle", "supplementary_compile_logs",
+                }}
+                history_request = (schemas.NativeXHistoryInput if deadline is not None else schemas.XHistoryInput).model_validate({
+                    **history_args, "compile_log": context.ordered_compile_logs[0],
+                    "simulator": context.simulator, "top_hint": context.selected_top,
+                })
+                history_deadline = started + history_request.timeout_sec
+            source_plan = None
+            if source_budget is not None:
+                from src.hierarchy_source_request import prepare_source_query
+                source_plan = prepare_source_query(context, name, source_arguments, budget=source_budget)
+                if not source_plan.needs_provider:
+                    # Ownership/filter misses and metadata-only filters must
+                    # not depend on KDB availability, policy, or a native load.
+                    # The existing optional backend receipts remain absent.
+                    from src.hierarchy_source_codec import validate_source_result
+                    from src.hierarchy_source_service import finish_hierarchy_query
+                    await _validate_design_source(context, timeout_sec=remaining(30))
+                    _require_design_store_owner(store)
+                    raw = source_plan.execute()
+                    await _validate_design_source(context)
+                    await anyio.lowlevel.checkpoint()
+                    _require_design_store_owner(store)
+                    raw["design_handle"] = handle
+                    raw["context_identity_sha256"] = context.identity_sha256
+                    finish_hierarchy_query(raw, source_budget)
+                    raw = validate_source_result(name, raw)
+                    finish_hierarchy_query(raw, source_budget)
+                    return raw
+            binding, reused = await _prepare_pinned_design_entry(
+                store, handle, entry, metrics=metrics, remaining=remaining,
+                budget_binding=(history_deadline is not None and not connectivity_query) or source_budget is not None)
+            resolved = {
+                **args, "compile_log": context.ordered_compile_logs[0],
+                "supplementary_compile_logs": list(context.ordered_compile_logs[1:]),
+                "simulator": context.simulator, "top_hint": context.selected_top,
+                "_prepared_design": entry,
+            }
+            if failure_events_observation is not None:
+                resolved["_failure_events_observation"] = failure_events_observation
+            if name in {"explain_signal_driver", "find_signal_loads"}:
+                resolved.setdefault("allow_bounded_bootstrap", True)
+            if history_deadline is not None:
+                resolved["_design_query_started"] = started
+            if trace_budget is not None:
+                resolved["_trace_budget"] = trace_budget
+            if deadline is not None:
+                resolved["_trace_deadline"] = deadline
+            if connectivity_query or name in {"resolve_packed_fields", "trace_x_source"}:
+                resolved["_prepared_source_execution"] = prepared_source_execution
+            phase = time.monotonic()
+            previous_failure = entry.npi_failure
+            # X history owns its graph budget and returns a partial graph when
+            # it expires; only the total-deadline APIs reject late results.
+            if enforce_total_deadline:
+                with anyio.fail_after(remaining(300)):
+                    result = await _dispatch_inner(name, resolved)
+            else:
+                result = (await _query_prepared_hierarchy(entry, name, source_arguments, source_budget, plan=source_plan)
+                          if source_budget is not None else await _dispatch_inner(name, resolved))
+            metrics["query_ms"] = (time.monotonic() - phase) * 1000
+            query_status = (result.get("backend_status", {}) if isinstance(result, dict)
+                            else getattr(result, "backend_status", None))
+            used_source = (query_status.get("actual_backend") == "source_graph" if isinstance(query_status, dict)
+                           else getattr(query_status, "actual_backend", None) == "source_graph")
+            phase = time.monotonic()
+            if enforce_total_deadline:
+                remaining(30)
+            await _validate_design_source(context, timeout_sec=remaining(30) if enforce_total_deadline else 30)
+            await _validate_design_binding(binding, timeout_sec=remaining(5) if enforce_total_deadline else 5)
+            if (connectivity_query or used_source) and get_source_graph_execution_config() != prepared_source_execution:
+                raise ExecutionBindingChanged()
+            metrics["final_validation_ms"] = (time.monotonic() - phase) * 1000
+            await anyio.lowlevel.checkpoint()
+            _require_design_store_owner(store)
+            if used_source and get_source_graph_execution_config() != prepared_source_execution:
+                raise ExecutionBindingChanged()
+            if enforce_total_deadline:
+                remaining(30)
+            status = (schemas.BackendStatus.model_validate(result["backend_status"])
+                      if source_budget is not None else getattr(result, "backend_status", None))
+            if status is not None:
+                for attempt in status.attempted_backends:
+                    if attempt.backend == "verdi_npi":
+                        store.note_npi_failure(handle, attempt.reason)
+                receipt = binding.receipt()
+                receipt["gaps"] = sorted(set(receipt["gaps"]) | set(context.gaps))
+                if receipt["artifact"] is not None:
+                    receipt["artifact"]["load_status"] = status.kdb_load_status or "not_checked"
+                metrics["total_ms"] = (time.monotonic() - started) * 1000
+                status.design_context = schemas.DesignQueryReceipt(
+                    **receipt, design_handle=handle, context_identity_sha256=context.identity_sha256,
+                    backend_preference=context.backend_preference, binding_reused=reused,
+                    source_snapshot_status="complete" if context.snapshot.complete else "partial",
+                    include_resolution_status="complete" if context.include_resolution_complete else "partial",
+                    previous_npi_failure=previous_failure, metrics=metrics,
+                )
+                history = getattr(result, "history", None)
+                if history is not None:
+                    history.context.setdefault("backend_status", {})["design_context"] = (
+                        status.design_context.model_dump(mode="json", exclude_none=True)
+                    )
+            if source_budget is not None:
+                from src.hierarchy_source_codec import validate_source_result
+                from src.hierarchy_source_service import finish_hierarchy_query
+                raw = result
+                raw["backend_status"] = status.model_dump(mode="json", exclude_unset=True)
+                raw["design_handle"] = handle
+                finish_hierarchy_query(raw, source_budget)
+                raw = validate_source_result(name, raw)
+                # Include validation in the original deadline, including an
+                # empty exact result whose final checks completed too late.
+                finish_hierarchy_query(raw, source_budget)
+                raw["backend_status"]["design_context"]["metrics"]["total_ms"] = (
+                    time.monotonic() - started) * 1000
+                return raw
+            if name == "recommend_failure_debug_next_steps" and publish:
+                _result_cache[name] = result
+                _result_provenance[name] = _build_result_provenance(name, resolved, result)
+            return result
+    except OperationCancelled as exc:
+        raise asyncio.CancelledError from exc
+    except KdbBindingChanged:
+        code = "kdb_identity_changed"
+    except ExecutionBindingChanged:
+        code = "design_context_execution_changed"
+    except (TimeoutError, CaptureAborted) as exc:
+        code = ("design_context_changed" if isinstance(exc, CaptureAborted) and exc.code == "input_changed"
+                else "design_context_" + exc.code if isinstance(exc, CaptureAborted) else "design_context_timeout")
+    except design_context_runtime.ContextUnavailable as exc:
+        code = exc.code
+    return schemas.ToolErrorResult(
+        error="Design query did not complete; prepare a new context when its identity or policy changes.",
+        error_code=code,
+    )
+
+
+async def _handle_explain_property(args: dict):
+    options = schemas.ExplainPropertyOptions.model_validate(args)
+    config = get_source_graph_execution_config()
+    if not options.design_handle:
+        return await explain_properties(args, registry=_property_runs, config=config,
+                                        run_thread=_run_in_cancellable_thread, plan_store=_property_plans)
+    store = _design_context_store
+    try:
+        with store.pin(options.design_handle) as entry:
+            context = entry.context
+            async def validate(deadline):
+                if (store is not _design_context_store
+                        or options.compile_log and not _same_realpath(options.compile_log, context.ordered_compile_logs[0])
+                        or options.simulator not in ("auto", context.simulator)
+                        or options.top_hint not in (None, context.selected_top)):
+                    raise ValueError("design_context_arguments_mismatch")
+                try:
+                    await _validate_design_source(context, timeout_sec=max(.001, deadline-time.monotonic()))
+                except design_context_runtime.ContextUnavailable:
+                    raise ValueError("design_context_changed") from None
+            return await explain_properties(args, registry=_property_runs, config=config,
+                run_thread=_run_in_cancellable_thread, prepared=context, validate=validate, plan_store=_property_plans)
+    except design_context_runtime.ContextUnavailable:
+        return await explain_properties(args, registry=_property_runs, config=config,
+            run_thread=_run_in_cancellable_thread, source_blocker="design_context_expired", plan_store=_property_plans)
+
+
+async def _handle_property_check(args):
+    from src.property_check import PropertyCheckOptions, PropertyReadIncomplete, check_property, failure_from_log, validate_failure
+    from src.property_engine import UnsupportedPlan, EvaluationLimit
+    from src.property_runtime import _stamp
+    raw=dict(args)
+    def blocked(code,status='insufficient_evidence',gaps=None):
+        return schemas.PropertyCheckResult(wave_path=str(args.get('wave_path','')),status=status,
+                                          error_code=code,gap_codes=gaps or [code])
+    try:
+        if isinstance(raw.get('failure_time_ps'),str):raw['failure_time_ps']=_resolve_time(raw['failure_time_ps'])
+        options=PropertyCheckOptions.model_validate(raw)
+        deadline=time.monotonic()+options.timeout_sec
+        async with asyncio.timeout(options.timeout_sec):
+            entry=_property_plans.resolve(options.property_plan)
+            async def validate():
+                if _property_plans.entries.get(options.property_plan) is not entry:
+                    raise ValueError('property_plan_expired')
+                if entry.current and not await _run_in_cancellable_thread(entry.current):
+                    raise ValueError('property_source_identity_changed')
+                if entry.validate:await entry.validate(deadline)
+            await validate()
+            log_stamp=_stamp(options.log_path) if options.log_path else None
+            if options.log_path:
+                event=await _run_in_cancellable_thread(lambda:failure_from_log(options,entry.plan))
+            elif options.failure_event is not None:
+                event={**options.failure_event,'selection_basis':'supplied_failure_event'}
+            else:
+                event=dict(time_ps=options.failure_time_ps,selection_basis='caller_supplied_time')
+            validate_failure(event,entry.plan)
+            wave_stamp=_stamp(options.wave_path)
+            def work():
+                cancellation.check_cancelled()
+                if time.monotonic()>=deadline:raise TimeoutError('property_timeout')
+                return check_property(_get_parser(options.wave_path),entry.plan,options,event,deadline=deadline)
+            result=await _run_in_wave_request(options.wave_path,work)
+            await validate()
+            if _stamp(options.wave_path)!=wave_stamp:
+                raise ValueError('property_wave_identity_changed')
+            if options.log_path and _stamp(options.log_path)!=log_stamp:
+                raise ValueError('property_log_identity_changed')
+            return schemas.PropertyCheckResult.model_validate(result)
+    except PropertyReadIncomplete as exc:
+        return blocked(str(exc),gaps=exc.gap_codes)
+    except UnsupportedPlan as exc:
+        return blocked(str(exc),'unsupported')
+    except EvaluationLimit as exc:
+        return blocked(str(exc))
+    except TimeoutError:
+        return blocked('property_timeout')
+    except ValidationError:
+        return blocked('property_check_arguments_invalid')
+    except KeyError:
+        return blocked('property_signal_unavailable')
+    except FstError:
+        raise
+    except (OSError,ValueError,RuntimeError) as exc:
+        code=str(exc)
+        if len(code)>100 or not code or any(not(c.islower() or c.isdigit() or c=='_') for c in code):
+            code='property_input_or_wave_unavailable'
+        return blocked(code)
+
+
 async def _dispatch(name: str, args: dict):
+    if any(key.startswith("_") for key in args):
+        return schemas.ToolErrorResult(error="Reserved internal argument.", error_code="invalid_design_context_arguments")
+    if name == "explain_property":
+        return await _handle_explain_property(args)
+    if name == 'verify_window' and args.get('mode')=='property':
+        return await _handle_property_check(args)
+    if name == 'verify_window':
+        from src.property_check import PropertyCheckOptions
+        if (set(args)&(set(PropertyCheckOptions.model_fields)-{'mode','wave_path'})):
+            return schemas.ToolErrorResult(error='Property plan options require mode=property.',
+                                           error_code='property_options_require_property_mode')
+    if name == "get_diagnostic_snapshot":
+        return await _dispatch_inner(name, args)
+    from src.native_query import NATIVE_TOOLS
+    hierarchy_tools = {"get_tb_subtree", "find_tb_instance", "lookup_tb_files", "get_tb_file_detail",
+                       "get_tb_class_hierarchy", "dump_tb_section"}
+    if "design_handle" in args:
+        if name not in NATIVE_TOOLS:
+            return schemas.ToolErrorResult(error="This tool does not accept design_handle.", error_code="design_handle_tool_unsupported")
+        if "retry_npi" in args or ("handle" in args and name not in {
+            "get_tb_subtree", "find_tb_instance", "lookup_tb_files", "get_tb_file_detail",
+            "get_tb_class_hierarchy", "dump_tb_section"}):
+            return schemas.ToolErrorResult(error="Conflicting identity modes.", error_code="design_context_arguments_mismatch")
+        return await _dispatch_design_query(name, args)
+    if name in NATIVE_TOOLS and (
+        ("handle" in args and name not in hierarchy_tools)
+        or ("compile_context" in args and name not in {"explain_signal_driver", "trace_x_source"})
+        or ("retry_npi" in args and ("handle" in args or "compile_context" in args))
+    ):
+        return schemas.ToolErrorResult(error="Conflicting or unsupported identity inputs.", error_code="invalid_native_query_arguments")
+    if (name in NATIVE_TOOLS and not any(key in args for key in ("handle", "compile_context"))
+            and (args.get("compile_log") or args.get("kdb_path"))):
+        from src.native_dispatch import dispatch_native_query
+        return await dispatch_native_query(sys.modules[__name__], name, args)
+    return await _dispatch_inner(name, args)
+
+
+async def _dispatch_inner(name: str, args: dict):
     fst_paths = [args[key] for key in ("wave_path", "wave_path_a", "wave_path_b")
                  if isinstance(args.get(key), str) and args[key].lower().endswith(".fst")]
     if fst_paths and name not in FST_SUPPORTED_TOOLS:
@@ -7607,24 +9233,38 @@ async def _dispatch(name: str, args: dict):
         bound, reason, hierarchy_recovery = await _resolve_explicit_driver_context(raw_context)
         if bound is None:
             return schemas.PrerequisiteBlockResult.model_validate({
-                "ok": False, "error_code": reason, "missing_step": "build_tb_hierarchy",
-                "required_before": name, "reason": reason,
+                "ok": False, "error_code": reason, "missing_step": "prepare_design_context",
+                "required_before": name, "reason": reason + "; historical identity was not recovered. A new preparation describes current inputs only; retain the old action tokens.",
                 "hierarchy_recovery": hierarchy_recovery,
-                "suggested_call": {"tool": "build_tb_hierarchy", "arguments": {
+                "suggested_call": {"tool": "prepare_design_context", "arguments": {
                     k: v for k, v in args["compile_context"].items()
-                    if k in {"compile_log", "simulator", "supplementary_compile_logs"}}},
+                    if k in {"compile_log", "simulator", "supplementary_compile_logs", "top_hint"}}},
             })
         if not _same_realpath(args["compile_log"], bound.context["compile_log"]):
             raise ValueError("compile_context does not match compile_log")
         if args.get("top_hint") not in (None, bound.context.get("top_hint")):
             raise ValueError("compile_context does not match top_hint")
+        if isinstance(bound, _DesignRecoveryReference):
+            resolved = {key: value for key, value in args.items() if key != "compile_context"}
+            resolved.update(design_handle=bound.design_handle, simulator=bound.context["simulator"],
+                            top_hint=bound.context.get("top_hint"))
+            result = await _dispatch_design_query(name, resolved)
+            if isinstance(result, schemas.ToolErrorResult):
+                hierarchy_recovery = {**hierarchy_recovery, "status": "blocked",
+                                      "blocker": result.error_code or "design_query_failed"}
+            if hasattr(result, "hierarchy_recovery"):
+                result.hierarchy_recovery = schemas.HierarchyRecoveryReceipt.model_validate(hierarchy_recovery)
+            return result
         args = {**args, "_bound_context": bound, "simulator": bound.context["simulator"],
                 "top_hint": bound.context.get("top_hint")}
-    block = None if bound is not None else _check_prerequisites(name, args)
+    block = None if bound is not None or args.get("_prepared_design") is not None or args.get("_native_query") is not None else _check_prerequisites(name, args)
     if block is not None:
         return schemas.PrerequisiteBlockResult.model_validate(block)
 
-    if name == "get_sim_paths":
+    if name == "prepare_design_context":
+        return await _handle_prepare_design_context(args)
+
+    elif name == "get_sim_paths":
         result = discover_sim_paths(
             args["verif_root"],
             args.get("case_name"),
@@ -7634,10 +9274,15 @@ async def _dispatch(name: str, args: dict):
         )
         _update_session_state(name, args, result)
         validated = schemas.SimPathsResult.model_validate(result)
+        if validated.sim_logs and validated.simulator:
+            validated.suggested_calls = [
+                _build_suggested_call("parse_sim_log", sim_paths=validated)
+            ]
         _result_cache["get_sim_paths"] = validated
         _result_provenance["get_sim_paths"] = _build_result_provenance(
             name, args, validated
         )
+        _property_runs.note("simulation", validated)
         return validated
 
     elif name == "get_formal_paths":
@@ -7650,6 +9295,7 @@ async def _dispatch(name: str, args: dict):
         )
         validated = schemas.FormalPathsResult.model_validate(result)
         _cache_formal_discovery(validated)
+        _property_runs.note("formal", validated)
         return validated
 
     elif name == "parse_sim_log":
@@ -8204,8 +9850,15 @@ async def _dispatch(name: str, args: dict):
 
     elif name == "scan_structural_risks":
         analysis_mode, semantic_options = validate_semantic_options(args)
+        continuation = args.get('semantic_continuation')
+        if continuation is not None and (analysis_mode == 'fast' or not isinstance(continuation, str)
+                or not re.fullmatch(r'[A-Za-z0-9_-]{32}', continuation)):
+            raise ValueError('semantic_continuation requires auto/deep and a current 32-character token')
         simulator = _resolve_session_simulator(args)
         resolved_args = {**args, "simulator": simulator}
+        top_hint = args.get("top_hint")
+        if top_hint is not None and (not isinstance(top_hint, str) or not top_hint.strip() or "\x00" in top_hint):
+            raise ValueError("top_hint must be nonempty")
         compile_result, context_simulator = await _run_in_cancellable_thread(
             lambda: _parse_merged_compile_context(
                 compile_log=args["compile_log"],
@@ -8213,6 +9866,8 @@ async def _dispatch(name: str, args: dict):
                 supplementary_compile_logs=[],
             )
         )
+        if top_hint is not None and compile_result.get("top_modules") and top_hint not in compile_result["top_modules"]:
+            raise ValueError("top_hint does not match compile evidence")
         compile_snapshot_sha256 = compute_snapshot_fingerprint(
             args["compile_log"],
             context_simulator,
@@ -8322,22 +9977,62 @@ async def _dispatch(name: str, args: dict):
         })
         result["analysis_mode"] = analysis_mode
         result["lexical_coverage_status"] = result.get("coverage_status", "complete")
-        semantic_config = get_source_graph_execution_config()
-        query_request, query_runtime = await _structural_query_context(
-            args["compile_log"], simulator, semantic_options["scope"], analysis_mode, semantic_config,
+        async def source_scan(missing, deadline, validate):
+            semantic_config = get_source_graph_execution_config()
+            async def source_guard():
+                await validate()
+                if get_source_graph_execution_config() != semantic_config:
+                    raise ExecutionBindingChanged()
+            async def source_identity_guard():
+                await source_guard()
+                if identity.complete and not await _run_in_cancellable_thread(identity.current):
+                    from src.native_query import NativeInputChanged
+                    raise NativeInputChanged("structural_source_identity_changed")
+            # Auto probes only existing source artifacts. The semantic runtime
+            # validates content before consuming a positive cache/IR candidate;
+            # probing a miss needs only the request guards and a final content
+            # check. Deep keeps full validation around preparation/build work.
+            guard = source_identity_guard if analysis_mode == "deep" else source_guard
+            await guard()
+            query_request, query_runtime = await _structural_query_context(
+                args["compile_log"], simulator, semantic_options["scope"], analysis_mode, semantic_config,
+            )
+            await guard()
+            source_options = {**semantic_options, "categories": missing,
+                              "timeout_sec": min(semantic_options["timeout_sec"], deadline-time.monotonic())}
+            raw = await _semantic_scan_runtime.scan(
+                identity=identity, mode=analysis_mode, options=source_options,
+                compile_log=args["compile_log"], compile_result=compile_result,
+                config=semantic_config, run_thread=_run_in_cancellable_thread,
+                query_request=query_request, query_runtime=query_runtime,
+                deadline=deadline, validate=guard, selected_top=args.get("top_hint"),
+            )
+            await source_identity_guard()
+            observed = bool(raw.get("categories_checked") or raw.get("facts"))
+            raw["artifact_identity"] = identity.digest if observed else None
+            raw["selected_top"] = args.get("top_hint")
+            raw["checked_scope"] = ((semantic_options["scope"] or args.get("top_hint"))
+                                    if observed else None)
+            return raw
+
+        def metadata_guard():
+            if compute_snapshot_fingerprint(args["compile_log"], context_simulator) != compile_snapshot_sha256:
+                from src.native_query import NativeInputChanged
+                raise NativeInputChanged("compile_metadata_changed")
+
+        result["semantic"] = await _structural_native_runtime.scan(
+            mode=analysis_mode, options=semantic_options, compile_log=args["compile_log"], simulator=simulator,
+            source_scan=source_scan, run_thread=_run_in_cancellable_thread,
+            top_hint=args.get("top_hint"), metadata_guard=metadata_guard,
+            continuation=continuation,
         )
-        result["semantic"] = await _semantic_scan_runtime.scan(
-            identity=identity, mode=analysis_mode, options=semantic_options,
-            compile_log=args["compile_log"], compile_result=compile_result,
-            config=semantic_config, run_thread=_run_in_cancellable_thread,
-            query_request=query_request, query_runtime=query_runtime,
-        )
+        if analysis_mode != "fast" and result["semantic"]["status"] != "complete":
+            result.setdefault("coverage_warnings", []).append(
+                "Requested semantic checks are incomplete; inspect semantic.category_coverage and semantic.gaps."
+            )
         if analysis_mode == "deep" and result["semantic"]["status"] != "complete":
             if result["coverage_status"] != "zero_coverage":
                 result["coverage_status"] = "degraded"
-            result.setdefault("coverage_warnings", []).append(
-                "Requested semantic checks are incomplete; inspect semantic.status and semantic.gaps."
-            )
         validated = _enforce_output_budget(
             schemas.ScanStructuralRisksResult.model_validate(result),
             [
@@ -8368,11 +10063,16 @@ async def _dispatch(name: str, args: dict):
                 window_ps=args.get("window_ps", DEFAULT_WAVE_WINDOW_PS),
                 extra_transitions=args.get("extra_transitions", DEFAULT_EXTRA_TRANSITIONS),
             )
-        result = await _run_in_cancellable_thread(lambda: _fst_metadata_call(analyze)) if fst_paths else analyze()
+        result = await _run_in_wave_request(args["wave_path"], analyze)
         if _get_compatible_recommend_scan_cache(request_context) is None:
             original_guide = result.get("analysis_guide", {})
             result["analysis_guide"] = {
-                "step0": "scan_structural_risks has not been run, so this analysis does not include structural risk correlation.",
+                "step0": (
+                    "scan_structural_risks has not been run, so this analysis does not include structural risk correlation."
+                    if STRUCTURAL_SCAN_IN_WORKFLOW else
+                    "Structural scanning is skipped in the default workflow by "
+                    "TRACEWEAVE_STRUCTURAL_SCAN_IN_WORKFLOW=0; structural risks remain unchecked."
+                ),
                 **original_guide,
             }
         return _enforce_output_budget(
@@ -8386,6 +10086,7 @@ async def _dispatch(name: str, args: dict):
 
     elif name == "analyze_failure_event":
         simulator = _resolve_session_simulator(args)
+        source, backend_status = await _failure_source_context(args, args["failure_event"])
         def analyze():
             return WaveformAnalyzer(
                 log_path=args["log_path"],
@@ -8397,8 +10098,11 @@ async def _dispatch(name: str, args: dict):
                 wave_path=args["wave_path"],
                 compile_log=args.get("compile_log"),
                 top_hint=args.get("top_hint"),
+                **source,
             )
-        result = await _run_in_cancellable_thread(lambda: _fst_metadata_call(analyze)) if fst_paths else analyze()
+        result = await _run_in_wave_request(args["wave_path"], analyze)
+        if backend_status is not None:
+            result["backend_status"] = backend_status
         return schemas.AnalyzeFailureEventResult.model_validate(result)
 
     elif name == "recommend_failure_debug_next_steps":
@@ -8408,6 +10112,22 @@ async def _dispatch(name: str, args: dict):
         scan_cache = _get_compatible_recommend_scan_cache(request_context)
         parse_cache = _get_compatible_recommend_parse_cache(request_context)
         sweep_cache = _get_compatible_recommend_sweep_cache(request_context)
+        from src.analyzer import select_primary_failure, _build_runtime_protocol_coverage
+        observation = None
+        if args.get("_native_query") is not None or args.get("_failure_events_observation") is not None:
+            observation = await _run_in_cancellable_thread(lambda: observe_failure_events(
+                args["log_path"], simulator, args.get("native_time_unit"),
+                previous=args.get("_failure_events_observation")))
+            events = observation.events
+        else:
+            events = await _run_in_cancellable_thread(lambda: SimLogParser(
+                args["log_path"], simulator, args.get("native_time_unit")).parse_failure_events())
+        from src.native_query import NativeFallback
+        try:
+            source, backend_status = await _failure_source_context(args, select_primary_failure(events))
+        except NativeFallback as fallback:
+            fallback.failure_events_observation = observation
+            raise
         def analyze():
             return WaveformAnalyzer(
                 log_path=args["log_path"],
@@ -8427,8 +10147,12 @@ async def _dispatch(name: str, args: dict):
                 handshake_sweep=sweep_cache.model_dump()
                 if sweep_cache is not None
                 else None,
+                failure_events=events,
+                **source,
             )
-        result = await _run_in_cancellable_thread(lambda: _fst_metadata_call(analyze)) if fst_paths else analyze()
+        result = await _run_in_wave_request(args["wave_path"], analyze)
+        if backend_status is not None:
+            result["backend_status"] = backend_status
         has_failure_context = False
         if parse_cache is not None:
             has_failure_context = parse_cache.runtime_total_errors > 0
@@ -8437,40 +10161,34 @@ async def _dispatch(name: str, args: dict):
             and result.get("suspected_failure_class") != "no_failure_detected"
         ):
             has_failure_context = True
-        # Single primary missing-step recommendation. On a scoreboard/compare/
-        # mismatch symptom the runtime handshake sweep leads (a data-compare
-        # mismatch is more often a runtime protocol symptom than a structural
-        # one); otherwise the structural scan leads. get_diagnostic_snapshot is
-        # the broader auditor that lists every missing step; this is the single
-        # prioritized nudge for an agent that called recommend directly. Both
-        # treat "failure context + no complete compatible sweep cache" as
-        # requiring attention. Only a parameter-changing retry is actionable;
-        # terminal zero/degraded coverage remains explicitly inconclusive but
-        # must not replay the same sweep forever.
-        missing_scan = scan_cache is None and has_failure_context
-        sweep_needs_attention = (
-            _sweep_coverage_incomplete(sweep_cache) and has_failure_context
+        # Sweep evidence is advisory. Preserve its coverage independently from
+        # required source/structural prerequisites and the chosen debug path.
+        result["runtime_protocol_coverage"] = _build_runtime_protocol_coverage(
+            sweep_cache.model_dump() if sweep_cache is not None else None,
+            wave_path=args["wave_path"],
         )
-        sweep_call = (
-            _build_sweep_required_next_call(args["wave_path"], sweep_cache)
-            if sweep_needs_attention
-            else None
-        )
-        actionable_sweep = sweep_needs_attention and sweep_call is not None
-        protocol_symptom = _recommend_has_protocol_symptom(parse_cache)
-        primary_missing = _select_recommend_primary_missing_step(
-            missing_scan, actionable_sweep, protocol_symptom
-        )
-        if primary_missing == "sweep":
-            result["workflow_incomplete"] = True
-            result["degraded_reason"] = (
-                "missing_handshake_sweep"
-                if sweep_cache is None
-                else "incomplete_handshake_sweep"
+        missing_scan = STRUCTURAL_SCAN_IN_WORKFLOW and scan_cache is None and has_failure_context
+        if not STRUCTURAL_SCAN_IN_WORKFLOW and scan_cache is None:
+            result.setdefault("why", []).append(
+                "Structural scanning is skipped in the default workflow by "
+                "TRACEWEAVE_STRUCTURAL_SCAN_IN_WORKFLOW=0; structural risks remain unchecked."
             )
-            result["required_next_call"] = sweep_call
-            result["missing_inputs"] = []
-        elif primary_missing == "scan":
+        from src.log_parser import _protocol_symptom_hint
+        protocol_symptom = (_recommend_has_protocol_symptom(parse_cache)
+                            or _protocol_symptom_hint(events) is not None)
+        sweep_needs_attention = _sweep_coverage_incomplete(sweep_cache) and (
+            sweep_cache is not None or (has_failure_context and protocol_symptom)
+        )
+        sweep_calls = (
+            _build_sweep_suggested_calls(args["wave_path"], sweep_cache)
+            if sweep_needs_attention
+            else []
+        )
+        if sweep_calls:
+            result.setdefault("suggested_next_actions", []).extend(sweep_calls)
+        elif sweep_needs_attention:
+            result.setdefault("why", []).append(_describe_non_actionable_sweep(sweep_cache))
+        if missing_scan:
             result["workflow_incomplete"] = True
             result["degraded_reason"] = "missing_structural_scan"
             result["required_next_call"] = _build_scan_required_next_call(
@@ -8478,20 +10196,16 @@ async def _dispatch(name: str, args: dict):
                 request_context.get("simulator"),
             )
             result["missing_inputs"] = []
-        elif sweep_needs_attention:
-            result["workflow_incomplete"] = True
-            result["degraded_reason"] = "incomplete_handshake_sweep"
-            result["required_next_call"] = None
-            result["missing_inputs"] = [_describe_non_actionable_sweep(sweep_cache)]
         else:
             result["workflow_incomplete"] = False
             result["degraded_reason"] = None
             result["required_next_call"] = None
         validated = schemas.RecommendNextStepsResult.model_validate(result)
-        _result_cache["recommend_failure_debug_next_steps"] = validated
-        _result_provenance["recommend_failure_debug_next_steps"] = (
-            _build_result_provenance(name, resolved_args, validated)
-        )
+        if args.get("_prepared_design") is None and args.get("_native_query") is None:
+            _result_cache["recommend_failure_debug_next_steps"] = validated
+            _result_provenance["recommend_failure_debug_next_steps"] = (
+                _build_result_provenance(name, resolved_args, validated)
+            )
         return validated
 
     elif name == "get_diagnostic_snapshot":
@@ -8637,50 +10351,8 @@ async def _dispatch(name: str, args: dict):
         return await trace_divergence(sys.modules[__name__], args)
 
     elif name == "diff_first_divergence":
-
-        contexts = {side: (schemas.DivergenceContext.model_validate(args[f"context_{side}"]).model_dump(exclude_none=True)
-                           if args.get(f"context_{side}") is not None else None)
-                    for side in ("a", "b")}
-
-        def _work():
-            result = diff_first_divergence(
-                get_parser=_get_parser,
-                wave_path_a=args["wave_path_a"],
-                signal_a=args["signal_a"],
-                wave_path_b=args["wave_path_b"],
-                signal_b=args["signal_b"],
-                start_ps=_resolve_time(args.get("start_time_ps", 0)),
-                end_ps=_resolve_time(args.get("end_time_ps", -1), allow_sentinel=True),
-                cursor_store=None,
-                cursor_name=args.get("cursor_name"),
-                cursor_note=args.get("cursor_note"),
-            )
-            return result
-
-        result = await _run_in_wave_request(
-            [args["wave_path_a"], args["wave_path_b"]], _work
-        )
-        if result["diverged"]:
-            for side, ctx in contexts.items():
-                resolved, reason = (await _run_in_cancellable_thread(
-                    lambda ctx=ctx: resolve_divergence_context(ctx, _handle_store)
-                )) if ctx is not None else (None, "context_missing")
-                expression = next((r for r in result.get('expressions',[]) if r.get('side')==side),None)
-                targets = expression['dependencies'][:16] if expression else [result[f'signal_{side}']]
-                for target in targets:
-                    action = driver_action(result={**result,f'signal_{side}':target}, side=side, context=ctx,
-                                           bound=resolved, reason=reason)
-                    if expression:
-                        action['reason'] = 'inspect_expression_dependency'
-                        action['evidence']['expression_key'] = expression['key']
-                    result['next_actions'].append(action)
-            from src.verify_condition import _attach_cursor
-            _attach_cursor(result, _cursor_store, result["first_divergence_time_ps"],
-                           result["value_a"], result["value_b"], args["wave_path_a"], result['signal_a'],
-                           args["wave_path_b"], result['signal_b'], args.get("cursor_name"), args.get("cursor_note"))
-            for action in result["next_actions"]:
-                action["evidence"]["cursor_name"] = result["cursor"]["name"]
-        return schemas.DiffFirstDivergenceResult.model_validate(result)
+        from src.divergence_diff_context import diff_with_context
+        return await diff_with_context(sys.modules[__name__], args)
 
     elif name == "period":
 
@@ -8825,8 +10497,13 @@ async def _dispatch(name: str, args: dict):
                 antecedent=args.get("antecedent"),
                 consequent=args.get("consequent"),
                 delta=args.get("delta"),
-                within_cycles=args.get("within_cycles", 1),
-                overlap=args.get("overlap", True),
+                within_cycles=args.get("within_cycles"),
+                overlap=args.get("overlap"),
+                response_min_cycles=args.get("response_min_cycles"),
+                response_max_cycles=args.get("response_max_cycles"),
+                attempt_start_indices=args.get("attempt_start_indices"),
+                sample_phase=args.get("sample_phase", "after"),
+                sample_offset_ps=args.get("sample_offset_ps"),
                 edge=args.get("edge", "posedge"),
                 start_ps=_resolve_time(args.get("start_time_ps", 0)),
                 end_ps=_resolve_time(args.get("end_time_ps", -1), allow_sentinel=True),
@@ -9082,6 +10759,13 @@ def _extract_structural_scan_summary(result: schemas.ScanStructuralRisksResult) 
         "lexical_coverage_status": result.lexical_coverage_status,
         "categories_scanned": result.categories_scanned,
         "semantic_status": result.semantic.status,
+        "semantic_backend": result.semantic.backend,
+        "semantic_category_coverage": result.semantic.category_coverage,
+        "semantic_result_groups": result.semantic.result_groups,
+        "semantic_backend_attempts": result.semantic.backend_attempts,
+        "semantic_native_execution": result.semantic.native_execution,
+        "semantic_termination_reason": result.semantic.termination_reason,
+        "semantic_continuation": result.semantic.continuation,
         "semantic_fact_count": result.semantic.total_facts,
         "semantic_scope": result.semantic.scope,
         "semantic_categories_checked": result.semantic.categories_checked,
@@ -9098,7 +10782,7 @@ def _extract_structural_scan_summary(result: schemas.ScanStructuralRisksResult) 
 
 
 def _extract_protocol_health_summary(result: schemas.HandshakeSweepResult) -> dict:
-    return schemas.ProtocolHealthSummary.model_validate({
+    summary = schemas.ProtocolHealthSummary.model_validate({
         "interfaces_inspected": result.interface_count,
         "flagged_count": result.flagged_count,
         "discovered_count": result.discovered_count,
@@ -9116,6 +10800,7 @@ def _extract_protocol_health_summary(result: schemas.HandshakeSweepResult) -> di
         "sampling_phase": result.sampling_phase,
         "skipped_count": len(result.skipped),
     }).model_dump(exclude_none=True)
+    return {**summary, "wave_path": result.wave_path, "facts_origin": "waveform", "optional": True}
 
 
 def _extract_recommend_summary(result: schemas.RecommendNextStepsResult) -> dict:
@@ -9130,16 +10815,14 @@ def _extract_recommend_summary(result: schemas.RecommendNextStepsResult) -> dict
 
 
 def _build_recommend_request_context(args: dict) -> dict[str, str | None]:
-    hier_state = _session_state.get("build_tb_hierarchy") or {}
     sim_state = _session_state.get("get_sim_paths") or {}
     return {
         "log_path": args.get("log_path"),
         "native_time_unit": args.get("native_time_unit"),
         "wave_path": args.get("wave_path"),
         "simulator": _resolve_session_simulator(args) or sim_state.get("simulator"),
-        "compile_log": args.get("compile_log")
-        or hier_state.get("compile_log")
-        or sim_state.get("compile_log"),
+        "compile_log": (args.get("compile_log") if args.get("_native_query") is not None
+                        else args.get("compile_log") or sim_state.get("compile_log")),
     }
 
 
@@ -9168,7 +10851,7 @@ def _build_scan_required_next_call(
     compile_log: str | None,
     simulator: str | None,
 ) -> dict[str, dict[str, str]] | None:
-    if not compile_log or not simulator:
+    if not STRUCTURAL_SCAN_IN_WORKFLOW or not compile_log or not simulator:
         return None
     return {
         "tool": "scan_structural_risks",
@@ -9237,45 +10920,46 @@ def _sweep_coverage_incomplete(
     return sweep_result is None or sweep_result.coverage_status != "complete"
 
 
-def _build_sweep_required_next_call(
+def _build_sweep_suggested_call(
     wave_path: str | None,
     sweep_result: schemas.HandshakeSweepResult | None = None,
 ) -> dict | None:
+    return next(iter(_build_sweep_suggested_calls(wave_path, sweep_result)), None)
+
+
+def _build_sweep_suggested_calls(
+    wave_path: str | None,
+    sweep_result: schemas.HandshakeSweepResult | None = None,
+) -> list[dict]:
     if not wave_path:
-        return None
+        return []
     if sweep_result is None:
-        return {
+        return [{
             "tool": "sweep_handshakes",
             "arguments": {"wave_path": wave_path},
             "reason": (
-                "Scoreboard/compare/mismatch failures are frequently a runtime protocol "
-                "symptom. Run the whole-design handshake sweep before reading RTL "
-                "line-by-line; it returns a per-interface stall/deadlock/payload-hold/"
-                "premature-valid-deassertion fact table in one call."
+                "Protocol behavior remains unchecked. For an unknown interface behind "
+                "a timeout/hang or compare symptom, consider a bounded handshake sweep. "
+                "Choose scope/window from evidence, or inspect a known interface directly."
             ),
-        }
-    if sweep_result.coverage_status == "complete":
-        return None
+        }]
+    if (sweep_result.coverage_status == "complete"
+            or not _same_realpath(wave_path, sweep_result.wave_path)):
+        return []
 
-    for action in sweep_result.suggested_next_actions:
+    result = sweep_result.model_dump()
+    actions, seen = [], set()
+    candidates = [action for action in sweep_result.suggested_next_actions
+                  if _sweep_action_makes_progress(action, wave_path, sweep_result)]
+    if not candidates:
+        candidates = build_sweep_followup_actions(result)
+    for action in candidates:
         if _sweep_action_makes_progress(action, wave_path, sweep_result):
-            return action
-    if sweep_result.coverage_status == "truncated":
-        target = max(
-            int(sweep_result.discovered_count or 0),
-            int(sweep_result.interface_count or 0),
-        )
-        if target > int(sweep_result.interface_count or 0):
-            return {
-                "tool": "sweep_handshakes",
-                "arguments": {"wave_path": wave_path, "max_interfaces": target},
-                "reason": (
-                    "Previous sweep_handshakes coverage was truncated, so it was not "
-                    "a complete protocol scan. Re-run with max_interfaces high enough "
-                    "to cover every discovered interface."
-                ),
-            }
-    return None
+            key = (action["tool"], json.dumps(action["arguments"], sort_keys=True))
+            if key not in seen:
+                actions.append(action)
+                seen.add(key)
+    return actions
 
 
 def _sweep_action_makes_progress(
@@ -9283,7 +10967,8 @@ def _sweep_action_makes_progress(
     wave_path: str,
     sweep_result: schemas.HandshakeSweepResult,
 ) -> bool:
-    if action.get("tool") != "sweep_handshakes":
+    tool = action.get("tool")
+    if tool not in {"sweep_handshakes", "suggest_handshakes", "suggest_protocol_bundles"}:
         return False
     arguments = action.get("arguments")
     if not isinstance(arguments, dict) or not arguments:
@@ -9294,12 +10979,18 @@ def _sweep_action_makes_progress(
 
     prior_scope = sweep_result.scope or None
     next_scope = arguments.get("scope") or None
+    if tool != "sweep_handshakes":
+        return bool(next_scope and next_scope != prior_scope and (
+            not prior_scope or next_scope.startswith(prior_scope.rstrip(".") + ".")
+        ))
     if prior_scope != next_scope:
-        # Removing a scope, or moving to a strict parent, expands discovery.
-        # Adding/narrowing a scope after an unscoped sweep cannot complete the
-        # whole-design default-flow check.
-        if prior_scope and next_scope is None:
+        # A narrower investigation may make progress while global coverage
+        # remains incomplete. Parent scopes can recover empty scoped discovery.
+        if next_scope and (not prior_scope or next_scope.startswith(prior_scope.rstrip(".") + ".")):
             return True
+        if prior_scope and next_scope is None:
+            return not (sweep_result.coverage_status == "zero_coverage"
+                        and "discovery_incomplete" in sweep_coverage_gaps(sweep_result.model_dump()))
         if (
             prior_scope
             and next_scope
@@ -9313,12 +11004,10 @@ def _sweep_action_makes_progress(
             next_max = int(arguments.get("max_interfaces"))
         except (TypeError, ValueError):
             next_max = 0
-        return next_max >= int(sweep_result.discovered_count or 0) and next_max > int(
-            sweep_result.interface_count or 0
-        )
-
-    if sweep_result.coverage_status != "degraded":
-        return False
+        if (sweep_coverage_gaps(sweep_result.model_dump()) == ["interface_cap"]
+                and next_max >= int(sweep_result.discovered_count or 0)
+                and next_max > int(sweep_result.interface_count or 0)):
+            return True
     if arguments.get("edge", sweep_result.edge) != sweep_result.edge:
         return True
 
@@ -9381,23 +11070,6 @@ def _recommend_has_protocol_symptom(
     return False
 
 
-def _select_recommend_primary_missing_step(
-    missing_scan: bool,
-    missing_sweep: bool,
-    protocol_symptom: bool,
-) -> str | None:
-    # Protocol symptom: sweep leads even when the structural scan is also
-    # missing. Otherwise the structural scan leads; sweep fills in when it is
-    # the only step still missing.
-    if missing_sweep and protocol_symptom:
-        return "sweep"
-    if missing_scan:
-        return "scan"
-    if missing_sweep:
-        return "sweep"
-    return None
-
-
 def _build_result_provenance(
     tool_name: str, args: dict, result: schemas.SchemaModel
 ) -> dict | None:
@@ -9451,6 +11123,8 @@ def _build_result_provenance(
                 log_size = stat_result.st_size
             except OSError:
                 pass
+        prepared = args.get("_prepared_design") or args.get("_native_query")
+        correlation = getattr(result, "source_correlation", None) or {}
         return {
             "log_path": log_path,
             "wave_path": args.get("wave_path"),
@@ -9458,6 +11132,10 @@ def _build_result_provenance(
             "compile_log": args.get("compile_log"),
             "log_mtime": log_mtime,
             "log_size": log_size,
+            "design_handle": args.get("design_handle"),
+            "context_identity_sha256": prepared.context.identity_sha256 if prepared is not None else None,
+            "facts_origin": correlation.get("facts_origin"),
+            "source_coverage_status": correlation.get("coverage_status"),
         }
     return None
 
@@ -9518,7 +11196,6 @@ def _can_suggest_recommend(anchor: dict | None) -> bool:
         and sim_result
         and sim_result.sim_logs
         and sim_result.wave_files
-        and _session_state.get("build_tb_hierarchy") is not None
     )
 
 
@@ -9595,6 +11272,8 @@ def _matches_anchor(
         )
     if tool_name == "recommend_failure_debug_next_steps":
         return (
+            _cached_design_provenance_observed(provenance)
+            and
             provenance.get("simulator") == anchor.get("simulator")
             and provenance.get("compile_log") == anchor.get("compile_log")
             and _path_matches_session(provenance.get("log_path"), sim_logs, case_dir)
@@ -9602,6 +11281,36 @@ def _matches_anchor(
             and _file_unchanged(provenance, "log_path", "log_mtime", "log_size")
         )
     return False
+
+
+def _cached_design_provenance_observed(provenance):
+    """Check registry association only; diagnostics do not rehash sources."""
+    handle = provenance.get("design_handle")
+    if handle is None:
+        return True
+    return any(row["design_handle"] == handle and row["context_identity_sha256"] ==
+               provenance.get("context_identity_sha256") for row in _design_context_store.summaries())
+
+
+def _diagnostic_design_context(args, anchor, *, case_mismatch=False):
+    """Select observed metadata explicitly or by one unambiguous case match."""
+    explicit = args.get("design_handle")
+    rows = [] if case_mismatch else _design_context_store.summaries()
+    if explicit is not None:
+        rows = [row for row in rows if row["design_handle"] == explicit]
+    elif anchor is None or not anchor.get("compile_log"):
+        rows = []
+    if anchor is not None:
+        rows = [row for row in rows if _same_realpath(row["compile_log"], anchor.get("compile_log"))
+                and anchor.get("simulator") in (None, "auto", row["simulator"])]
+    if len(rows) == 1:
+        row = rows[0]
+        return schemas.DiagnosticSnapshotSection(available=True, summary=row), row
+    reason = ("case_mismatch" if case_mismatch else "ambiguous" if rows else
+              "handle_unavailable_or_mismatched" if explicit is not None else "not_prepared")
+    return schemas.DiagnosticSnapshotSection(available=False, summary={
+        "status": reason, "candidates": rows, "identity_validation": "not_revalidated",
+        "query_validation_required": True}), None
 
 
 def _handle_diagnostic_snapshot(args: dict) -> schemas.DiagnosticSnapshot:
@@ -9631,6 +11340,10 @@ def _handle_diagnostic_snapshot(args: dict) -> schemas.DiagnosticSnapshot:
     if case_mismatch:
         sim_result = None
         anchor = None
+    sections["design_context"], selected_design = _diagnostic_design_context(
+        args, anchor, case_mismatch=case_mismatch)
+    if selected_design is not None:
+        quick_ref["top_module"] = selected_design["selected_top"]
 
     if sim_result is not None:
         summary = _extract_sim_paths_summary(sim_result)
@@ -9666,42 +11379,6 @@ def _handle_diagnostic_snapshot(args: dict) -> schemas.DiagnosticSnapshot:
             }
         )
 
-    # Suggest build_kdb when the active simulator is Xcelium and the
-    # probe positively confirms there is no KDB. We deliberately do
-    # *not* surface this when the compile log fails to parse — that
-    # signals a degraded probe, not a missing KDB.
-    try:
-        from config import AUTO_KDB_BUILD  # noqa: PLC0415
-    except Exception:
-        AUTO_KDB_BUILD = False
-    if (
-        AUTO_KDB_BUILD
-        and sim_result is not None
-        and getattr(sim_result, "simulator", None) == "xcelium"
-    ):
-        cl_entries = getattr(sim_result, "compile_logs", []) or []
-        compile_log_path = cl_entries[0].path if cl_entries else None
-        if compile_log_path:
-            try:
-                _cr = parse_compile_log(compile_log_path, "xcelium")
-                _probe = probe_verdi_backend(_cr, compile_log_path=compile_log_path)
-                _probe_ok = True
-            except Exception:
-                _probe_ok = False
-                _probe = {}
-            if _probe_ok and not _probe.get("kdb_path"):
-                missing_steps.append(
-                    {
-                        "tool": "build_kdb",
-                        "arguments": {"compile_log": compile_log_path},
-                        "reason": (
-                            "Xcelium flow has no Verdi KDB yet; running build_kdb "
-                            "produces one so the NPI backend can answer cross-hierarchy "
-                            "driver/load/path queries."
-                        ),
-                    }
-                )
-
     hier_result = None if case_mismatch else _result_cache.get("build_tb_hierarchy")
     if hier_result is not None:
         is_stale = anchor is not None and not _matches_anchor(
@@ -9709,30 +11386,33 @@ def _handle_diagnostic_snapshot(args: dict) -> schemas.DiagnosticSnapshot:
             anchor,
             _result_provenance.get("build_tb_hierarchy"),
         )
+        if args.get("design_handle") is not None and selected_design is None:
+            is_stale = True
+        if selected_design is not None:
+            legacy = _result_provenance.get("build_tb_hierarchy") or {}
+            legacy_logs = legacy.get("supplementary_compile_logs") or []
+            current_logs = selected_design["supplementary_compile_logs"]
+            is_stale |= (not _same_realpath(legacy.get("compile_log"), selected_design["compile_log"])
+                or legacy.get("simulator") != selected_design["simulator"]
+                or hier_result.project.get("top_module") != selected_design["selected_top"]
+                or len(legacy_logs) != len(current_logs)
+                or any(not _same_realpath(a, b) for a, b in zip(legacy_logs, current_logs)))
         sections["hierarchy"] = schemas.DiagnosticSnapshotSection(
             available=True,
             stale=is_stale,
             summary=_extract_hierarchy_summary(hier_result),
         )
-        if not is_stale and anchor is not None:
+        if not is_stale and anchor is not None and selected_design is None:
             quick_ref["top_module"] = hier_result.project.get("top_module")
     else:
         sections["hierarchy"] = schemas.DiagnosticSnapshotSection(
             available=False,
-            suggested_call=_build_suggested_call("build_tb_hierarchy")
-            if anchor is not None
-            else None,
+            summary={"view": "legacy_full_hierarchy", "optional": True},
         )
-    if anchor is not None and (hier_result is None or sections["hierarchy"].stale):
-        suggested = _build_suggested_call("build_tb_hierarchy")
-        sections["hierarchy"].suggested_call = suggested
-        missing_steps.append(
-            {
-                "tool": "build_tb_hierarchy",
-                "arguments": suggested["arguments"],
-                "reason": "Hierarchy has not been built yet, so module and instance relationships are unknown.",
-            }
-        )
+    if anchor is not None and selected_design is None and anchor.get("compile_log"):
+        sections["design_context"].suggested_call = {
+            "tool": "get_tb_subtree", "arguments": {
+                "compile_log": anchor["compile_log"], "simulator": anchor.get("simulator") or "auto"}}
 
     log_result = None if case_mismatch else _result_cache.get("parse_sim_log")
     compatible_log_result = None
@@ -9769,11 +11449,6 @@ def _handle_diagnostic_snapshot(args: dict) -> schemas.DiagnosticSnapshot:
         )
 
     scan_result = None if case_mismatch else _result_cache.get("scan_structural_risks")
-    compatible_hierarchy = bool(
-        anchor is not None
-        and hier_result is not None
-        and not sections["hierarchy"].stale
-    )
     compatible_scan_result = (
         _get_compatible_scan_cache(anchor.get("compile_log"), anchor.get("simulator"))
         if anchor is not None
@@ -9790,9 +11465,22 @@ def _handle_diagnostic_snapshot(args: dict) -> schemas.DiagnosticSnapshot:
             stale=is_stale,
             summary=_extract_structural_scan_summary(scan_result),
         )
+        if not STRUCTURAL_SCAN_IN_WORKFLOW:
+            sections["structural_scan"].summary["workflow_enabled"] = False
+    elif not STRUCTURAL_SCAN_IN_WORKFLOW:
+        sections["structural_scan"] = schemas.DiagnosticSnapshotSection(
+            available=False,
+            summary={
+                "workflow_enabled": False,
+                "status": "skipped_by_policy",
+                "coverage_status": "not_run",
+                "reason": "TRACEWEAVE_STRUCTURAL_SCAN_IN_WORKFLOW=0; structural risks remain unchecked.",
+            },
+        )
     else:
         sections["structural_scan"] = None
-    if anchor is not None and compatible_hierarchy and compatible_scan_result is None:
+    if (STRUCTURAL_SCAN_IN_WORKFLOW and anchor is not None
+            and anchor.get("compile_log") and compatible_scan_result is None):
         has_failure_context = bool(
             compatible_log_result is not None
             and compatible_log_result.runtime_total_errors > 0
@@ -9813,66 +11501,41 @@ def _handle_diagnostic_snapshot(args: dict) -> schemas.DiagnosticSnapshot:
             }
         )
 
-    # Whole-design protocol health (sweep_handshakes) — the runtime-layer
-    # counterpart of scan_structural_risks: a default-flow perception step whose
-    # facts the LLM judges. Recommended only when a waveform exists AND the run
-    # actually failed (a clean run or a log-less session needs no protocol scan).
+    # Optional protocol evidence remains visible independently of workflow
+    # completeness. An unchecked waveform never acquires a clean status.
     sweep_result = None if case_mismatch else _result_cache.get("sweep_handshakes")
     has_waveform = bool(sim_result is not None and sim_result.wave_files)
     sweep_failure_context = bool(
         compatible_log_result is not None
         and compatible_log_result.runtime_total_errors > 0
     )
-    sweep_wave_path = anchor.get("wave_path") if anchor is not None else None
+    sweep_wave_path = sim_result.wave_files[0].path if has_waveform else None
     if sweep_wave_path is None and sweep_result is not None:
         sweep_wave_path = sweep_result.wave_path
     if sweep_result is not None:
+        stale = bool(sweep_wave_path and not _same_realpath(sweep_result.wave_path, sweep_wave_path))
         sweep_call = (
-            _build_sweep_required_next_call(sweep_wave_path, sweep_result)
-            if _sweep_coverage_incomplete(sweep_result)
+            _build_sweep_suggested_call(sweep_wave_path, sweep_result)
+            if not stale and _sweep_coverage_incomplete(sweep_result)
             else None
         )
         sections["protocol_health"] = schemas.DiagnosticSnapshotSection(
             available=True,
+            stale=stale,
             summary=_extract_protocol_health_summary(sweep_result),
             suggested_call=sweep_call,
         )
-        if (
-            anchor is not None
-            and has_waveform
-            and sweep_failure_context
-            and _sweep_coverage_incomplete(sweep_result)
-        ):
-            if sweep_call is not None:
-                missing_steps.append(
-                    {
-                        "tool": "sweep_handshakes",
-                        "arguments": sweep_call["arguments"],
-                        "reason": (
-                            "A compatible sweep_handshakes result exists, but its "
-                            f"coverage_status={sweep_result.coverage_status!r}; this is "
-                            "not a complete default-flow protocol scan."
-                        ),
-                    }
-                )
-    elif anchor is not None and has_waveform and sweep_failure_context:
-        sweep_call = _build_suggested_call("sweep_handshakes")
+    elif has_waveform:
+        from src.analyzer import _build_runtime_protocol_coverage
+        sweep_call = (
+            _build_sweep_suggested_call(sweep_wave_path)
+            if sweep_failure_context and _recommend_has_protocol_symptom(compatible_log_result)
+            else None
+        )
         sections["protocol_health"] = schemas.DiagnosticSnapshotSection(
             available=False,
+            summary={**_build_runtime_protocol_coverage(None, wave_path=sweep_wave_path), "optional": True},
             suggested_call=sweep_call,
-        )
-        missing_steps.append(
-            {
-                "tool": "sweep_handshakes",
-                "arguments": sweep_call["arguments"],
-                "reason": (
-                    "Whole-design bus protocol health has not been checked; a "
-                    "scoreboard/data-compare failure is frequently the symptom of a "
-                    "lower-level protocol problem. sweep_handshakes inspects every "
-                    "AHB and valid/ready interface in one call and returns a "
-                    "per-interface stall/deadlock/payload-hold fact table."
-                ),
-            }
         )
     else:
         sections["protocol_health"] = None
@@ -9889,15 +11552,26 @@ def _handle_diagnostic_snapshot(args: dict) -> schemas.DiagnosticSnapshot:
         else _result_cache.get("recommend_failure_debug_next_steps")
     )
     if rec_result is not None:
-        is_stale = anchor is not None and not _matches_anchor(
+        rec_provenance = _result_provenance.get("recommend_failure_debug_next_steps") or {}
+        is_stale = (anchor is not None and not _matches_anchor(
             "recommend_failure_debug_next_steps",
             anchor,
-            _result_provenance.get("recommend_failure_debug_next_steps"),
-        )
+            rec_provenance,
+        )) or not _cached_design_provenance_observed(rec_provenance)
+        if args.get("design_handle") is not None or (anchor is not None and rec_provenance.get("design_handle") is not None):
+            is_stale |= (selected_design is None or rec_provenance.get("design_handle") !=
+                         selected_design["design_handle"] or rec_provenance.get("context_identity_sha256") !=
+                         selected_design["context_identity_sha256"])
+        rec_summary = _extract_recommend_summary(rec_result)
+        if rec_provenance.get("design_handle") is not None:
+            rec_summary = {**(rec_summary or {}), "design_handle": rec_provenance["design_handle"],
+                "context_identity_sha256": rec_provenance.get("context_identity_sha256"),
+                "identity_validation": "not_revalidated", "facts_origin": rec_provenance.get("facts_origin"),
+                "source_coverage_status": rec_provenance.get("source_coverage_status")}
         sections["recommended_next"] = schemas.DiagnosticSnapshotSection(
             available=True,
             stale=is_stale,
-            summary=_extract_recommend_summary(rec_result),
+            summary=rec_summary,
         )
         if not is_stale and anchor is not None:
             quick_ref["primary_failure_target"] = rec_result.primary_failure_target
@@ -9921,6 +11595,8 @@ def _handle_diagnostic_snapshot(args: dict) -> schemas.DiagnosticSnapshot:
             if _can_suggest_recommend(anchor)
             else None
         )
+        if suggested is not None and selected_design is not None:
+            suggested["arguments"]["design_handle"] = selected_design["design_handle"]
         sections["recommended_next"].suggested_call = suggested
         missing_steps.append(
             {
@@ -9946,10 +11622,10 @@ def _handle_diagnostic_snapshot(args: dict) -> schemas.DiagnosticSnapshot:
         )
         workflow_order = {
             "get_sim_paths": 0,
+            "prepare_design_context": 1,
             "build_tb_hierarchy": 1,
             "scan_structural_risks": 2,
             "parse_sim_log": 3,
-            "sweep_handshakes": 4,
             "recommend_failure_debug_next_steps": 5,
         }
         missing_steps.sort(
@@ -9968,6 +11644,7 @@ def _handle_diagnostic_snapshot(args: dict) -> schemas.DiagnosticSnapshot:
     return schemas.DiagnosticSnapshot(
         sim_paths=sections["sim_paths"],
         hierarchy=sections["hierarchy"],
+        design_context=sections["design_context"],
         log_analysis=sections["log_analysis"],
         structural_scan=sections["structural_scan"],
         protocol_health=sections["protocol_health"],
@@ -10240,6 +11917,30 @@ def _trim_semantic_scan(model: schemas.SemanticScanResult, limit: int) -> dict:
     )
     payload["facts"] = facts
     payload["instance_bindings"] = bindings
+    if limit <= 3:
+        payload.pop('suggested_next_action', None)
+    for group in payload['result_groups']:
+        if limit <= 3 and group.get('scan_progress'):
+            group['scan_progress']['next_scopes'] = []
+        if limit <= 3:
+            for row in group.get('gap_summary', []):
+                row['examples_truncated'] |= bool(row['examples'])
+                row['examples'] = []
+        if limit == 0 and group.get('gap_summary'):
+            group['gap_summary'] = []
+            group['gap_summary_truncated'] = True
+        if limit == 0:
+            group.pop('scan_progress', None)
+            group['limitations'] = []
+    if limit == 0:
+        referenced = {row['result_group'] for row in payload['category_coverage']}
+        omitted = [g['group_id'] for g in payload['result_groups'] if
+            g['group_id'] not in referenced and g['status'] == 'not_run'
+            and g.get('artifact_identity') is None and not g['total_facts']
+            and not g['selected_categories']]
+        if omitted:
+            payload['omitted_result_groups'] = omitted
+            payload['result_groups'] = [g for g in payload['result_groups'] if g['group_id'] not in omitted]
     return payload
 
 
@@ -10291,8 +11992,13 @@ def _shrink_scan_structural_risks_terminal(
         {
             **model.model_dump(exclude_none=True),
             "detail_level": "summary",
-            "detail_hint": "Response truncated to fit budget. Re-run scan_structural_risks with one category.",
-            "semantic": _trim_semantic_scan(model.semantic, 0),
+            "detail_hint": ("Resume with semantic_continuation and unchanged scope/categories."
+                            if model.semantic.continuation else
+                            "Response truncated to fit budget. Re-run scan_structural_risks with one category."),
+            # Keep coverage/identity/counters, shed explanatory prose and
+            # optional timings before ever dropping required semantic receipts.
+            "semantic": {**_trim_semantic_scan(model.semantic, 0), "note": None, "metrics": {}},
+            "scan_metrics": {},
             "risks": [],
             "categories_scanned": model.categories_scanned,
             "skipped_files": [],
@@ -10414,16 +12120,18 @@ def _handle_parse_sim_log(args: dict) -> schemas.ParseSimLogResult:
 
     # Spell out the concrete sweep call at the one layer where its args first
     # co-exist: the symptom (just computed) + the wave path (cached get_sim_paths).
-    # A prose protocol_symptom_hint alone gets skipped by weak models; the
-    # ready-to-run call does not. Gated on BOTH a symptom AND an available wave
-    # (_build_sweep_required_next_call returns None without a wave_path) —
-    # suggestion only, the LLM still decides whether to run it.
+    # Gated on both a symptom and an available wave. This is an optional
+    # investigation; known interfaces may use targeted tools directly.
     summary["protocol_symptom_next_step"] = None
     if summary.get("protocol_symptom_hint"):
         sim_paths = _result_cache.get("get_sim_paths")
+        matching_log = bool(sim_paths and any(
+            _same_realpath(entry.path, args["log_path"])
+            for entry in getattr(sim_paths, "sim_logs", [])
+        ))
         wave_path = (
             sim_paths.wave_files[0].path
-            if sim_paths and getattr(sim_paths, "wave_files", None)
+            if matching_log and getattr(sim_paths, "wave_files", None)
             else None
         )
         sweep_cache = _result_cache.get("sweep_handshakes")
@@ -10437,7 +12145,7 @@ def _handle_parse_sim_log(args: dict) -> schemas.ParseSimLogResult:
             )
             else None
         )
-        summary["protocol_symptom_next_step"] = _build_sweep_required_next_call(
+        summary["protocol_symptom_next_step"] = _build_sweep_suggested_call(
             wave_path, compatible_sweep
         )
 

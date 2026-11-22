@@ -7,6 +7,8 @@ import os
 import hashlib
 import json
 
+from config import STRUCTURAL_SCAN_IN_WORKFLOW
+
 from .cancellation import check_cancelled
 from .compile_session_snapshot import CompileSessionSnapshot
 from .hierarchy_handles import compute_handle, compute_snapshot_fingerprint
@@ -136,6 +138,7 @@ def driver_action(
     context: dict | None,
     bound: BoundContext | None = None,
     reason: str = "hierarchy_unavailable",
+    native: bool = False,
 ) -> dict:
     arguments = {
         "wave_path": result[f"wave_path_{side}"],
@@ -156,6 +159,50 @@ def driver_action(
         action["evidence"]["cursor_name"] = result["cursor"]["name"]
     if context is None:
         return action
+    if context.get("design_handle") is not None:
+        if bound is not None:
+            arguments["design_handle"] = bound.design_handle
+            action.update(status="ready", missing_fields=[])
+            return action
+        action["missing_fields"] = [f"side_{side}.design_handle"]
+        action["evidence"]["context_status"] = reason
+        # A new preparation establishes current inputs. Never relay a stale
+        # random handle or a composite historical-source fingerprint as an
+        # expected identity for the ordinary prepare API.
+        if context.get("compile_log"):
+            prepare = {key: context[key] for key in (
+                "compile_log", "simulator", "supplementary_compile_logs",
+                "top_hint", "backend_preference", "kdb_path",
+            ) if context.get(key) is not None}
+            action["status"] = "needs_prerequisite"
+            action["prerequisite_calls"] = [{
+                "id": f"design_{side}", "tool": "prepare_design_context",
+                "arguments": prepare, "depends_on": [], "parallel_group": f"compile_{side}",
+            }]
+            action["evidence"]["preparation_identity"] = "current_inputs_only"
+            action["prerequisite_calls"].extend(_scan_calls(context, side))
+        else:
+            action["missing_fields"].append(f"side_{side}.compile_log")
+        return action
+    if native:
+        # A retry starts a new native observation; no stale bound context or
+        # legacy compile_context identity is carried across a lifecycle error.
+        arguments.update({key: context[key] for key in (
+            "compile_log", "supplementary_compile_logs", "simulator", "top_hint",
+            "kdb_path", "backend_preference", "retry_npi",
+        ) if context.get(key) is not None})
+        action.update(status="ready", missing_fields=[])
+        action["evidence"]["context_status"] = reason
+        return action
+    if bound is not None and getattr(getattr(bound, "prepared", None), "native", False):
+        inputs = bound.prepared.context
+        arguments.update({key: value for key, value in {
+            "compile_log": inputs.ordered_compile_logs[0] if inputs.ordered_compile_logs else None,
+            "supplementary_compile_logs": list(inputs.ordered_compile_logs[1:]),
+            "simulator": inputs.simulator, "top_hint": inputs.selected_top,
+            "kdb_path": inputs.requested_kdb_path}.items() if value is not None})
+        action.update(status="ready", missing_fields=[])
+        return action
     ctx = DivergenceContext.model_validate(context).model_dump(exclude_none=True)
     arguments.update(
         compile_log=ctx["compile_log"], simulator=ctx["simulator"], compile_context=ctx
@@ -171,36 +218,35 @@ def driver_action(
         )
         action["status"] = "ready"
         return action
-    action["status"] = "needs_prerequisite"
     action["evidence"]["context_status"] = reason
-    # A rebuild establishes a new identity. Do not relay stale tokens to it.
-    arguments["compile_context"].pop("snapshot_sha256", None)
-    arguments["compile_context"].pop("hierarchy_handle", None)
-    arguments["compile_context"].pop("source_snapshot_sha256", None)
-    arguments["compile_context"].pop("compile_log_identity_sha256", None)
-    build = {
-        k: ctx[k] for k in ("compile_log", "simulator", "supplementary_compile_logs")
-    }
-    calls = [
-        {
-            "id": f"hierarchy_{side}",
-            "tool": "build_tb_hierarchy",
-            "arguments": build,
-            "depends_on": [],
-            "parallel_group": f"compile_{side}",
-        }
-    ]
+    # An unavailable in-process tree is recoverable by the existing exact
+    # action entry point. Retain every historical token for its verification;
+    # a changed identity must never become a token-free current-source action.
+    if reason in {"hierarchy_unavailable", "handle_expired"}:
+        action["status"] = "ready"
+        action["evidence"]["context_recovery"] = "required_before_query"
+    else:
+        action["status"] = "needs_context"
+        action["missing_fields"] = [f"context_{side}.verified_identity"]
+    action["prerequisite_calls"] = _scan_calls(ctx, side)
+    return action
+
+
+def _scan_calls(ctx, side):
+    """Independent default-workflow scans never require a full hierarchy."""
+    if not STRUCTURAL_SCAN_IN_WORKFLOW:
+        return []
+    calls = []
     for index, path in enumerate(
-        [ctx["compile_log"], *ctx["supplementary_compile_logs"]]
+        [ctx["compile_log"], *ctx.get("supplementary_compile_logs", [])]
     ):
         calls.append(
             {
                 "id": f"scan_{side}_{index}",
                 "tool": "scan_structural_risks",
-                "arguments": {"compile_log": path, "simulator": ctx["simulator"]},
+                "arguments": {"compile_log": path, "simulator": ctx.get("simulator", "auto")},
                 "depends_on": [],
                 "parallel_group": f"compile_{side}",
             }
         )
-    action["prerequisite_calls"] = calls
-    return action
+    return calls

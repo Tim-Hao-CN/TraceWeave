@@ -1,0 +1,14 @@
+{
+  "version": "REPLACE_WITH_PROJECT_REVISION",
+  "top": "tb",
+  "simulator": "vcs",
+  "paths": {"compile_log": "/absolute/path/to/build.log"},
+  "compile_log_sha256": "REPLACE_WITH_SHA256",
+  "source": "/absolute/path/to/uart_core.sv",
+  "source_sha256": "REPLACE_WITH_SHA256",
+  "line": 10,
+  "site": "/absolute/path/to/uart.sv",
+  "site_sha256": "REPLACE_WITH_SHA256",
+  "site_line": 74,
+  "target": "tb.dut.top_earlgrey.u_uart0.uart_core"
+}

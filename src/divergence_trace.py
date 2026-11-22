@@ -7,16 +7,24 @@ from collections import deque
 import hashlib
 import json
 
+import anyio
+
 from .cancellation import OperationCancelled
+from .compile_input_capture import CaptureAborted
+from .design_backend_binding import ExecutionBindingChanged
+from .design_context_runtime import ContextUnavailable
 from .divergence_budget import Budget, BudgetExceeded, TraceRestart
 from .divergence_clock import compare_clock
 from .divergence_compare import compare_signals, file_identity, known
 from .divergence_context import resolve_context, driver_action
+from .divergence_design_context import DivergenceDesigns
 from .divergence_mapping import Mapping, selected_path, split_selection
 from .divergence_routing import DynamicRoute
 from .dynamic_observe import observe_step
 from .observation_session import ObservationSession
 from .schemas import TraceDivergenceInput, TraceDivergenceResult
+from .kdb_anchor import KdbBindingChanged
+from .native_query import NativeFallback, NativeInputChanged
 
 _COMPETING = [
     "upstream_input_difference",
@@ -26,10 +34,20 @@ _COMPETING = [
 
 
 def _context(side):
-    return {k: v for k, v in side.items() if k not in {"wave_path", "signal_path"}}
+    legacy = any(side.get(k) is not None for k in ("hierarchy_handle", "snapshot_sha256",
+        "source_snapshot_sha256", "compile_log_identity_sha256"))
+    return {k: v for k, v in side.items() if k not in {"wave_path", "signal_path"}
+            and (not legacy or k not in {"kdb_path", "backend_preference", "retry_npi"})}
 
 
 def _design_id(bound):
+    if getattr(bound, "prepared", None) is not None:
+        # Content/compile identity, never a random registry handle. Legacy H
+        # and independent C identities intentionally do not imply equivalence.
+        return hashlib.sha256(json.dumps([
+            "prepared_compile_context_v1", bound.snapshot,
+            bound.context.get("top_hint"),
+        ]).encode()).hexdigest()
     return hashlib.sha256(
         json.dumps(
             [
@@ -82,8 +100,65 @@ def _structure(step):
     return result
 
 
+class _ContextsUnavailable(Exception):
+    pass
+
+
+def _empty_result(request):
+    return dict(
+        status="blocked", reference_side=request["reference_side"], comparison={},
+        contexts={}, nodes=[], edges=[], findings=[], frontier=[],
+        coverage=dict(checks=[], gaps=[], limits=request["limits"], truncated=False),
+        next_actions=[], cursor=None, operation_metrics={},
+    )
+
+
 async def trace_divergence(services, raw, *, route_factory=DynamicRoute):
-    request = TraceDivergenceInput.model_validate(raw).model_dump(exclude_none=True)
+    model = TraceDivergenceInput.model_validate(raw)
+    request = model.model_dump(exclude_none=True)
+    budget = Budget(request["limits"])
+    sides = {label: request[f"side_{label}"] for label in ("a", "b")}
+    with DivergenceDesigns(services, model, sides, budget) as designs:
+        try:
+            designs.pin_all()
+            result = await _trace_divergence(
+                designs.services, request, budget, designs, route_factory=route_factory,
+            )
+        except OperationCancelled as exc:
+            raise asyncio.CancelledError from exc
+        except (CaptureAborted, ContextUnavailable, NativeInputChanged, KdbBindingChanged,
+                ExecutionBindingChanged, TimeoutError) as exc:
+            code = ("compile_metadata_changed" if isinstance(exc, NativeInputChanged) else exc.code if isinstance(exc, ContextUnavailable)
+                    else "design_context_changed" if isinstance(exc, CaptureAborted) and exc.code == "input_changed"
+                    else "design_context_" + exc.code if isinstance(exc, CaptureAborted)
+                    else "kdb_identity_changed" if isinstance(exc, KdbBindingChanged)
+                    else "design_context_execution_changed" if isinstance(exc, ExecutionBindingChanged)
+                    else "design_context_timeout")
+            # No typed lifecycle failure can retain root comparison, graph or
+            # cursor facts, or trigger a source fallback/rebinding attempt.
+            failed = _empty_result(request)
+            failed["status"] = "inconclusive"
+            failed["coverage"]["gaps"] = [code]
+            failed["frontier"] = [dict(node_id=None, reason=code)]
+            for label, side in sides.items():
+                context = designs.recovery_context(label)
+                failed["contexts"][label] = dict(compile_context=context, status=code,
+                                                wave_path=side["wave_path"])
+                failed["next_actions"].append(driver_action(
+                    result={f"wave_path_{label}": side["wave_path"],
+                            f"signal_{label}": side["signal_path"],
+                            "first_divergence_time_ps": None},
+                    side=label, context=context, reason=code,
+                    native=designs.native_eligible(label),
+                ))
+            result = _finish(failed, budget)
+        designs.describe(result.contexts)
+        result.operation_metrics.update(designs.cost())
+        result.coverage["used_budget"].update(designs.cost())
+        return result
+
+
+async def _trace_divergence(services, request, budget, designs, *, route_factory):
     start = services._resolve_time(request["start_time_ps"])
     end = services._resolve_time(request["end_time_ps"], allow_sentinel=True)
     if start < 0 or end < -1 or end >= 0 and end < start:
@@ -98,29 +173,11 @@ async def trace_divergence(services, raw, *, route_factory=DynamicRoute):
     ):
         raise ValueError("clock_policy_requires_clock_mode")
     sides = {s: request[f"side_{s}"] for s in ("a", "b")}
-    budget = Budget(request["limits"])
     observations = ObservationSession(budget)
     budget.observations = observations
-    result = dict(
-        status="blocked",
-        reference_side=request["reference_side"],
-        comparison={},
-        contexts={},
-        nodes=[],
-        edges=[],
-        findings=[],
-        frontier=[],
-        coverage={
-            "checks": [],
-            "gaps": [],
-            "limits": request["limits"],
-            "truncated": False,
-        },
-        next_actions=[],
-        cursor=None,
-        operation_metrics={},
-    )
+    result = _empty_result(request)
     wave_ids = {s: file_identity(side["wave_path"]) for s, side in sides.items()}
+    designs.wave_ids = wave_ids
     bounds = {}
     routes = {}
     comparison = None
@@ -152,11 +209,16 @@ async def trace_divergence(services, raw, *, route_factory=DynamicRoute):
             False,
         )
         for label, side in sides.items():
-            bound, reason = await budget.run(
-                lambda side=side: services._run_in_cancellable_thread(
-                    lambda: resolve_context(_context(side), services._handle_store)
+            if side.get("design_handle") is not None:
+                bound, reason = await designs.resolve(label), "ready"
+            elif designs.native_eligible(label):
+                bound, reason = await designs.resolve_native(label), "ready"
+            else:
+                bound, reason = await budget.run(
+                    lambda side=side: services._run_in_cancellable_thread(
+                        lambda: resolve_context(_context(side), services._handle_store)
+                    )
                 )
-            )
             bounds[label] = bound
             result["contexts"][label] = dict(
                 compile_context=bound.context if bound else _context(side),
@@ -182,7 +244,7 @@ async def trace_divergence(services, raw, *, route_factory=DynamicRoute):
                 )
                 frontier(None, reason, side=label)
         if any(bound is None for bound in bounds.values()):
-            return _finish(result, budget)
+            raise _ContextsUnavailable
         ids = {s: _design_id(bound) for s, bound in bounds.items()}
         for label in sides:
             result["contexts"][label]["design_identity_sha256"] = ids[label]
@@ -239,6 +301,8 @@ async def trace_divergence(services, raw, *, route_factory=DynamicRoute):
                 for s, side in sides.items()
             }
             while True:
+                for route in routes.values():
+                    route.receipt = {}
                 # No edge or finding from the discarded backend/artifact survives.
                 (
                     result["nodes"],
@@ -263,6 +327,18 @@ async def trace_divergence(services, raw, *, route_factory=DynamicRoute):
                         observations,
                     )
                     break
+                except NativeFallback as fallback:
+                    observations.clear()
+                    budget.restart("npi_source_context_fallback")
+                    label = fallback.side
+                    bounds[label] = await designs.ensure_native_source(label, fallback.attempts)
+                    ids = {s: _design_id(bound) for s, bound in bounds.items()}
+                    for selected in sides:
+                        result["contexts"][selected].update(
+                            compile_context=bounds[selected].context, design_identity_sha256=ids[selected])
+                    mapping = Mapping(request["signal_pairs"], request["scope_pairs"],
+                        sides["a"]["signal_path"], sides["b"]["signal_path"], ids["a"] == ids["b"])
+                    routes = {s: route_factory(services, s, side, bounds[s], budget) for s, side in sides.items()}
                 except TraceRestart as restart:
                     observations.clear()
                     (
@@ -281,6 +357,8 @@ async def trace_divergence(services, raw, *, route_factory=DynamicRoute):
                     result["status"] = "partial"
     except OperationCancelled as exc:
         raise asyncio.CancelledError from exc
+    except _ContextsUnavailable:
+        pass
     except BudgetExceeded as exc:
         result["status"] = (
             "partial" if comparison and comparison.get("diverged") else "inconclusive"
@@ -294,22 +372,12 @@ async def trace_divergence(services, raw, *, route_factory=DynamicRoute):
     finally:
         observations.clear()
 
-    # Revalidation runs after the bounded work, even after a timeout. It performs
-    # only exact local stat checks and never prepares/retries another backend.
-    changed = []
-    for label, side in sides.items():
-        if wave_ids[label] is None or wave_ids[label] != file_identity(
-            side["wave_path"]
-        ):
-            changed.append((label, "waveform_changed"))
-        if bounds.get(
-            label
-        ) is not None and not await services._run_in_cancellable_thread(
-            bounds[label].current
-        ):
-            changed.append((label, "compile_context_changed"))
-        if label in routes and not routes[label].current():
-            changed.append((label, "compile_context_changed"))
+    # Raw source/map checks for independent designs run in a worker, once per
+    # unique handle. Their post-budget cost remains part of this request.
+    changed = await designs.validate_final(bounds, routes, wave_ids)
+    if changed and (designs.entries or designs.native_bounds):
+        # Mixed calls also discard all old-side facts when either side changes.
+        raise ContextUnavailable(changed[0][1])
     if changed:
         result.update(status="inconclusive", nodes=[], edges=[], findings=[], frontier=[], next_actions=[])
         result['coverage'].update(checks=[], gaps=[])
@@ -361,6 +429,10 @@ async def trace_divergence(services, raw, *, route_factory=DynamicRoute):
             whole_trace_restart_reasons=budget.restart_reasons,
         )
         result["contexts"][label]["backend_status"] = route.receipt
+    # The event loop is the sole cursor writer. In particular, a reset during
+    # another side's final worker cannot overwrite an existing named cursor.
+    await anyio.lowlevel.checkpoint()
+    designs.require_owner()
     if comparison and comparison.get("diverged"):
         from .verify_condition import _attach_cursor
 
@@ -728,5 +800,6 @@ async def _walk(
                 )
             )
         node["status"] = (
-            "expanded" if expanded else "candidate" if all_equal else "frontier"
+            "expanded" if expanded else "candidate"
+            if all_equal and all(o["complete"] for o in observations.values()) else "frontier"
         )

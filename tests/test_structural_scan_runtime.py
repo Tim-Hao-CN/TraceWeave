@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 import os
 import threading
 
@@ -52,6 +53,87 @@ def test_include_content_and_earlier_shadow_candidate_invalidate(tmp_path):
     assert not second.current()
 
 
+@pytest.mark.parametrize('present', [False, True])
+def test_repeated_include_lookup_is_fresh_on_every_validation(tmp_path, monkeypatch, present):
+    from src import design_identity
+    early, late = tmp_path / 'early', tmp_path / 'late'
+    early.mkdir(); late.mkdir()
+    if present:
+        (late / 'defs.svh').write_text('`define WIDTH 8\n')
+    log, _, result = context(tmp_path, '`include "defs.svh"\n' * 8 + 'module top; endmodule\n')
+    result['compile_command'] += f' +incdir+{early}+{late}'
+    identity = DesignIdentityReader().capture(str(log), result)
+    assert identity.complete and len(identity.includes) == 8
+    original, calls = design_identity._resolve, []
+    def resolve(*args):
+        calls.append(args)
+        return original(*args)
+    monkeypatch.setattr(design_identity, '_resolve', resolve)
+    assert identity.current() and len(calls) == 1
+    assert identity.current() and len(calls) == 2
+    # The memo must retain neither a successful lookup nor an absent result
+    # across validation passes, even when source bytes did not change.
+    (early / 'defs.svh').write_text('`define WIDTH 16\n')
+    assert not identity.current() and len(calls) == 3
+
+
+def test_include_lookup_keeps_ordered_search_paths_distinct(tmp_path):
+    from src import design_identity
+    a, b = tmp_path / 'a', tmp_path / 'b'
+    a.mkdir(); b.mkdir()
+    (a / 'defs.svh').write_text('a')
+    (b / 'defs.svh').write_text('b')
+    log, _, result = context(tmp_path)
+    identity = DesignIdentityReader().capture(str(log), result)
+    ab, ba = (str(a), str(b)), (str(b), str(a))
+    includes = tuple(('defs.svh', dirs, design_identity._resolve('defs.svh', dirs))
+                     for dirs in [ab, ba, ab, ba])
+    assert replace(identity, includes=includes).current()
+
+
+@pytest.mark.parametrize('capacity', [0, 1])
+def test_include_lookup_capacity_bypass_still_checks_every_choice(tmp_path, monkeypatch, capacity):
+    from src import design_identity
+    log, _, result = context(tmp_path)
+    (tmp_path / 'known.svh').write_text('known')
+    identity = DesignIdentityReader().capture(str(log), result)
+    dirs = (str(tmp_path),)
+    includes = (('known.svh', dirs, str(tmp_path / 'known.svh')),
+                ('absent.svh', dirs, None)) * 3
+    identity = replace(identity, includes=includes)
+    original, calls = design_identity._resolve, []
+    def resolve(name, directories):
+        calls.append(name)
+        return original(name, directories)
+    monkeypatch.setattr(design_identity, '_resolve', resolve)
+    monkeypatch.setattr(design_identity, '_INCLUDE_LOOKUP_MEMO_LIMIT', capacity)
+    assert identity.current()
+    assert calls.count('absent.svh') == 3  # never memoized at these capacities
+    (tmp_path / 'absent.svh').write_text('new candidate')
+    assert not identity.current()
+
+
+def test_include_memo_hits_observe_cancellation_and_never_publish_a_memo(tmp_path, monkeypatch):
+    from src import cancellation, design_identity
+    log, _, result = context(tmp_path, '`include "absent.svh"\n' * 8 + 'module top; endmodule\n')
+    identity = DesignIdentityReader().capture(str(log), result)
+    original = design_identity._resolve
+    event = threading.Event()
+    def resolve(*args):
+        actual = original(*args)
+        event.set()
+        return actual
+    token = cancellation.push_cancel_event(event)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(design_identity, '_resolve', resolve)
+            with pytest.raises(cancellation.OperationCancelled):
+                identity.current()
+    finally:
+        cancellation.pop_cancel_event(token)
+    assert identity.current()
+
+
 @pytest.mark.parametrize("text", ['`include `DYNAMIC\n', '`include "absent.svh"\n'])
 def test_include_gaps_do_not_prove_semantic_identity(tmp_path, text):
     log, _, result = context(tmp_path, text)
@@ -75,6 +157,44 @@ def test_coarsened_stat_identity_cannot_hide_content_change(tmp_path, monkeypatc
     source.write_text("module top; wire b; endmodule\n")
     assert not first.current()
     assert reader.capture(str(log), result).digest != first.digest
+
+
+def test_exact_identity_reuse_still_checks_bytes_and_include_shadowing(tmp_path, monkeypatch):
+    early, late = tmp_path / 'early', tmp_path / 'late'
+    early.mkdir(); late.mkdir()
+    (late / 'defs.svh').write_text('`define WIDTH 8\n')
+    log, source, result = context(tmp_path, '`include "defs.svh"\nmodule top; endmodule\n')
+    result['compile_command'] += f' +incdir+{early}+{late}'
+    reader = DesignIdentityReader()
+    first = reader.capture(str(log), result)
+    # A hit bypasses graph reconstruction; option replay and content hashing
+    # remain mandatory to detect directory aliases and external path bindings.
+    original = reader._read
+    monkeypatch.setattr(reader, '_read', lambda *a: pytest.fail('rebuilt unchanged graph'))
+    assert reader.capture(str(log), result) is first
+    monkeypatch.setattr(reader, '_read', original)
+    (early / 'defs.svh').write_text('`define WIDTH 16\n')
+    second = reader.capture(str(log), result)
+    assert second.digest != first.digest and second is not first
+    from src.compile_session_snapshot import FileContentSnapshot
+    monkeypatch.setattr(FileContentSnapshot, 'current', lambda _: True)
+    source.write_text('`include "defs.svh"\nmodule top; wire a; endmodule\n')
+    assert reader.capture(str(log), result).digest != second.digest
+
+
+def test_identity_memo_is_bounded_and_never_retains_incomplete_capture(tmp_path):
+    log, source, result = context(tmp_path)
+    reader = DesignIdentityReader(max_entries=2)
+    for i in range(8):
+        reader.capture(str(log), {**result, 'compile_command': result['compile_command'] + f' +define+V={i}'})
+    assert len(reader._identities) == 2
+    assert reader._identity_bytes == sum(n for _, n in reader._identities.values())
+    assert reader._identity_bytes <= reader._identity_max_bytes
+    bypass = DesignIdentityReader(max_bytes=1)
+    assert bypass.capture(str(log), result).complete and not bypass._identities
+    source.unlink()
+    incomplete = DesignIdentityReader()
+    assert not incomplete.capture(str(log), result).complete and not incomplete._identities
 
 
 @pytest.mark.anyio
@@ -226,3 +346,29 @@ async def test_identity_lease_survives_hierarchy_completion_on_scan_miss(tmp_pat
         if not task.done():
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize('change', ['environment', 'directory_alias'])
+def test_identity_reuse_refreshes_external_include_search_paths(tmp_path, monkeypatch, change):
+    a, b = tmp_path / 'a', tmp_path / 'b'
+    a.mkdir(); b.mkdir()
+    (a / 'defs.svh').write_text('`define WIDTH 8\n')
+    (b / 'defs.svh').write_text('`define WIDTH 16\n')
+    log, source, result = context(tmp_path, '`include "defs.svh"\nmodule top; endmodule\n')
+    alias = tmp_path / 'include'
+    if change == 'environment':
+        monkeypatch.setenv('TW_IDENTITY_INCLUDE', str(a))
+        result['compile_command'] += ' +incdir+$TW_IDENTITY_INCLUDE'
+    else:
+        alias.symlink_to(a, target_is_directory=True)
+        result['compile_command'] += f' +incdir+{alias}'
+    reader = DesignIdentityReader()
+    first = reader.capture(str(log), result)
+    assert first.complete and reader.capture(str(log), result) is first
+    if change == 'environment':
+        monkeypatch.setenv('TW_IDENTITY_INCLUDE', str(b))
+    else:
+        alias.unlink();alias.symlink_to(b, target_is_directory=True)
+    second = reader.capture(str(log), result)
+    assert second.complete and second.digest != first.digest
+    assert any(r.path == str(b / 'defs.svh') for _, r in second.records)

@@ -37,8 +37,8 @@ RAW_EVENTS = [(0, "0"), (1, "1"), (2, "x"), (9, "z"),
 def reclaim_libraries(tmp_path_factory):
     verdi = os.environ.get("VERDI_HOME")
     compiler = shutil.which("g++")
-    if not os.environ.get("TW_POINT_READ_FSDB") or not verdi or not compiler:
-        pytest.skip("requires TW_POINT_READ_FSDB, VERDI_HOME and g++")
+    if not verdi or not compiler:
+        pytest.skip("requires VERDI_HOME and g++")
     sdk = Path(verdi) / "share/FsdbReader"
     directory = tmp_path_factory.mktemp("cursor_reclaim")
     libraries = {}
@@ -46,7 +46,7 @@ def reclaim_libraries(tmp_path_factory):
     def build(mode):
         if mode in libraries:
             return libraries[mode]
-        source = (NATIVE / "fsdb_wrapper.cpp").read_text()
+        source = (NATIVE / "fsdb_wrapper.cpp").read_text(encoding="utf-8")
         # Observe immediately before every explicit per-ID unload, including
         # reclamation. Page-boundary sampling alone could miss a resident peak.
         marker = "static bool _CloseEventCursors(FsdbCtx *ctx) {"
@@ -99,6 +99,37 @@ extern "C" int test_signal_state(void *p, const char *path, unsigned long long *
     out[1] = ctx->obj->ffrGetVCCount(id);
     return 0;
 }
+// Inject only the optional metadata policy. FFR event data, traversal and
+// Restore remain real, including the fixture's same-tick/sub-ps events.
+struct TestSessionReader {
+    ffrSessionInfo rows[3] = {};
+    int mode;
+    explicit TestSessionReader(int m) : mode(m) {
+        rows[0].next = &rows[1];
+        rows[0].close_xtag.hltag.L = 1;
+        rows[1].start_xtag.hltag.L = 1;
+        rows[1].next = &rows[2];
+        rows[1].close_xtag.hltag.L = 10;
+        rows[2].start_xtag.hltag.L = 10;
+        rows[2].close_xtag.hltag.L = 40;
+        if (mode == 2) rows[1].start_xtag.hltag.L = 0;
+        if (mode == 3) { rows[0].next = nullptr; rows[0].close_xtag.hltag.L = 40; }
+    }
+    fsdbFileType ffrGetFileType() { return FSDB_FT_VERILOG; }
+    fsdbRC ffrGetMinFsdbTag64(fsdbTag64 *tag) { *tag = {}; return FSDB_RC_SUCCESS; }
+    fsdbRC ffrGetMaxFsdbTag64(fsdbTag64 *tag) { *tag = {}; tag->L = 40; return FSDB_RC_SUCCESS; }
+    ffrSessionInfo *ffrGetSessionListInfo() {
+        if (mode == 4) throw 1;
+        return mode == 1 ? nullptr : rows;
+    }
+};
+extern "C" int test_session_plan(void *p, int mode) {
+    FsdbCtx *ctx = (FsdbCtx*)p;
+    ctx->event_session_plan = FsdbSessionReclaimPlan{};
+    TestSessionReader reader(mode);
+    if (mode == 5) ctx->path_to_sig["top.alias"] = ctx->path_to_sig.at("top.data");
+    return ctx->event_session_plan.Load(&reader) ? 1 : 0;
+}
 '''
         flags = []
         if mode.startswith("records"):
@@ -109,7 +140,7 @@ extern "C" int test_signal_state(void *p, const char *path, unsigned long long *
         else:
             assert mode == "default"
         cpp, library = directory / (mode + ".cpp"), directory / (mode + ".so")
-        cpp.write_text(source)
+        cpp.write_text(source, encoding="utf-8")
         subprocess.run([compiler, "-shared", "-fPIC", "-std=c++11", *flags,
                         "-I" + str(NATIVE), "-I" + str(sdk), str(cpp), "-o", str(library),
                         "-L" + str(sdk / "linux64"), "-lnffr", "-lnsys", "-lz",

@@ -210,6 +210,10 @@ class TestDispatchGetSimPaths:
             assert result["wave_files"][0]["format"] == "fsdb"
             assert result["available_cases"] == []
             assert "fsdb_runtime" in result
+            assert result.suggested_calls == [{
+                "tool": "parse_sim_log",
+                "arguments": {"log_path": str(sim_log.resolve()), "simulator": "xcelium"},
+            }]
 
 
 @pytest.mark.anyio
@@ -366,7 +370,13 @@ class TestVertexFunctionSchemaCompatibility:
                         f"{tool_name}:{path} has items with type {schema_type!r}"
                     )
                 for key, value in node.items():
-                    walk(tool_name, f"{path}.{key}", value)
+                    if key in {"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"} and isinstance(value, dict):
+                        # A property called "items" is a name in a map, not
+                        # the array-schema keyword. Walk the actual schemas.
+                        for child_name, child in value.items():
+                            walk(tool_name, f"{path}.{key}.{child_name}", child)
+                    else:
+                        walk(tool_name, f"{path}.{key}", value)
             elif isinstance(node, list):
                 for index, value in enumerate(node):
                     walk(tool_name, f"{path}[{index}]", value)
@@ -425,7 +435,9 @@ class TestStructuralScannerToolContract:
         assert "coverage_status" in scan_tool.description
         assert "zero_coverage" in scan_tool.description
 
-    async def test_dispatch_uses_auto_simulator_default(self):
+    @pytest.mark.parametrize("workflow_enabled", [True, False])
+    async def test_dispatch_uses_auto_simulator_default(self, monkeypatch, workflow_enabled):
+        monkeypatch.setattr(server, "STRUCTURAL_SCAN_IN_WORKFLOW", workflow_enabled)
         compile_result = {"simulator": "vcs", "files": {"user": []}}
         with (
             patch.object(
@@ -466,7 +478,11 @@ class TestStructuralScannerToolContract:
         assert result["scan_scope"] == "scope1"
         assert result["files_scanned"] == 1
 
-    async def test_build_tb_hierarchy_returns_required_next_call_when_scan_missing(self):
+    @pytest.mark.parametrize("workflow_enabled", [True, False])
+    async def test_build_tb_hierarchy_returns_required_next_call_when_scan_missing(
+        self, monkeypatch, workflow_enabled
+    ):
+        monkeypatch.setattr(server, "STRUCTURAL_SCAN_IN_WORKFLOW", workflow_enabled)
         with patch.object(server, "parse_compile_log", return_value={"files": []}), patch.object(
             server,
             "build_hierarchy",
@@ -484,6 +500,10 @@ class TestStructuralScannerToolContract:
                 {"compile_log": "/tmp/elab.log", "simulator": "vcs"},
             )
 
+        if not workflow_enabled:
+            assert result["required_next_call"] is None
+            assert result["suggested_next"] is None
+            return
         assert result["required_next_call"] == {
             "tool": "scan_structural_risks",
             "arguments": {"compile_log": "/tmp/elab.log", "simulator": "vcs"},
@@ -643,7 +663,7 @@ class TestSweepRetryRouting:
             ]
         )
 
-        assert server._build_sweep_required_next_call("/tmp/wave.vcd", result) is None
+        assert server._build_sweep_suggested_call("/tmp/wave.vcd", result) is None
 
     def test_scoped_zero_coverage_retries_without_scope(self):
         retry = {
@@ -653,7 +673,7 @@ class TestSweepRetryRouting:
         }
         result = self._result(scope="top_tb.u_dut", suggested_next_actions=[retry])
 
-        assert server._build_sweep_required_next_call("/tmp/wave.vcd", result) == retry
+        assert server._build_sweep_suggested_call("/tmp/wave.vcd", result) == retry
 
     def test_truncated_coverage_synthesizes_a_larger_cap(self):
         result = self._result(
@@ -663,7 +683,7 @@ class TestSweepRetryRouting:
             truncated=True,
         )
 
-        retry = server._build_sweep_required_next_call("/tmp/wave.vcd", result)
+        retry = server._build_sweep_suggested_call("/tmp/wave.vcd", result)
 
         assert retry is not None
         assert retry["arguments"]["max_interfaces"] == 7
@@ -675,7 +695,7 @@ class TestSweepRetryRouting:
             coverage_warnings=["COVERAGE DEGRADED: clock was not dumped"],
         )
 
-        assert server._build_sweep_required_next_call("/tmp/wave.vcd", result) is None
+        assert server._build_sweep_suggested_call("/tmp/wave.vcd", result) is None
 
     def test_degraded_coverage_accepts_a_narrower_window_action(self):
         retry = {
@@ -695,7 +715,7 @@ class TestSweepRetryRouting:
             suggested_next_actions=[retry],
         )
 
-        assert server._build_sweep_required_next_call("/tmp/wave.vcd", result) == retry
+        assert server._build_sweep_suggested_call("/tmp/wave.vcd", result) == retry
 
     def test_degraded_open_ended_window_accepts_a_later_start(self):
         retry = {
@@ -714,7 +734,7 @@ class TestSweepRetryRouting:
             suggested_next_actions=[retry],
         )
 
-        assert server._build_sweep_required_next_call("/tmp/wave.vcd", result) == retry
+        assert server._build_sweep_suggested_call("/tmp/wave.vcd", result) == retry
 
 
 @pytest.mark.anyio
@@ -977,6 +997,22 @@ _SCOREBOARD_MISMATCH_LINE = (
 
 @pytest.mark.anyio
 class TestParseSimLogSweepNextStep:
+    async def test_new_log_does_not_suggest_waveform_from_prior_discovery(self, tmp_path):
+        _prefill_get_sim_paths_state()
+        log = tmp_path / "new-run.log"
+        log.write_text(_SCOREBOARD_MISMATCH_LINE)
+        server._result_cache["get_sim_paths"] = types.SimpleNamespace(
+            wave_files=[types.SimpleNamespace(path=str(tmp_path / "old-run.vcd"))],
+            sim_logs=[types.SimpleNamespace(path=str(tmp_path / "old-run.log"))],
+        )
+
+        result = await server._dispatch(
+            "parse_sim_log", {"log_path": str(log), "simulator": "vcs"},
+        )
+
+        assert result.protocol_symptom_hint is not None
+        assert result.protocol_symptom_next_step is None
+
     async def test_protocol_symptom_emits_ready_to_run_sweep_call(self, tmp_path):
         _prefill_get_sim_paths_state()
         wave = tmp_path / "wave.fsdb"
@@ -984,7 +1020,8 @@ class TestParseSimLogSweepNextStep:
         log = tmp_path / "run.log"
         log.write_text(_SCOREBOARD_MISMATCH_LINE)
         server._result_cache["get_sim_paths"] = types.SimpleNamespace(
-            wave_files=[types.SimpleNamespace(path=str(wave))]
+            wave_files=[types.SimpleNamespace(path=str(wave))],
+            sim_logs=[types.SimpleNamespace(path=str(log))]
         )
         try:
             res = await server._dispatch(
@@ -1019,7 +1056,8 @@ class TestParseSimLogSweepNextStep:
         log = tmp_path / "run.log"
         log.write_text(_SCOREBOARD_MISMATCH_LINE)
         server._result_cache["get_sim_paths"] = types.SimpleNamespace(
-            wave_files=[types.SimpleNamespace(path=str(wave))]
+            wave_files=[types.SimpleNamespace(path=str(wave))],
+            sim_logs=[types.SimpleNamespace(path=str(log))]
         )
         _prefill_sweep_handshakes_cache(
             str(wave),
@@ -1044,7 +1082,8 @@ class TestParseSimLogSweepNextStep:
         log = tmp_path / "run.log"
         log.write_text(_SCOREBOARD_MISMATCH_LINE)
         server._result_cache["get_sim_paths"] = types.SimpleNamespace(
-            wave_files=[types.SimpleNamespace(path=str(wave))]
+            wave_files=[types.SimpleNamespace(path=str(wave))],
+            sim_logs=[types.SimpleNamespace(path=str(log))]
         )
         retry = {
             "tool": "sweep_handshakes",
@@ -1065,7 +1104,7 @@ class TestParseSimLogSweepNextStep:
             )
 
             assert res.protocol_symptom_next_step is not None
-            assert res.protocol_symptom_next_step.model_dump() == retry
+            assert res.protocol_symptom_next_step.model_dump(exclude_none=True) == retry
         finally:
             server._result_cache.pop("get_sim_paths", None)
 
@@ -1076,7 +1115,8 @@ class TestParseSimLogSweepNextStep:
         log = tmp_path / "run.log"
         log.write_text("module_a ERROR something went wrong @ 1 ns\n")
         server._result_cache["get_sim_paths"] = types.SimpleNamespace(
-            wave_files=[types.SimpleNamespace(path=str(wave))]
+            wave_files=[types.SimpleNamespace(path=str(wave))],
+            sim_logs=[types.SimpleNamespace(path=str(log))]
         )
         try:
             res = await server._dispatch(
@@ -1780,7 +1820,7 @@ $enddefinitions $end
 1!
 """
         )
-        result = await server._dispatch(
+        result = await server._dispatch_inner(
             "recommend_failure_debug_next_steps",
             {
                 "log_path": str(log_path),
@@ -1875,7 +1915,7 @@ $enddefinitions $end
         }
         _prefill_sweep_handshakes_cache(str(wave_path))
 
-        result = await server._dispatch(
+        result = await server._dispatch_inner(
             "recommend_failure_debug_next_steps",
             {
                 "log_path": str(log_path),
@@ -1963,7 +2003,7 @@ $enddefinitions $end
         }
         _prefill_sweep_handshakes_cache(str(wave_path))
 
-        result = await server._dispatch(
+        result = await server._dispatch_inner(
             "recommend_failure_debug_next_steps",
             {
                 "log_path": str(log_path),
@@ -2028,7 +2068,7 @@ $enddefinitions $end
             ],
         )
 
-        result = await server._dispatch(
+        result = await server._dispatch_inner(
             "recommend_failure_debug_next_steps",
             {
                 "log_path": str(log_path),
@@ -2049,7 +2089,7 @@ $enddefinitions $end
         # sweep cache present ⇒ workflow not flagged incomplete for a missing sweep
         assert result["degraded_reason"] is None
 
-    async def test_recommend_requires_sweep_on_protocol_symptom_when_missing(self, tmp_path):
+    async def test_recommend_suggests_optional_sweep_on_protocol_symptom(self, tmp_path):
         _prefill_get_sim_paths_state()
         _prefill_build_tb_hierarchy_state()
         log_path = tmp_path / "run.log"
@@ -2093,8 +2133,7 @@ $enddefinitions $end
             "log_path": str(log_path),
             "simulator": "vcs",
         }
-        # scan cache present, sweep cache absent ⇒ on a protocol/mismatch symptom
-        # the sweep takes priority over the (already-satisfied) structural scan.
+        # Missing sweep evidence remains unchecked and advisory.
         server._result_cache["scan_structural_risks"] = server.schemas.ScanStructuralRisksResult.model_validate(
             {"scan_scope": "scope1", "files_scanned": 1, "total_risks": 0, "risks": [],
              "categories_scanned": ["magic_condition"], "skipped_files": []}
@@ -2104,7 +2143,7 @@ $enddefinitions $end
             "simulator": "vcs",
         }
 
-        result = await server._dispatch(
+        result = await server._dispatch_inner(
             "recommend_failure_debug_next_steps",
             {
                 "log_path": str(log_path),
@@ -2114,10 +2153,12 @@ $enddefinitions $end
             },
         )
 
-        assert result["workflow_incomplete"] is True
-        assert result["degraded_reason"] == "missing_handshake_sweep"
-        assert result["required_next_call"]["tool"] == "sweep_handshakes"
-        assert result["required_next_call"]["arguments"]["wave_path"] == str(wave_path)
+        assert result["workflow_incomplete"] is False
+        assert result["degraded_reason"] is None
+        assert result["required_next_call"] is None
+        assert result["runtime_protocol_coverage"]["coverage_status"] == "not_run"
+        assert result["suggested_next_actions"][0]["tool"] == "sweep_handshakes"
+        assert result["suggested_next_actions"][0]["arguments"]["wave_path"] == str(wave_path)
 
     @pytest.mark.parametrize(
         ("coverage_status", "warning", "expected_missing_input"),
@@ -2186,7 +2227,7 @@ $enddefinitions $end
             suggested_next_actions=[],
         )
 
-        result = await server._dispatch(
+        result = await server._dispatch_inner(
             "recommend_failure_debug_next_steps",
             {
                 "log_path": str(log_path),
@@ -2196,10 +2237,11 @@ $enddefinitions $end
             },
         )
 
-        assert result["workflow_incomplete"] is True
-        assert result["degraded_reason"] == "incomplete_handshake_sweep"
+        assert result["workflow_incomplete"] is False
+        assert result["degraded_reason"] is None
         assert result["required_next_call"] is None
-        assert expected_missing_input in " ".join(result["missing_inputs"])
+        assert result["suggested_next_actions"] == []
+        assert expected_missing_input in " ".join(result["why"])
         assert result["runtime_protocol_coverage"]["coverage_status"] == coverage_status
         assert result["runtime_protocol_coverage"]["coverage_warnings"] == [warning]
 
@@ -2276,7 +2318,7 @@ $enddefinitions $end
             "simulator": "vcs",
         }
 
-        result = await server._dispatch(
+        result = await server._dispatch_inner(
             "recommend_failure_debug_next_steps",
             {
                 "log_path": str(log_path),
@@ -2321,7 +2363,7 @@ $enddefinitions $end
 1!
 """
         )
-        result = await server._dispatch(
+        result = await server._dispatch_inner(
             "recommend_failure_debug_next_steps",
             {
                 "log_path": str(log_path),
@@ -2363,7 +2405,7 @@ $enddefinitions $end
             "simulator": "vcs",
         }
 
-        result = await server._dispatch(
+        result = await server._dispatch_inner(
             "recommend_failure_debug_next_steps",
             {
                 "log_path": str(log_path),
@@ -2401,7 +2443,7 @@ $enddefinitions $end
 """
         )
 
-        result = await server._dispatch(
+        result = await server._dispatch_inner(
             "recommend_failure_debug_next_steps",
             {
                 "log_path": str(log_path),
@@ -2415,7 +2457,11 @@ $enddefinitions $end
         assert result["degraded_reason"] == "missing_structural_scan"
         assert result["required_next_call"] is None
 
-    async def test_analyze_failures_inserts_step0_when_scan_missing(self):
+    @pytest.mark.parametrize("workflow_enabled", [True, False])
+    async def test_analyze_failures_inserts_step0_when_scan_missing(
+        self, monkeypatch, workflow_enabled
+    ):
+        monkeypatch.setattr(server, "STRUCTURAL_SCAN_IN_WORKFLOW", workflow_enabled)
         _prefill_get_sim_paths_state()
         _prefill_build_tb_hierarchy_state()
 
@@ -2438,7 +2484,7 @@ $enddefinitions $end
         with patch.object(server, "WaveformAnalyzer", _FakeAnalyzer), patch.object(
             server, "_get_parser", return_value=object()
         ):
-            result = await server._dispatch(
+            result = await server._dispatch_inner(
                 "analyze_failures",
                 {
                     "log_path": "/tmp/run.log",
@@ -2449,9 +2495,13 @@ $enddefinitions $end
             )
 
         assert list(result["analysis_guide"].keys())[:2] == ["step0", "step1"]
-        assert result["analysis_guide"]["step0"] == (
-            "scan_structural_risks has not been run, so this analysis does not include structural risk correlation."
-        )
+        if workflow_enabled:
+            assert result["analysis_guide"]["step0"] == (
+                "scan_structural_risks has not been run, so this analysis does not include structural risk correlation."
+            )
+        else:
+            assert "TRACEWEAVE_STRUCTURAL_SCAN_IN_WORKFLOW=0" in result["analysis_guide"]["step0"]
+            assert "unchecked" in result["analysis_guide"]["step0"]
 
     async def test_analyze_failures_skips_step0_when_scan_is_compatible(self):
         _prefill_get_sim_paths_state()
@@ -2490,7 +2540,7 @@ $enddefinitions $end
         with patch.object(server, "WaveformAnalyzer", _FakeAnalyzer), patch.object(
             server, "_get_parser", return_value=object()
         ):
-            result = await server._dispatch(
+            result = await server._dispatch_inner(
                 "analyze_failures",
                 {
                     "log_path": "/tmp/run.log",
@@ -2539,7 +2589,7 @@ $enddefinitions $end
         with patch.object(server, "WaveformAnalyzer", _FakeAnalyzer), patch.object(
             server, "_get_parser", return_value=object()
         ):
-            result = await server._dispatch(
+            result = await server._dispatch_inner(
                 "analyze_failures",
                 {
                     "log_path": "/tmp/run.log",
@@ -2579,7 +2629,7 @@ Top Level Modules:
         )
         wave_path.write_text("$date\n$end\n")
 
-        result = await server._dispatch(
+        result = await server._dispatch_inner(
             "explain_signal_driver",
             {
                 "signal_path": "top_tb.u0.K_sub",
@@ -2625,7 +2675,7 @@ Top Level Modules:
         )
         wave_path.write_text("$date\n$end\n")
 
-        result = await server._dispatch(
+        result = await server._dispatch_inner(
             "explain_signal_driver",
             {
                 "signal_path": "top_tb.u0.S",
@@ -2681,7 +2731,7 @@ x"
 """
         )
 
-        result = await server._dispatch(
+        result = await server._dispatch_inner(
             "trace_x_source",
             {
                 "signal_path": "top_tb.u0.out_sig",
@@ -2737,7 +2787,7 @@ $enddefinitions $end
 """
         )
 
-        result = await server._dispatch(
+        result = await server._dispatch_inner(
             "trace_x_source",
             {
                 "signal_path": "top_tb.u0.only_sig",
@@ -2823,7 +2873,7 @@ x!
             lambda status: backend,
         )
 
-        result = await server._dispatch(
+        result = await server._dispatch_inner(
             "trace_x_source",
             {
                 "signal_path": "top_tb.u0.out_sig",
@@ -2958,7 +3008,7 @@ x"
             lambda: static_backend,
         )
 
-        result = await server._dispatch(
+        result = await server._dispatch_inner(
             "trace_x_source",
             {
                 "signal_path": "top_tb.u0.out_sig",
@@ -3268,21 +3318,34 @@ class TestPrerequisiteGating:
         assert "schema_version" in result
         assert result.get("ok") is not False
 
-    async def test_analyze_failures_blocked_without_build_tb_hierarchy(self, tmp_path):
+    async def test_analyze_failures_reads_log_and_wave_without_hierarchy(self, tmp_path):
         _prefill_get_sim_paths_state()
+        log_path, wave_path = tmp_path / "run.log", tmp_path / "wave.vcd"
+        log_path.write_text("module_a ERROR issue @ 1 ns\n")
+        wave_path.write_text("""$timescale 1ps $end
+$scope module top $end
+$var wire 1 ! sig $end
+$upscope $end
+$enddefinitions $end
+#0
+0!
+#1000
+1!
+""")
         result = await server._dispatch(
             "analyze_failures",
             {
-                "log_path": "/tmp/run.log",
-                "wave_path": "/tmp/wave.vcd",
+                "log_path": str(log_path),
+                "wave_path": str(wave_path),
                 "signal_paths": ["top.sig"],
                 "simulator": "vcs",
             },
         )
-        assert result["ok"] is False
-        assert result["error_code"] == "missing_prerequisite"
-        assert result["missing_step"] == "build_tb_hierarchy"
-        assert result["required_before"] == "analyze_failures"
+        assert result.summary["runtime_total_errors"] == 1
+        assert result.focused_group["first_time_ps"] == 1000
+        assert "top.sig" in result.wave_context["signals"]
+        assert server._session_state["build_tb_hierarchy"] is None
+        assert server._result_cache["build_tb_hierarchy"] is None
 
     async def test_search_signals_no_gate(self, tmp_path):
         wave_path = tmp_path / "wave.vcd"
@@ -3446,19 +3509,14 @@ $enddefinitions $end
         assert server._result_provenance["build_tb_hierarchy"] is None
         assert server._handle_store.resolve(handle) is None
 
-    async def test_suggested_call_includes_compile_log(self):
+    async def test_legacy_handle_prerequisite_includes_compile_log(self):
         _prefill_get_sim_paths_state(
             compile_log="/my/elab.log",
             simulator="xcelium",
         )
         result = await server._dispatch(
-            "analyze_failures",
-            {
-                "log_path": "/tmp/run.log",
-                "wave_path": "/tmp/wave.vcd",
-                "signal_paths": ["top.sig"],
-                "simulator": "vcs",
-            },
+            "find_tb_instance",
+            {"handle": "tbh_missing", "path": "top"},
         )
         assert result["ok"] is False
         suggested = result["suggested_call"]

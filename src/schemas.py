@@ -5,6 +5,8 @@ import config as _config
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, WithJsonSchema, model_serializer, model_validator
 
+from .property_model import ExplainPropertyOptions, ExplainPropertyResult, PropertyExplanation
+
 
 class SchemaModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -34,6 +36,38 @@ class SchemaModel(BaseModel):
         return iter(self._as_dict())
 
 
+class NativeRouteMetrics(SchemaModel):
+    metadata_ms: float = Field(ge=0)
+    kdb_discovery_ms: float = Field(ge=0)
+    kdb_validation_ms: float = Field(ge=0)
+    npi_ms: float = Field(ge=0)
+    source_prepare_ms: float = Field(ge=0)
+    source_validation_ms: float = Field(ge=0)
+    total_ms: float = Field(ge=0)
+    source_prepare_count: int = Field(ge=0)
+    source_capture_read_bytes: int = Field(ge=0)
+    cached_kdb_source_read_bytes: int = Field(ge=0)
+
+
+class NativeRouteReceipt(SchemaModel):
+    entry: Literal["native_first"] = "native_first"
+    input_validation: Literal["compile_metadata_and_kdb", "kdb_only", "compile_metadata_only"]
+    compile_metadata_identity_sha256: str | None
+    kdb_identity_sha256: str | None
+    source_context_status: Literal["not_required", "prepared", "reused", "unavailable", "changed", "expired"]
+    source_design_handle: str | None
+    source_context_identity_sha256: str | None
+    source_association: Literal["unverified"] = "unverified"
+    metrics: NativeRouteMetrics
+
+    @model_serializer(mode="plain")
+    def serialize_native_receipt(self):
+        # Null identities explicitly distinguish no source observation from
+        # omitted legacy receipts, including nested exclude_none serializers.
+        return {name: (self.metrics.model_dump() if name == "metrics" else getattr(self, name))
+                for name in type(self).model_fields}
+
+
 TOKEN_BUDGET_SOFT_LIMIT = 80_000
 
 
@@ -41,10 +75,9 @@ class EvidenceOutputOptions(SchemaModel):
     output_format: Literal["full", "compact"] = Field(
         default="full",
         description=(
-            "full preserves the original result. compact returns a lossless "
-            "traceweave.compact.v1 envelope: result plus response-local selection "
-            "references. Coverage and display limits are unchanged; references "
-            "are JSON pointers, not time cursors or stored result handles."
+            "full: original result. compact: lossless traceweave.compact.v1 "
+            "{result,references}; refs are response-local JSON pointers, not cursors/handles. "
+            "Same coverage/display limits."
         ),
     )
 
@@ -191,6 +224,7 @@ class SimPathsResult(SchemaModel):
     available_cases: list[CaseInfo] = Field(default_factory=list)
     hints: list[str] = Field(default_factory=list)
     next_required_step: NextRequiredStep | None = None
+    suggested_calls: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class FormalProjectEntry(SchemaModel):
@@ -258,6 +292,75 @@ class FormalPathsResult(SchemaModel):
     available_runs: list[FormalRunEntry] = Field(default_factory=list)
     coverage: FormalDiscoveryCoverage
     hints: list[str] = Field(default_factory=list)
+
+
+class PrepareDesignContextOptions(SchemaModel):
+    """Independent preparation budgets; no discovery or semantic work."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    compile_log: str = Field(min_length=1, pattern=r"\S")
+    supplementary_compile_logs: list[Annotated[str, Field(min_length=1, pattern=r"\S")]] = Field(
+        default_factory=list, max_length=16,
+        description="Complementary compile logs in compilation order.",
+    )
+    simulator: Literal["auto", "vcs", "xcelium", "verilator"] = "auto"
+    top_hint: Annotated[str, Field(min_length=1, pattern=r"\S")] | None = None
+    backend_preference: Literal["auto", "source"] = "auto"
+    kdb_path: Annotated[str, Field(min_length=1, pattern=r"\S")] | None = Field(
+        default=None, description="Explicit candidate, captured on first query; does not prove source association.",
+    )
+    context_identity_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$",
+        description=("Expected compile/source identity when replaying a recovery_context. "
+                     "A mismatch rejects preparation before a new handle is published."),
+    )
+    timeout_sec: float = Field(default=30.0, gt=0, le=300, allow_inf_nan=False)
+    max_files: int = Field(default=32768, ge=1, le=32768)
+    max_bytes: int = Field(default=128 * 1024 * 1024, ge=1, le=128 * 1024 * 1024)
+    max_references: int = Field(default=65536, ge=1, le=65536)
+    max_include_depth: int = Field(default=64, ge=0, le=64)
+
+
+class DesignContextRecovery(SchemaModel):
+    compile_log: str
+    supplementary_compile_logs: list[str]
+    simulator: Literal["vcs", "xcelium", "verilator"]
+    top_hint: str | None = None
+    backend_preference: Literal["auto", "source"]
+    kdb_path: str | None = None
+    context_identity_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class DesignContextPreparationMetrics(SchemaModel):
+    parse_ms: float = Field(ge=0)
+    prepare_ms: float = Field(ge=0)
+    input_file_count: int = Field(ge=0)
+    captured_bytes: int = Field(ge=0)
+    read_bytes: int = Field(ge=0, description="Raw bytes read during capture and its validation.")
+    dependency_file_visits: int = Field(ge=0)
+    registration_ms: float = Field(ge=0, description="Additional content revalidation and metadata accounting.")
+    total_ms: float = Field(ge=0, description="Preparation, admission wait and registration through receipt construction.")
+    retained_metadata_bytes: int = Field(ge=0, description="Conservative registry capacity charge; no source bodies.")
+
+
+class PrepareDesignContextResult(SchemaModel):
+    design_handle: str
+    handle_lifetime: Literal["process"] = "process"
+    context_identity_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    identity_verification: Literal["current_inputs", "matched_recovery_identity"] = "current_inputs"
+    simulator: Literal["vcs", "xcelium", "verilator"]
+    selected_top: str | None = None
+    backend_preference: Literal["auto", "source"]
+    preparation_status: Literal["prepared", "partial"]
+    source_snapshot_status: Literal["complete", "partial"]
+    include_resolution_status: Literal["complete", "partial"]
+    semantic_status: Literal["not_run"] = "not_run"
+    kdb_status: Literal["not_checked"] = "not_checked"
+    capabilities: list[Literal["compile_metadata", "source_observations"]]
+    gaps: list[str]
+    metrics: DesignContextPreparationMetrics
+    recovery_context: DesignContextRecovery
 
 
 class BuildTbHierarchyResult(SchemaModel):
@@ -430,7 +533,87 @@ class StructuralPropagationReceipt(SchemaModel):
     note: str | None = None
 
 
+class StructuralCategoryCoverage(SchemaModel):
+    category: str
+    status: Literal["not_run", "complete", "partial", "unavailable", "unsupported", "failed"]
+    backend: Literal["none", "verdi_npi", "slang"]
+    result_group: str | None = None
+    scope: str | None = None
+    checked_scope: str | None = None
+    evidence_domain: str
+    total_facts: int = 0
+    gaps: list[str] = Field(default_factory=list)
+
+
+class StructuralGapExample(SchemaModel):
+    instance: str = Field(max_length=256)
+    port: str = Field(max_length=128)
+    expression_kind: str | None = Field(default=None, max_length=64)
+    parent_kind: str | None = Field(default=None, max_length=64)
+    operator: str | None = Field(default=None, max_length=64)
+    actual_width: StrictInt | None = None
+    port_width: StrictInt | None = None
+
+
+class StructuralGapSummary(SchemaModel):
+    reason: str = Field(pattern=r'^[a-z][a-z0-9_]*$', max_length=128)
+    occurrences: StrictInt = Field(ge=1, le=1_000_000_000)
+    affected_ports: StrictInt = Field(ge=0, le=1_000_000_000)
+    examples: list[StructuralGapExample] = Field(default_factory=list, max_length=2)
+    examples_truncated: bool = False
+
+
+class StructuralScanProgress(SchemaModel):
+    inventory: Literal['cumulative_counts_current_page_facts']
+    completed_instances: StrictInt = Field(ge=0)
+    pending_scopes: StrictInt = Field(ge=0, le=8192)
+    cumulative_counts: dict[str, StrictInt]
+    page_facts: StrictInt = Field(ge=0)
+    status: Literal['available', 'blocked', 'complete']
+    next_scopes: list[str] = Field(default_factory=list, max_length=3)
+
+
+class StructuralResultGroup(SchemaModel):
+    group_id: str
+    backend: Literal["verdi_npi", "slang"]
+    artifact_identity: str | None = None
+    selected_top: str | None = None
+    kdb_binding: dict[str, Any] | None = None
+    scope: str | None = None
+    checked_scope: str | None = None
+    evidence_domain: str
+    status: str
+    categories_checked: list[str] = Field(default_factory=list)
+    selected_categories: list[str] = Field(default_factory=list)
+    total_facts: int = 0
+    gaps: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    gap_summary: list[StructuralGapSummary] = Field(default_factory=list, max_length=64)
+    gap_summary_truncated: bool = False
+    scan_progress: StructuralScanProgress | None = None
+
+    @model_serializer(mode='wrap')
+    def omit_empty_gap_summary(self, handler):
+        row = handler(self)
+        if not self.gap_summary:
+            row.pop('gap_summary', None)
+        if not self.gap_summary_truncated:
+            row.pop('gap_summary_truncated', None)
+        if self.scan_progress is None:
+            row.pop('scan_progress', None)
+        return row
+
+
 class SemanticScanResult(SchemaModel):
+    continuation: str | None = None
+    suggested_next_action: dict[str, Any] | None = None
+    omitted_result_groups: list[str] | None = None
+    termination_reason: str | None = None
+    backend: Literal["none", "verdi_npi", "slang", "mixed"] = "none"
+    category_coverage: list[StructuralCategoryCoverage] = Field(default_factory=list)
+    result_groups: list[StructuralResultGroup] = Field(default_factory=list)
+    backend_attempts: list[dict[str, str]] = Field(default_factory=list)
+    native_execution: dict[str, str] = Field(default_factory=dict)
     status: Literal["not_run", "complete", "partial", "unavailable"] = "not_run"
     scope: str | None = None
     categories_checked: list[str] = Field(default_factory=list)
@@ -479,6 +662,13 @@ class StructuralScanSummary(SchemaModel):
     lexical_coverage_status: str
     categories_scanned: list[str]
     semantic_status: str
+    semantic_backend: str = "none"
+    semantic_category_coverage: list[StructuralCategoryCoverage] = Field(default_factory=list)
+    semantic_result_groups: list[StructuralResultGroup] = Field(default_factory=list)
+    semantic_backend_attempts: list[dict[str, str]] = Field(default_factory=list)
+    semantic_native_execution: dict[str, str] = Field(default_factory=dict)
+    semantic_termination_reason: str | None = None
+    semantic_continuation: str | None = None
     semantic_fact_count: int
     semantic_scope: str | None = None
     semantic_categories_checked: list[str]
@@ -517,6 +707,9 @@ class SuggestedToolCall(SchemaModel):
     tool: str
     arguments: dict[str, Any] = Field(default_factory=dict)
     reason: str | None = None
+    reason_code: str | None = None
+    addresses: list[str] | None = None
+    remaining_gaps: list[str] | None = None
 
 
 class ParseSimLogResult(TruncatableResult):
@@ -531,12 +724,9 @@ class ParseSimLogResult(TruncatableResult):
     # diluted past a weak model's attention. Field order = serialized JSON order,
     # so this surfaces the pointer before the big payloads.
     protocol_symptom_hint: str | None = None
-    # The actionable companion to protocol_symptom_hint: the concrete
-    # sweep_handshakes(...) call with wave_path already filled from the cached
-    # get_sim_paths. Set by the server ONLY when the hint fires AND a waveform is
-    # available — the prose hint alone gets skipped by weak models, so the call is
-    # spelled out at the one layer where the symptom and the wave path co-exist
-    # (the suggest->inspect relay lesson applied to parse->sweep). Suggestion only.
+    # Optional sweep or coverage-repair discovery action, bound to a waveform
+    # from the same discovery observation as this log. Missing time/scope
+    # evidence stays explicit; this is never a required workflow step.
     protocol_symptom_next_step: SuggestedToolCall | None = None
     simulator: str
     schema_version: str
@@ -708,7 +898,7 @@ class SignalValue(SchemaModel):
 
 
 class WaveformSelection(SchemaModel):
-    """One exact dump declaration, with ordered declared bits or lsb + width."""
+    """Exact dump declaration: ordered bits or lsb+width."""
     path: str = Field(min_length=1, max_length=16384, description="Exact declaration path returned by search_signals.")
     bits: list[StrictInt] | None = Field(default=None, min_length=1, max_length=4096,
         description="Unique declared indices, MSB first. Supply bits OR lsb+width.")
@@ -751,7 +941,7 @@ ExpressionRange = Annotated[
 
 
 class ExpressionType(SchemaModel):
-    """Caller-supplied integral type; width is the packed element width."""
+    """Explicit integral type; width is packed bits per element."""
     width: StrictInt = Field(ge=1, le=4096, description="Total packed bits per element; {width:8} describes unsigned [7:0].")
     signed: bool = Field(default=False, description="Declared signedness; default unsigned.")
     two_state: bool = Field(default=False, description="True for two-state; default four-state.")
@@ -760,7 +950,7 @@ class ExpressionType(SchemaModel):
     unpacked: list[ExpressionRange] = Field(default_factory=list, max_length=8,
         description="Unpacked [left,right] ranges, outermost first; requires elements or path_template.")
     members: list[ExpressionMember] = Field(default_factory=list, max_length=128,
-        description="Packed struct/union layout: name, lsb offset, type. For packed arrays, describe the innermost aggregate; its final packed range is the aggregate's flattened bits.")
+        description="Packed struct/union: name, lsb, type. Packed arrays use the innermost aggregate; its final packed range is flattened bits.")
 
 
 class ExpressionElement(SchemaModel):
@@ -769,11 +959,11 @@ class ExpressionElement(SchemaModel):
 
 
 class ExpressionArray(SchemaModel):
-    """Sparse elements or a bounded one-dimensional path template."""
+    """Sparse elements or bounded 1D path template."""
     elements: list[ExpressionElement] = Field(default_factory=list, max_length=128,
         description="Exact sparse mappings. Missing elements remain missing evidence.")
     path_template: str | None = Field(default=None, min_length=1, max_length=16384,
-        description="Alternative to elements: one {index}, e.g. tb.mem[{index}][7:0]; expand types.<name>.unpacked (1D, at most 128 elements).")
+        description="Instead of elements: one {index}, e.g. tb.m[{index}][7:0]; expand types.<name>.unpacked (1D, <=128).")
 
     @model_validator(mode="after")
     def check_mapping(self):
@@ -788,19 +978,19 @@ class ExpressionArray(SchemaModel):
 
 
 class WaveformExpression(SchemaModel):
-    """Read-only SV expression, re-evaluated at each sample."""
+    """Read-only SV expression evaluated per sample."""
     expr: str = Field(min_length=1, max_length=16384,
-        description="SV value expression, e.g. a[i], data[base+:W], valid && ready, or $countones(mask). No assignments, user functions or temporal syntax.")
+        description="SV values, e.g. a[i], data[base+:W], $countones(mask); no assignments, user functions or temporal syntax.")
     typing: Literal["semantic", "wave_bits"] = Field(default="semantic",
-        description="semantic needs declared types in types; wave_bits opts into unsigned dump-vector inference. Public queries do not load RTL types automatically.")
+        description="semantic: types required. wave_bits: unsigned dump vectors. No automatic RTL type loading.")
     scope: str | None = Field(default=None, max_length=16384,
-        description="Prefix for unbound names, e.g. tb.dut. Explicit bindings override it; this is not a type provider.")
+        description="Unbound-name prefix, e.g. tb.dut; bindings override. Not a type source.")
     bindings: dict[str, str | WaveformSelection | ExpressionArray] = Field(default_factory=dict, max_length=128,
-        description="Names to exact search_signals paths, fixed selections, or array bindings. Bare strings are paths.")
+        description="Names to exact search_signals paths, fixed selections or arrays.")
     types: dict[str, ExpressionType] = Field(default_factory=dict, max_length=128,
-        description="Declared operand types and named cast types. Supply signedness and array/member layout when relevant; dump width alone cannot prove them.")
+        description="Declared operand/cast types: signedness and array/member layout; dump width cannot infer these.")
     constants: dict[str, str] = Field(default_factory=dict, max_length=128,
-        description="Named integral constants as SV text, e.g. {W: '8'} for a fixed slice width. No automatic parameter/macro lookup.")
+        description="Integral SV text, e.g. {W:'8'} for slice width. No parameter/macro lookup.")
 
 
 ExpressionMember.model_rebuild()
@@ -989,12 +1179,15 @@ class TimeAnchor(SchemaModel):
 
 
 class AnalyzeFailureEventResult(SchemaModel):
+    native_route: NativeRouteReceipt | None = None
     failure_event: dict[str, Any]
     time_anchor: TimeAnchor
     likely_instances: list[dict[str, Any]] = Field(default_factory=list)
     recommended_signals: list[dict[str, Any]] = Field(default_factory=list)
     related_source_files: list[dict[str, Any]] = Field(default_factory=list)
     reasoning_summary: list[str] = Field(default_factory=list)
+    source_correlation: dict[str, Any] | None = None
+    backend_status: BackendStatus | None = None
 
 
 class StructuralRiskCorrelation(SchemaModel):
@@ -1009,6 +1202,7 @@ class StructuralRiskCorrelation(SchemaModel):
 
 
 class RecommendNextStepsResult(SchemaModel):
+    native_route: NativeRouteReceipt | None = None
     primary_failure_target: dict[str, Any] | None = None
     recommended_signals: list[dict[str, Any]] = Field(default_factory=list)
     recommended_instances: list[dict[str, Any]] = Field(default_factory=list)
@@ -1026,6 +1220,7 @@ class RecommendNextStepsResult(SchemaModel):
     # Coverage receipt is kept even when there are no flagged rows. In
     # particular, zero_coverage + [] findings is not a protocol pass.
     runtime_protocol_coverage: dict[str, Any] | None = None
+    suggested_next_actions: list[dict[str, Any]] = Field(default_factory=list)
     workflow_incomplete: bool = False
     degraded_reason: (
         Literal[
@@ -1038,6 +1233,8 @@ class RecommendNextStepsResult(SchemaModel):
     required_next_call: dict[str, Any] | None = None
     missing_inputs: list[str] = Field(default_factory=list)
     next_iteration_hint: dict[str, Any] | None = None
+    source_correlation: dict[str, Any] | None = None
+    backend_status: BackendStatus | None = None
 
 
 RecommendFailureDebugNextStepsResult = RecommendNextStepsResult
@@ -1053,12 +1250,11 @@ class DiagnosticSnapshotSection(SchemaModel):
 class DiagnosticSnapshot(SchemaModel):
     sim_paths: DiagnosticSnapshotSection
     hierarchy: DiagnosticSnapshotSection
+    design_context: DiagnosticSnapshotSection | None = None
     log_analysis: DiagnosticSnapshotSection
     structural_scan: DiagnosticSnapshotSection | None = None
-    # Whole-design protocol health (sweep_handshakes). Same role as
-    # structural_scan but at the waveform/runtime layer: a default-flow
-    # perception step whose facts the LLM judges. Present only when a waveform
-    # exists; recommended (via missing_steps) only on a failing run.
+    # Optional sweep evidence, including not_run and partial coverage. Its
+    # suggested_call is advisory and never makes sweep a missing workflow step.
     protocol_health: DiagnosticSnapshotSection | None = None
     recommended_next: DiagnosticSnapshotSection
     simulator: str | None = None
@@ -1205,10 +1401,14 @@ class SourceGraphClaimSemanticsReceipt(SchemaModel):
 
 
 class HierarchyRecoveryReceipt(SchemaModel):
-    status: Literal["hit_existing", "rebuilt", "blocked"]
+    status: Literal["hit_existing", "rebuilt", "prepared_design", "hit_design_context", "blocked"]
     attempted: bool = False
     coalesced: bool = False
     hierarchy_handle: str | None = None
+    design_handle: str | None = None
+    hierarchy_available: bool | None = None
+    preparation_metrics: dict[str, int | float] | None = None
+    context_gaps: list[str] | None = None
     handle_lifetime: Literal["process"] = "process"
     identity_basis: Literal["validated_historical_source", "current_sources"] | None = None
     compile_context: dict[str, Any] | None = None
@@ -1224,6 +1424,7 @@ class HierarchyRecoveryReceipt(SchemaModel):
 
 
 class ExplainDriverResult(SchemaModel):
+    native_route: NativeRouteReceipt | None = None
     hierarchy_recovery: HierarchyRecoveryReceipt | None = None
     dependency_context: dict[str, Any] | None = None
     wave_design_binding: dict[str, Any] | None = None
@@ -1464,6 +1665,10 @@ class SourceGraphScopeMatchReceipt(SchemaModel):
 class SourceGraphBackendReceipt(SchemaModel):
     adapter_status: Literal["ready", "blocked", "disabled", "invalid"]
     bootstrap_context: dict[str, Any] | None = None
+    request_timeout_sec: float | None = None
+    request_remaining_sec: float | None = None
+    semantic_instances_charged: int | None = None
+    semantic_members_charged: int | None = None
     adapter: dict[str, Any] | None = None
     prepare_status: (
         Literal[
@@ -1650,7 +1855,47 @@ class SourceGraphBackendReceipt(SchemaModel):
         return data
 
 
+class KdbArtifactEvidence(SchemaModel):
+    artifact_status: Literal["missing", "empty", "source_only_candidate", "elaborated_candidate", "elaboration_error", "unrecognized"]
+    identity_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    identity_basis: Literal["bounded_elaboration_maps"]
+    identity_status: Literal["complete", "partial"]
+    load_status: Literal["not_checked", "loaded", "failed"]
+    source_association: Literal["unverified"]
+    gaps: list[str]
+
+
+class DesignQueryMetrics(SchemaModel):
+    source_validation_ms: float = Field(ge=0)
+    binding_wait_ms: float = Field(ge=0)
+    discovery_ms: float = Field(ge=0)
+    discovery_read_bytes: int = Field(ge=0)
+    discovery_file_count: int = Field(ge=0)
+    discovery_entry_count: int = Field(ge=0)
+    anchor_ms: float = Field(ge=0)
+    binding_ms: float = Field(ge=0)
+    binding_validation_ms: float = Field(ge=0)
+    query_ms: float = Field(ge=0)
+    final_validation_ms: float = Field(ge=0)
+    total_ms: float = Field(ge=0)
+
+
+class DesignQueryReceipt(SchemaModel):
+    design_handle: str
+    context_identity_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    backend_preference: Literal["auto", "source"]
+    binding_reused: bool
+    selection: Literal["candidate", "unavailable", "source_policy", "probe_partial", "unusable_candidate"]
+    artifact: KdbArtifactEvidence | None = None
+    source_snapshot_status: Literal["complete", "partial"]
+    include_resolution_status: Literal["complete", "partial"]
+    previous_npi_failure: Literal["npi_load_failed", "npi_lsf_npi_unavailable"] | None = None
+    gaps: list[str]
+    metrics: DesignQueryMetrics
+
+
 class BackendStatus(SchemaModel):
+    design_context: DesignQueryReceipt | None = None
     simulator: Literal["vcs", "xcelium", "verilator", "unknown"] = "unknown"
     # ``backend`` retains its legacy meaning (policy-selected backend).  The
     # additive fields make a multi-attempt NPI -> Source Graph -> Static route
@@ -1718,6 +1963,7 @@ class BackendStatus(SchemaModel):
         "vericom_standalone",
         "vericom_import_from_file",
         "traceweave_cached",
+        "explicit",
         "none",
     ] = "none"
     kdb_validation_status: Literal[
@@ -1729,6 +1975,7 @@ class BackendStatus(SchemaModel):
     # stronger: it becomes true only after NPI actually loaded that partial
     # netlist and passed the top-instance self-check.
     kdb_degraded: bool = False
+    kdb_load_status: Literal["not_checked", "loaded", "failed"] | None = None
     kdb_error_count: int | None = Field(default=None, ge=0)
     kdb_error_log: str | None = None
     kdb_hint: str | None = None
@@ -1774,6 +2021,7 @@ class LoadEnumerationReceipt(SchemaModel):
 
 
 class FindSignalLoadsResult(SchemaModel):
+    native_route: NativeRouteReceipt | None = None
     wave_design_binding: dict[str, Any] | None = None
     signal_path: str
     resolved_rtl_name: str
@@ -1821,6 +2069,7 @@ _TRACE_SIGNAL_PATH_DIRECTION_NOTE = (
 
 
 class TraceSignalPathResult(SchemaModel):
+    native_route: NativeRouteReceipt | None = None
     wave_design_binding: dict[str, Any] | None = None
     from_signal: str
     to_signal: str
@@ -1901,6 +2150,7 @@ class XHistoryEvidence(SchemaModel):
 
 
 class TraceXSourceResult(SchemaModel):
+    native_route: NativeRouteReceipt | None = None
     wave_design_binding: dict[str, Any] | None = None
     start_signal: str
     start_time_ps: int
@@ -1927,8 +2177,10 @@ class PrerequisiteBlockResult(SchemaModel):
 
 
 class ToolErrorResult(SchemaModel):
+    native_route: NativeRouteReceipt | None = None
     error: str
     error_code: str | None = None
+    hierarchy_recovery: HierarchyRecoveryReceipt | None = None
     fsdb_runtime: dict[str, Any] | None = None
     fst_runtime: FstRuntimeInfo | None = None
     fallback: dict[str, Any] | None = None
@@ -2010,6 +2262,24 @@ class DivergenceContext(SchemaModel):
     snapshot_sha256: str | None = None
     source_snapshot_sha256: str | None = None
     compile_log_identity_sha256: str | None = None
+
+
+class DivergenceQueryContext(DivergenceContext):
+    """One explicit prepared handle or an exact legacy compile observation."""
+    compile_log: str | None = Field(default=None, min_length=1)
+    design_handle: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def explicit_design_identity(self):
+        if self.design_handle is None:
+            if self.compile_log is None and not (getattr(self, "kdb_path", None) and self.top_hint):
+                raise ValueError("compile_log_or_design_handle_required")
+        elif any(getattr(self, key) is not None for key in (
+            "hierarchy_handle", "snapshot_sha256", "source_snapshot_sha256",
+            "compile_log_identity_sha256",
+        )):
+            raise ValueError("design_handle_conflicts_with_legacy_identity")
+        return self
 
 
 class DivergenceNextAction(SchemaModel):
@@ -2434,7 +2704,40 @@ class VerifyEvidence(SchemaModel):
     signal_values: dict[str, str | None] = Field(default_factory=dict)
 
 
+class PropertyCheckResult(SchemaModel):
+    mode: Literal['property'] = 'property'
+    wave_path: str
+    status: Literal['failure_reproduced','not_reproduced','insufficient_evidence','unsupported']
+    execution_status: Literal['not_run','partial','completed'] = 'not_run'
+    coverage_status: Literal['zero_coverage','partial','complete'] = 'zero_coverage'
+    clock: str | None = None
+    edge: str | None = None
+    plan: dict[str,Any] = Field(default_factory=dict)
+    target: dict[str,Any] = Field(default_factory=dict)
+    failure_event: dict[str,Any] = Field(default_factory=dict)
+    attempt_selection: dict[str,Any] = Field(default_factory=dict)
+    sampling: dict[str,Any] = Field(default_factory=dict)
+    evidence_context: dict[str,Any] = Field(default_factory=dict)
+    bindings: list[dict[str,Any]] = Field(default_factory=list)
+    bindings_truncated: bool = False
+    attempts: list[dict[str,Any]] = Field(default_factory=list)
+    attempts_truncated: bool = False
+    reproduced_count: int = 0
+    gap_codes: list[str] = Field(default_factory=list)
+    work_steps: int = 0
+    match_count: int = 0
+    output_truncated: bool = False
+    suggested_next_action: dict[str,Any] | None = None
+    error_code: str | None = None
+
+
 class WindowVerifyResult(SchemaModel):
+    sample_phase: Literal["before", "after"] = "after"
+    sample_offset_ps: int | None = None
+    response_min_cycles: int | None = None
+    response_max_cycles: int | None = None
+    attempt_start_indices: list[int] | None = None
+    attempts_evaluated: int = 0
     selections: list[WaveformSelectionReceipt] = Field(default_factory=list)
     expressions: list[WaveformExpressionReceipt] = Field(default_factory=list)
     transition_data_truncated: bool = False
@@ -2621,10 +2924,12 @@ class TlulInspectResult(SchemaModel):
 
 
 class PackedFieldsResult(SchemaModel):
+    native_route: NativeRouteReceipt | None = None
     status: Literal["resolved", "mapping_required"]
     fields: dict[str, WaveformSelection] = Field(default_factory=dict)
     reasons: list[str] = Field(default_factory=list)
     evidence: dict[str, Any] = Field(default_factory=dict)
+    backend_status: BackendStatus | None = None
 
 
 class DistValueCount(SchemaModel):
@@ -2689,7 +2994,22 @@ class XHistoryInput(SchemaModel):
     timeout_sec: float = Field(default=30, gt=0, le=120)
 
 
-class DivergenceSide(DivergenceContext):
+class NativeXHistoryInput(XHistoryInput):
+    compile_log: str | None = Field(default=None, min_length=1)
+    timeout_sec: float = Field(default=30, gt=0, le=300)
+
+
+class DivergenceSide(DivergenceQueryContext):
+    kdb_path: str | None = Field(default=None, min_length=1)
+    backend_preference: Literal["auto", "source"] = "auto"
+    retry_npi: bool = False
+
+    @model_validator(mode="after")
+    def native_identity_mode(self):
+        if self.design_handle and (self.kdb_path is not None or "retry_npi" in self.model_fields_set):
+            raise ValueError("design_handle_conflicts_with_native_identity")
+        return self
+
     wave_path: str = Field(min_length=1)
     signal_path: str = Field(min_length=1)
 
@@ -2741,3 +3061,348 @@ class TraceDivergenceResult(SchemaModel):
     next_actions: list[DivergenceNextAction] = Field(default_factory=list)
     cursor: CursorRefSchema | None = None
     operation_metrics: dict[str, int | float] = Field(default_factory=dict)
+
+
+# Version 2 hierarchy/source facts. Legacy handle schemas above remain intact.
+# Trees use shallow rows plus iterative validation at the transport boundary;
+# a supported depth of 256 must not depend on Pydantic's recursive-model cap.
+SourceFactLabel = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]*$")]
+SourceFactCount = Annotated[int, Field(ge=0, strict=True)]
+SourceFactName = Annotated[str, Field(min_length=1)]
+
+
+class SourceFactModel(SchemaModel):
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+
+
+class SourceScopeRow(SourceFactModel):
+    scope_id: SourceFactName
+    path: SourceFactName
+    inst: SourceFactName
+    kind: Literal["module", "interface", "program", "generate", "instance_array"]
+    parent: SourceFactName | None
+    definition_id: SourceFactName | None
+    module: SourceFactName | None
+    source_file: SourceFactName | None
+    source_line: Annotated[int, Field(ge=1)] | None
+    definition_file: SourceFactName | None
+    definition_line: Annotated[int, Field(ge=1)] | None
+    parameterization: dict[str, str]
+    gaps: list[SourceFactLabel]
+
+    @model_validator(mode="after")
+    def consistent_locations(self):
+        for left, right in ((self.definition_id, self.module), (self.source_file, self.source_line),
+                            (self.definition_file, self.definition_line)):
+            if (left is None) != (right is None):
+                raise ValueError("scope identity/location pairs must agree")
+        if self.parent == self.path:
+            raise ValueError("a scope cannot parent itself")
+        return self
+
+
+class SourceScopeNode(SourceScopeRow):
+    children: list[dict[str, Any]]
+    child_count: SourceFactCount | None
+    child_count_lower_bound: SourceFactCount
+    truncated: bool
+
+
+class SourceSymbolRow(SourceFactModel):
+    symbol_id: SourceFactName
+    name: SourceFactName
+    qualified_name: SourceFactName
+    kind: Literal["module", "interface", "program", "package", "class", "typedef",
+                  "function", "task", "variable", "parameter", "enum"]
+    scope_id: SourceFactName | None = None
+    declaration_id: SourceFactName | None = None
+    type_id: SourceFactName | None = None
+    source_file: SourceFactName | None
+    source_line: Annotated[int, Field(ge=1)] | None
+    source_column: SourceFactCount | None
+    parameterization: dict[str, str] = Field(default_factory=dict)
+    external: bool
+    gaps: list[SourceFactLabel]
+    declaration_status: Literal["declaration", "specialization", "namespace_observation"] = "declaration"
+
+    @model_validator(mode="after")
+    def consistent_location(self):
+        if (self.source_file is None) != (self.source_line is None):
+            raise ValueError("symbol file and line must agree")
+        if self.source_file is None and self.source_column is not None:
+            raise ValueError("an unknown location cannot supply a column")
+        return self
+
+
+class SourceClassNode(SourceSymbolRow):
+    kind: Literal["class"]
+    children: list[dict[str, Any]]
+    truncated: bool
+    reference_only: bool = False
+    base_status: Literal["none", "resolved", "unresolved"] | None = None
+    base_symbol_id: SourceFactName | None = None
+    base_qualified_name: SourceFactName | None = None
+    binding_gaps: list[SourceFactLabel] = Field(default_factory=list)
+    base_relation: Literal["declaration", "specialization"] | None = None
+    base_value_parameters: dict[str, str] = Field(default_factory=dict, max_length=128)
+    base_parameter_status: Literal["not_observed", "observed", "partial"] = "not_observed"
+    type_parameter_bindings: dict[str, SourceFactName] = Field(default_factory=dict, max_length=128)
+    base_type_parameter_bindings: dict[str, SourceFactName] = Field(default_factory=dict, max_length=128)
+    type_identity_domain: Literal["declaration", "artifact_canonical"] = "declaration"
+
+    @model_validator(mode="after")
+    def consistent_binding(self):
+        if self.reference_only:
+            if not self.external or self.base_status is not None:
+                raise ValueError("a reference-only base is not a recovered declaration")
+        elif self.base_status is None:
+            raise ValueError("class base status must be explicit")
+        if self.base_status == "resolved":
+            if self.base_symbol_id is None or self.base_qualified_name is None:
+                raise ValueError("a resolved base requires its semantic binding")
+        elif self.base_symbol_id is not None:
+            raise ValueError("an unresolved base cannot have a bound identity")
+        if self.base_status == "none" and self.base_qualified_name is not None:
+            raise ValueError("a class with no base cannot name one")
+        if self.base_relation is not None and self.base_status != "resolved":
+            raise ValueError("a declaration relation requires a resolved base")
+        if (self.base_value_parameters or self.base_type_parameter_bindings) and (
+            self.base_status != "resolved" or self.base_parameter_status == "not_observed"
+        ):
+            raise ValueError("base parameter observations require a resolved declaration")
+        if self.base_parameter_status == "observed" and not (
+                self.base_value_parameters or self.base_type_parameter_bindings):
+            raise ValueError("observed base parameters require positive facts")
+        if any(not k or not v for k, v in self.base_value_parameters.items()):
+            raise ValueError("base parameter observations must be nonempty")
+        if any(not key for key in (*self.type_parameter_bindings, *self.base_type_parameter_bindings)):
+            raise ValueError("type parameter names must be nonempty")
+        return self
+
+
+class SourceFileRow(SourceFactModel):
+    file_id: SourceFactName
+    path: SourceFactName
+    aliases: list[str]
+    ownership_origin: Literal["compile_metadata"]
+    compile_categories: list[str]
+    compiler_file_types: list[str]
+    compilation_roles: list[str]
+    includes: list[str]
+    include_origin: Literal["compile_log"]
+    is_compilation_unit: bool
+    is_reported_include: bool
+    is_dependency_include: bool
+    source_status: Literal["captured", "unavailable", "not_captured"]
+    file_type: str | None
+    modules: list[str] | None
+    classes: list[str] | None
+    interfaces: list[str] | None
+    symbols: list[SourceSymbolRow] | None
+    has_uvm_import: bool | None
+    contains_uvm: bool | None
+    semantic_status: Literal["not_run", "unavailable", "complete", "partial"]
+    semantic_work_scope: Literal["not_run", "provider_defined", "file_declarations", "global_namespaces_bounded"]
+    symbol_inventory_complete: bool
+    symbol_count: SourceFactCount | None
+    symbol_count_lower_bound: SourceFactCount
+    semantic_gaps: list[SourceFactLabel]
+    analysis_limits: list[SourceFactLabel]
+
+    @model_validator(mode="after")
+    def consistent_inventory(self):
+        if self.has_uvm_import is True and self.contains_uvm is not True:
+            raise ValueError("UVM import requires positive usage")
+        if self.symbol_inventory_complete != (self.symbol_count is not None):
+            raise ValueError("symbol count requires complete inventory")
+        if self.symbol_count is not None and self.symbol_count != self.symbol_count_lower_bound:
+            raise ValueError("exact symbol count must equal its lower bound")
+        if self.symbols is not None and len(self.symbols) != self.symbol_count_lower_bound:
+            raise ValueError("file detail must retain every admitted symbol")
+        if self.analysis_limits and self.symbol_inventory_complete:
+            raise ValueError("limited file inventory cannot be complete")
+        if self.semantic_status == "complete" and (not self.symbol_inventory_complete or self.semantic_gaps):
+            raise ValueError("complete file semantics requires complete gap-free inventory")
+        if self.semantic_status in {"not_run", "unavailable"} and any(value is not None for value in (
+            self.symbols, self.file_type, self.modules, self.classes, self.interfaces,
+            self.has_uvm_import, self.contains_uvm,
+        )):
+            raise ValueError("unqueried file semantics must remain unknown")
+        seen, owned_paths = set(), {self.path, *self.aliases}
+        from .cancellation import check_cancelled
+        for symbol in self.symbols or []:
+            check_cancelled()
+            if symbol.symbol_id in seen:
+                raise ValueError("duplicate file symbol identity")
+            seen.add(symbol.symbol_id)
+            if symbol.source_file is not None and symbol.source_file not in owned_paths:
+                raise ValueError("symbol belongs to another compile member")
+        return self
+
+
+class SourceQueryMetrics(SourceFactModel):
+    scope_count: SourceFactCount
+    native_call_count: SourceFactCount
+    symbol_count: SourceFactCount
+    file_count: SourceFactCount
+    estimated_fact_bytes: SourceFactCount
+    query_ms: Annotated[float, Field(ge=0)]
+    native_handle_count: SourceFactCount | None = None
+    native_iterator_release_count: SourceFactCount | None = None
+    language_cleanup_ms: Annotated[float, Field(ge=0)] | None = None
+    design_load_ms: Annotated[float, Field(ge=0)] | None = None
+    query_with_cleanup_validation_ms: Annotated[float, Field(ge=0)] | None = None
+    worker_context_decode_ms: Annotated[float, Field(ge=0)] | None = None
+    worker_source_validation_ms: Annotated[float, Field(ge=0)] | None = None
+    worker_metadata_validation_ms: Annotated[float, Field(ge=0)] | None = None
+    worker_kdb_validation_ms: Annotated[float, Field(ge=0)] | None = None
+    worker_result_validation_ms: Annotated[float, Field(ge=0)] | None = None
+    worker_query_ms: Annotated[float, Field(ge=0)] | None = None
+    context_transport_encode_ms: Annotated[float, Field(ge=0)] | None = None
+    context_transport_bytes: SourceFactCount | None = None
+    lsf_parent_preparation_ms: Annotated[float, Field(ge=0)] | None = None
+    lsf_round_trip_ms: Annotated[float, Field(ge=0)] | None = None
+    lsf_result_validation_ms: Annotated[float, Field(ge=0)] | None = None
+
+
+class SourceKdbBindingEvidence(KdbArtifactEvidence):
+    load_quality: Literal["clean", "degraded"]
+
+
+class SourceQueryEnvelope(SourceFactModel):
+    native_route: NativeRouteReceipt | None = None
+    schema_version: Literal[2]
+    facts_origin: Literal["compile_metadata", "verdi_npi", "slang", "static_inference"]
+    artifact_identity: SourceFactName
+    coverage_status: Literal["complete", "partial"]
+    coverage_gaps: list[SourceFactLabel]
+    analysis_limits: list[SourceFactLabel]
+    query_metrics: SourceQueryMetrics
+    error: SourceFactLabel | None = None
+    semantic_status: Literal["not_run", "unavailable", "complete", "partial"] | None = None
+    coverage_domain: SourceFactLabel | None = None
+    context_identity_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")] | None = None
+    ownership_identity: SourceFactName | None = None
+    ownership_basis: Literal["compile_metadata", "captured_source"] | None = None
+    kdb_binding: SourceKdbBindingEvidence | None = None
+    handle: str | None = None
+    design_handle: str | None = None
+    design_context: DesignQueryReceipt | None = None
+    backend_status: BackendStatus | None = None
+
+    @model_validator(mode="after")
+    def consistent_coverage(self):
+        if self.analysis_limits and self.coverage_status == "complete":
+            raise ValueError("limited analysis cannot prove complete coverage")
+        if self.error in {"hierarchy_query_incomplete", "semantic_provider_unavailable", "file_query_incomplete"}:
+            if self.coverage_status != "partial":
+                raise ValueError("unavailable/incomplete queries must remain partial")
+        return self
+
+
+class SourcePackedLayoutResult(SourceQueryEnvelope):
+    source_signal: SourceFactName
+    status: Literal["resolved", "mapping_required"]
+    field_bits: dict[SourceFactName, list[SourceFactCount]]
+    declared_range: dict[str, SourceFactCount] | None
+
+    @model_validator(mode="after")
+    def consistent_layout(self):
+        if self.status == "mapping_required":
+            if self.field_bits or self.declared_range is not None:
+                raise ValueError("an unresolved layout cannot publish selections")
+        else:
+            bounds = self.declared_range
+            if (self.coverage_status != "complete" or self.analysis_limits or self.coverage_gaps
+                    or bounds is None or set(bounds) != {"left", "right"}
+                    or bounds["right"] != 0 or bounds["left"] >= 256
+                    or not 1 <= len(self.field_bits) <= 128):
+                raise ValueError("resolved layout requires complete bounded type evidence")
+            for bits in self.field_bits.values():
+                if not bits or len(bits) > 256 or len(set(bits)) != len(bits) or max(bits) > bounds["left"]:
+                    raise ValueError("invalid packed field selection")
+        return self
+
+
+class SourceCountResult(SourceQueryEnvelope):
+    count_status: Literal["exact", "lower_bound"]
+    count_lower_bound: SourceFactCount
+    count_mode: Literal["bounded", "exact"] | None = None
+    count_domain: SourceFactLabel | None = None
+    output_truncated: bool
+
+
+class SourceSubtreeResult(SourceCountResult):
+    root: str
+    node: dict[str, Any] | None
+    total_descendants: SourceFactCount | None
+    truncated: bool
+
+
+class SourceInstanceResult(SourceCountResult):
+    hits: list[SourceScopeRow]
+    total: SourceFactCount | None
+    truncated: bool
+
+
+class SourceFileLookupResult(SourceCountResult):
+    matches: list[SourceFileRow]
+    total: SourceFactCount | None
+    unknown_filter_files: SourceFactCount
+    examined_files: SourceFactCount
+    semantic_file_queries: SourceFactCount
+    truncated: bool
+
+
+class SourceFileDetailResult(SourceQueryEnvelope, SourceFileRow):
+    semantic_status: Literal["not_run", "unavailable", "complete", "partial"]
+
+
+class SourceFileMissResult(SourceQueryEnvelope):
+    path: str
+    did_you_mean: list[str] = Field(default_factory=list)
+    error: Literal["file_not_in_compile_set", "file_query_incomplete"]
+
+
+class SourceClassResult(SourceQueryEnvelope):
+    view: Literal["static_class_inheritance"]
+    roots: list[dict[str, Any]]
+    total: SourceFactCount
+    output_truncated: bool
+    class_inventory_domain: Literal["provider_declarations", "declarations_and_referenced_specializations"]
+    class_inventory_count: SourceFactCount | None
+    class_inventory_lower_bound: SourceFactCount
+    class_inventory_complete: bool
+    candidates: list[dict[str, str]] = Field(default_factory=list)
+
+
+class SourceSectionResult(SourceQueryEnvelope):
+    section: Literal["compile_result", "include_tree", "filelist_tree", "files_full",
+                     "interfaces", "component_tree_full", "class_hierarchy_full"]
+    data: Any
+    export_complete: bool
+    output_truncated: bool
+    warning: str = ""
+    record_export_complete: bool | None = None
+    count_status: Literal["exact", "lower_bound"] | None = None
+    count_lower_bound: SourceFactCount | None = None
+    count_mode: Literal["bounded", "exact"] | None = None
+    count_domain: SourceFactLabel | None = None
+    total: SourceFactCount | None = None
+    examined_files: SourceFactCount | None = None
+    root: str | None = None
+    total_descendants: SourceFactCount | None = None
+    truncated: bool | None = None
+    view: Literal["elaborated_instances", "static_class_inheritance"] | None = None
+    class_inventory_domain: Literal["provider_declarations", "declarations_and_referenced_specializations"] | None = None
+    class_inventory_count: SourceFactCount | None = None
+    class_inventory_lower_bound: SourceFactCount | None = None
+    class_inventory_complete: bool | None = None
+    candidates: list[dict[str, str]] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def consistent_export(self):
+        if self.export_complete and (self.coverage_status != "complete" or self.coverage_gaps
+                                     or self.analysis_limits or self.output_truncated or self.error):
+            raise ValueError("partial/truncated exports cannot be complete")
+        return self

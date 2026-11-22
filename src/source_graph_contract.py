@@ -26,10 +26,10 @@ from .connectivity_limits import DEFAULT_LOAD_OUTPUT_LIMIT
 from .connectivity_ir import CONNECTIVITY_IR_VERSION, CoverageStatus
 
 
-SOURCE_GRAPH_BUILD_CONTRACT_VERSION = "3.3"
-SOURCE_GRAPH_WORKER_PROTOCOL_VERSION = "3.3"
+SOURCE_GRAPH_BUILD_CONTRACT_VERSION = "3.4"
+SOURCE_GRAPH_WORKER_PROTOCOL_VERSION = "3.4"
 SOURCE_GRAPH_PROJECTOR_NAME = "slang_connectivity_projector"
-SOURCE_GRAPH_PROJECTOR_SCHEMA_VERSION = "1.12"
+SOURCE_GRAPH_PROJECTOR_SCHEMA_VERSION = "1.22"
 SOURCE_GRAPH_ARTIFACT_IDENTITY_VERSION = "1.2"
 SOURCE_GRAPH_SEMANTIC_CONTEXT_VERSION = "1.0"
 SOURCE_GRAPH_QUERY_IDENTITY_VERSION = "1.0"
@@ -628,6 +628,132 @@ class CoverageBoundary:
 
 
 @dataclass(frozen=True)
+class SemanticScopeSearch:
+    """Bounded semantic lookup/expansion, never a proved lexical subtree.
+
+    Limits are artifact inputs. Different searches may not dominate each other,
+    even when their textual candidate prefixes happen to overlap.
+    """
+
+    roots: tuple[str, ...] = ()
+    depth: int = 0
+    max_instances: int = 64
+    max_members: int = 4096
+    assignment_candidates: tuple[str, ...] = ()
+    purpose: str = "connectivity"
+    source_files: tuple[str, ...] = ()
+    source_capabilities: tuple[str, ...] = ()
+    source_aliases: tuple[tuple[str, str], ...] = ()
+    source_version: int = 1
+    source_max_scopes: int = 1024
+    source_max_depth: int = 128
+    source_max_bytes: int = 2 * 1024 * 1024
+    hierarchy_version: int = 2
+    hierarchy_mode: str = "bounded"
+    hierarchy_max_bytes: int = 2 * 1024 * 1024
+    hierarchy_aliases: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.purpose not in {"connectivity", "hierarchy", "packed_layout", "trace", "source_catalog"}:
+            raise ValueError("unsupported semantic scope purpose")
+        roots = _path_set(self.roots, "semantic expansion root")
+        if len(roots) > 64 or any(len(path.split(".")) > 64 for path in roots):
+            raise ValueError("semantic expansion roots exceed bounds")
+        depth_max = 256 if self.purpose == "hierarchy" else 2
+        if type(self.depth) is not int or not 0 <= self.depth <= depth_max:
+            raise ValueError("semantic expansion depth exceeds purpose bounds")
+        if (not roots if self.purpose == "hierarchy" else bool(roots) != bool(self.depth)):
+            raise ValueError("semantic expansion roots require a nonzero depth")
+        if not 1 <= _positive_limit(self.max_instances, "semantic instances") <= (10000 if self.purpose == "hierarchy" else 64):
+            raise ValueError("semantic instance budget exceeds bounds")
+        if not 1 <= _positive_limit(self.max_members, "semantic members") <= (100000 if self.purpose in {"hierarchy", "source_catalog"} else 4096):
+            raise ValueError("semantic member budget exceeds bounds")
+        object.__setattr__(self, "roots", roots)
+        candidates = _path_set(self.assignment_candidates, "semantic assignment candidate")
+        candidate_limit = 64 if self.purpose == "trace" else 2
+        if len(candidates) > candidate_limit or any(len(path.split(".")) > 64 for path in candidates):
+            raise ValueError("semantic assignment candidates exceed bounds")
+        object.__setattr__(self, "assignment_candidates", candidates)
+        files = _ordered_text(self.source_files, "semantic source file")
+        capabilities = _fixed_labels(self.source_capabilities, "semantic source capability")
+        if self.purpose == "source_catalog":
+            if (not files or len(files) > 10000 or len(set(files)) != len(files)
+                    or any(not value.startswith("/") for value in files)
+                    or capabilities not in {("file_declarations",),
+                                            ("class_inheritance", "file_declarations")}):
+                raise ValueError("source catalog requires bounded files and declared capabilities")
+            if (type(self.source_version) is not int or self.source_version != 1
+                    or type(self.source_max_scopes) is not int or not 1 <= self.source_max_scopes <= 10000
+                    or type(self.source_max_depth) is not int or not 1 <= self.source_max_depth <= 256
+                    or type(self.source_max_bytes) is not int or not 1 <= self.source_max_bytes <= 8 * 1024 * 1024):
+                raise ValueError("invalid source catalog version or traversal limits")
+            aliases = tuple(tuple(pair) for pair in self.source_aliases)
+            if (len(aliases) > 32768 or any(len(pair) != 2 or
+                    any(not isinstance(value, str) or not value for value in pair)
+                    or not pair[1].startswith("/") for pair in aliases)
+                    or len({pair[0] for pair in aliases}) != len(aliases)):
+                raise ValueError("invalid source catalog aliases")
+            object.__setattr__(self, "source_aliases", tuple(sorted(aliases)))
+        elif (files or capabilities or self.source_aliases or self.source_version != 1
+              or self.source_max_scopes != 1024 or self.source_max_depth != 128
+              or self.source_max_bytes != 2 * 1024 * 1024):
+            raise ValueError("source files and capabilities require a source catalog")
+        object.__setattr__(self, "source_files", files)
+        object.__setattr__(self, "source_capabilities", capabilities)
+        if self.purpose == "hierarchy":
+            aliases = tuple(tuple(pair) for pair in self.hierarchy_aliases)
+            if (type(self.hierarchy_version) is not int or self.hierarchy_version != 2
+                    or self.hierarchy_mode not in {"bounded", "complete"}
+                    or type(self.hierarchy_max_bytes) is not int or not 1 <= self.hierarchy_max_bytes <= 8 * 1024 * 1024
+                    or len(aliases) > 32768 or any(len(pair) != 2 or
+                        any(not isinstance(item, str) or not item for item in pair)
+                        or not pair[1].startswith("/") for pair in aliases)
+                    or len({pair[0] for pair in aliases}) != len(aliases)):
+                raise ValueError("invalid hierarchy version, mode, aliases or byte limit")
+            object.__setattr__(self, "hierarchy_aliases", tuple(sorted(aliases)))
+        elif (self.hierarchy_version != 2 or self.hierarchy_mode != "bounded"
+              or self.hierarchy_max_bytes != 2 * 1024 * 1024 or self.hierarchy_aliases):
+            raise ValueError("hierarchy envelope requires hierarchy purpose")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"roots": list(self.roots), "depth": self.depth,
+                "max_instances": self.max_instances, "max_members": self.max_members,
+                "assignment_candidates": list(self.assignment_candidates),
+                **({"purpose": self.purpose} if self.purpose != "connectivity" else {}),
+                **({"source_files": list(self.source_files),
+                    "source_capabilities": list(self.source_capabilities),
+                    "source_aliases": [list(pair) for pair in self.source_aliases],
+                    "source_version": self.source_version,
+                    "source_max_scopes": self.source_max_scopes,
+                    "source_max_depth": self.source_max_depth,
+                    "source_max_bytes": self.source_max_bytes} if self.source_files else {}),
+                **({"hierarchy_version": self.hierarchy_version,
+                    "hierarchy_mode": self.hierarchy_mode,
+                    "hierarchy_max_bytes": self.hierarchy_max_bytes,
+                    "hierarchy_aliases": [list(pair) for pair in self.hierarchy_aliases]}
+                   if self.purpose == "hierarchy" else {})}
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> SemanticScopeSearch:
+        return cls(roots=tuple(value.get("roots", ())), depth=value.get("depth", 0),
+                   max_instances=value.get("max_instances", 64),
+                   max_members=value.get("max_members", 4096),
+                   assignment_candidates=tuple(value.get("assignment_candidates", ())),
+                   purpose=value.get("purpose", "connectivity"),
+                   source_files=tuple(value.get("source_files", ())),
+                   source_capabilities=tuple(value.get("source_capabilities", ())),
+                   source_aliases=tuple(tuple(pair) for pair in value.get("source_aliases", ())),
+                   source_version=value.get("source_version", 1),
+                   source_max_scopes=value.get("source_max_scopes", 1024),
+                   source_max_depth=value.get("source_max_depth", 128),
+                   source_max_bytes=value.get("source_max_bytes", 2 * 1024 * 1024),
+                   hierarchy_version=value.get("hierarchy_version", 2),
+                   hierarchy_mode=value.get("hierarchy_mode", "bounded"),
+                   hierarchy_max_bytes=value.get("hierarchy_max_bytes", 2 * 1024 * 1024),
+                   hierarchy_aliases=tuple(tuple(pair) for pair in value.get("hierarchy_aliases", ())))
+
+
+@dataclass(frozen=True)
 class SourceGraphBuildScope:
     design: str
     top: str
@@ -637,11 +763,18 @@ class SourceGraphBuildScope:
     coverage_boundary: CoverageBoundary
     path_hierarchy: PathHierarchyScope | None = None
     elaboration_candidates: tuple[str, ...] = ()
+    semantic_search: SemanticScopeSearch | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "design", _required_text(self.design, "design"))
         top = _hier_path(self.top, "top")
         object.__setattr__(self, "top", top)
+        if self.semantic_search is not None:
+            if not isinstance(self.semantic_search, SemanticScopeSearch):
+                raise ValueError("invalid semantic scope search")
+            if any(root != top and not root.startswith(top + ".")
+                   for root in (*self.semantic_search.roots, *self.semantic_search.assignment_candidates)):
+                raise ValueError("semantic roots must belong to the selected top")
         ancestors = tuple(
             _hier_path(path, "hierarchy ancestor") for path in self.hierarchy_ancestors
         )
@@ -696,6 +829,8 @@ class SourceGraphBuildScope:
             "target": self.target.to_dict(),
             "hierarchy_ancestors": list(self.hierarchy_ancestors),
             "elaboration_candidates": list(self.elaboration_candidates),
+            **({"semantic_search": self.semantic_search.to_dict()}
+               if self.semantic_search is not None else {}),
             "requested_cone": self.requested_cone.to_dict(),
             "coverage_boundary": self.coverage_boundary.to_dict(),
             "path_hierarchy": (
@@ -721,6 +856,8 @@ class SourceGraphBuildScope:
             target=_target_from_dict(target),
             hierarchy_ancestors=tuple(value.get("hierarchy_ancestors", ())),
             elaboration_candidates=tuple(value.get("elaboration_candidates", ())),
+            semantic_search=(SemanticScopeSearch.from_dict(value["semantic_search"])
+                             if value.get("semantic_search") is not None else None),
             requested_cone=RequestedCone.from_dict(cone),
             coverage_boundary=CoverageBoundary.from_dict(boundary),
             path_hierarchy=(
@@ -891,11 +1028,18 @@ class SourceGraphArtifactScope:
     # Exact, bounded lookup requests, not hierarchy proof. A worker may admit
     # only actual elaborated Instance objects. No candidate-prefix cache reuse.
     elaboration_candidates: tuple[str, ...] = ()
+    semantic_search: SemanticScopeSearch | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "design", _required_text(self.design, "design"))
         top = _hier_path(self.top, "top")
         object.__setattr__(self, "top", top)
+        if self.semantic_search is not None:
+            if not isinstance(self.semantic_search, SemanticScopeSearch):
+                raise ValueError("invalid semantic scope search")
+            if any(root != top and not root.startswith(top + ".")
+                   for root in (*self.semantic_search.roots, *self.semantic_search.assignment_candidates)):
+                raise ValueError("semantic roots must belong to the selected top")
         snapshot = _required_text(
             self.hierarchy_snapshot_sha256, "hierarchy snapshot fingerprint"
         ).lower()
@@ -1008,6 +1152,7 @@ class SourceGraphArtifactScope:
             coverage_boundary=scope.coverage_boundary,
             capabilities=tuple(QueryOperation(item) for item in capabilities),
             elaboration_candidates=scope.elaboration_candidates,
+            semantic_search=scope.semantic_search,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1021,6 +1166,8 @@ class SourceGraphArtifactScope:
             "proved_lcas": list(self.proved_lcas),
             "projection_instance_paths": list(self.projection_instance_paths),
             "elaboration_candidates": list(self.elaboration_candidates),
+            **({"semantic_search": self.semantic_search.to_dict()}
+               if self.semantic_search is not None else {}),
             "coverage_boundary": self.coverage_boundary.to_dict(),
             "capabilities": [item.value for item in self.capabilities],
         }
@@ -1040,6 +1187,8 @@ class SourceGraphArtifactScope:
             proved_lcas=tuple(value.get("proved_lcas", ())),
             projection_instance_paths=tuple(value.get("projection_instance_paths", ())),
             elaboration_candidates=tuple(value.get("elaboration_candidates", ())),
+            semantic_search=(SemanticScopeSearch.from_dict(value["semantic_search"])
+                             if value.get("semantic_search") is not None else None),
             coverage_boundary=CoverageBoundary.from_dict(boundary),
             capabilities=tuple(
                 QueryOperation(item) for item in value.get("capabilities", ())
@@ -1313,6 +1462,7 @@ def _legacy_exact_artifact_identity(
         coverage_boundary=scope.coverage_boundary,
         capabilities=(scope.target.operation,),
         elaboration_candidates=scope.elaboration_candidates,
+        semantic_search=scope.semantic_search,
     )
     return SourceGraphArtifactIdentity(
         source=source,
@@ -1652,10 +1802,46 @@ def _chain_covered_by(
     )
 
 
+def _catalog_search_scope_covers(available: dict, requested: dict) -> bool:
+    """Compare fact domains, independently of historical construction budgets.
+
+    Work limits remain in producer identity and codec validation. A warm query
+    pays its own actual traversal/output costs, never the producer's work again.
+    """
+    left, right = available.get('semantic_search'), requested.get('semantic_search')
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return available == requested
+    if left.get('purpose') != right.get('purpose'):
+        return False
+    purpose = left.get('purpose')
+    if purpose not in {'hierarchy', 'source_catalog'}:
+        return available == requested
+    available, requested = dict(available), dict(requested)
+    available['semantic_search'], requested['semantic_search'] = dict(left), dict(right)
+    if purpose == 'source_catalog':
+        if (not set(right['source_files']).issubset(left['source_files'])
+                or not set(right['source_capabilities']).issubset(left['source_capabilities'])):
+            return False
+        ignored = ('source_files', 'source_capabilities', 'max_instances', 'max_members',
+                   'source_max_scopes', 'source_max_depth', 'source_max_bytes')
+    else:
+        ignored = ('max_instances', 'max_members', 'hierarchy_max_bytes')
+    for value in (available['semantic_search'], requested['semantic_search']):
+        for key in ignored:
+            value.pop(key, None)
+    return available == requested
+
+
 def _artifact_scope_covers(
     available: SourceGraphArtifactScope,
     requested: SourceGraphArtifactScope,
 ) -> bool:
+    if available.semantic_search is not None or requested.semantic_search is not None:
+        if not set(requested.capabilities).issubset(available.capabilities):
+            return False
+        left, right = available.to_dict(), requested.to_dict()
+        left.pop("capabilities"); right.pop("capabilities")
+        return _catalog_search_scope_covers(left, right)
     if (
         available.design != requested.design
         or available.top != requested.top
@@ -1701,6 +1887,12 @@ def _semantic_context_scope_covers(
     they do not prevent the semantic root from projecting the requested scope.
     """
 
+    if available.semantic_search is not None or requested.semantic_search is not None:
+        if not set(requested.capabilities).issubset(available.capabilities):
+            return False
+        left, right = available.to_dict(), requested.to_dict()
+        left.pop("capabilities"); right.pop("capabilities")
+        return _catalog_search_scope_covers(left, right)
     if (
         available.design != requested.design
         or available.top != requested.top
@@ -1783,7 +1975,7 @@ def _compile_projection_covers(
     return set(requested.ordered_inputs).issubset(available.ordered_inputs)
 
 
-def source_graph_artifact_identity_covers(
+def source_graph_artifact_inputs_cover(
     available: SourceGraphArtifactIdentity,
     requested: SourceGraphArtifactIdentity,
 ) -> bool:
@@ -1796,8 +1988,13 @@ def source_graph_artifact_identity_covers(
             requested.compile_projection,
             manifest=available.source.compile_inputs,
         )
-        and _artifact_scope_covers(available.scope, requested.scope)
     )
+
+
+def source_graph_artifact_identity_covers(available, requested) -> bool:
+    """Prove compile inputs and the declared artifact domain cover a request."""
+    return (source_graph_artifact_inputs_cover(available, requested)
+            and _artifact_scope_covers(available.scope, requested.scope))
 
 
 def compare_source_graph_artifact_scopes(
@@ -1902,6 +2099,8 @@ def _scope_covers(
     available: SourceGraphBuildScope,
     requested: SourceGraphBuildScope,
 ) -> bool:
+    if available.semantic_search is not None or requested.semantic_search is not None:
+        return _catalog_search_scope_covers(available.to_dict(), requested.to_dict())
     if (
         available.design != requested.design
         or available.top != requested.top

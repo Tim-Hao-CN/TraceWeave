@@ -17,6 +17,56 @@ def _make_compile_result(simulator, *, compile_command=None, top="top_tb", files
     }
 
 
+def test_absent_kdb_cache_does_not_read_compile_dependencies(tmp_path, monkeypatch):
+    import config
+    from src import kdb_builder, verdi_backend
+    from src.compile_input_capture import CompileInputCapture
+
+    monkeypatch.setattr(config, "TRACEWEAVE_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(kdb_builder, "_extract_build_inputs",
+                        lambda *a, **kw: pytest.fail("absent cache read compile dependencies"))
+    with CompileInputCapture() as capture, verdi_backend.bounded_kdb_discovery(capture):
+        assert verdi_backend._probe_traceweave_cached_kdb({}, None) is None
+        assert capture.read_bytes_count == 0
+    assert not (tmp_path / "cache").exists()
+
+
+def test_new_kdb_cache_is_discovered_and_still_requires_exact_content(tmp_path, monkeypatch):
+    import config
+    from src import kdb_builder, verdi_backend
+
+    monkeypatch.setattr(config, "TRACEWEAVE_CACHE_ROOT", tmp_path / "cache")
+    source = tmp_path / "top.sv"
+    source.write_text("module top_tb; wire a; endmodule\n")
+    result = _make_compile_result("xcelium", files=[{"path": str(source)}])
+    assert verdi_backend._probe_traceweave_cached_kdb(result, None) is None
+    inputs = kdb_builder._extract_build_inputs(result, top_hint=None)
+    cached = config.TRACEWEAVE_CACHE_ROOT / config.KDB_CACHE_SUBDIR / inputs["hash"] / "kdb.elab++"
+    cached.mkdir(parents=True)
+    assert verdi_backend._probe_traceweave_cached_kdb(result, None) == str(cached)
+    before = source.stat()
+    source.write_text("module top_tb; wire b; endmodule\n")
+    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert verdi_backend._probe_traceweave_cached_kdb(result, None) is None
+
+
+def test_absent_kdb_cache_preserves_cancellation(tmp_path, monkeypatch):
+    import threading
+    import config
+    from src import verdi_backend
+    from src.cancellation import OperationCancelled, push_cancel_event, pop_cancel_event
+
+    monkeypatch.setattr(config, "TRACEWEAVE_CACHE_ROOT", tmp_path / "cache")
+    event = threading.Event()
+    event.set()
+    token = push_cancel_event(event)
+    try:
+        with pytest.raises(OperationCancelled):
+            verdi_backend._probe_traceweave_cached_kdb({}, None)
+    finally:
+        pop_cancel_event(token)
+
+
 def test_vcs_two_step_kdb_detected(tmp_path):
     case_dir = tmp_path
     kdb = case_dir / "simv.daidir" / "kdb.elab++"
@@ -209,17 +259,18 @@ def test_env_warnings_present_when_missing(tmp_path, monkeypatch):
     assert "LICENSE" in status["kdb_hint"]
 
 
-def test_real_cc20_case_when_available():
-    """When the cc20 fixture case is present locally, probe should succeed."""
-    cc20_log = "/home/robin/Projects/mcp_practise/uvm_demo_cc20/tb/comp.log"
-    if not os.path.exists(cc20_log):
-        pytest.skip("cc20 fixture unavailable")
+def test_generated_compile_metadata_probe(tmp_path):
+    """Compile metadata probing needs neither a private project nor a license."""
     from src.compile_log_parser import parse_compile_log
-
-    cr = parse_compile_log(cc20_log, "vcs")
-    status = probe_verdi_backend(cr, cc20_log)
+    source = tmp_path / 'top.sv'
+    source.write_text('module top_tb; endmodule\n')
+    log = tmp_path / 'compile.log'
+    log.write_text(f"Command: vcs -full64 -sverilog {source} -top top_tb -o simv\n"
+                   f"Parsing design file '{source}'\nTop Level Modules:\n       top_tb\n")
+    cr = parse_compile_log(str(log), "vcs")
+    assert cr['top_modules'] == ['top_tb']
+    status = probe_verdi_backend(cr, str(log))
     assert status["simulator"] == "vcs"
-    # KDB may or may not exist; just sanity-check the shape.
     assert status["kdb_flow"] in ("vcs_two_step", "vcs_three_step", "none")
 
 

@@ -1,12 +1,15 @@
+import json
 import os
+import subprocess
 import sys
+import threading
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src import schemas
-from src.cancellation import OperationCancelled
+from src.cancellation import OperationCancelled, push_cancel_event, pop_cancel_event
 from src.verdi_npi_backend import (
     VerdiNpiBackend,
     _classify_driver_kind,
@@ -27,6 +30,60 @@ from src.verdi_npi_backend import (
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("flag", "upper", "lower", "expected"),
+    [
+        (None, None, None, (None, None)),
+        ("0", "localhost", None, ("localhost", None)),
+        ("false", "upper.local", "lower.local", ("upper.local", "lower.local")),
+        ("1", None, None,
+         ("srv1.sw.synopsys.com,.updates.synopsys.com",) * 2),
+        ("1", "localhost", None,
+         ("localhost,srv1.sw.synopsys.com,.updates.synopsys.com",) * 2),
+        ("1", None, ".internal",
+         (".internal,srv1.sw.synopsys.com,.updates.synopsys.com",) * 2),
+        ("1", "upper.local", "lower.local",
+         ("upper.local,srv1.sw.synopsys.com,.updates.synopsys.com",
+          "lower.local,srv1.sw.synopsys.com,.updates.synopsys.com")),
+        ("1", "SRV1.SW.SYNOPSYS.COM,.updates.synopsys.com", None,
+         ("SRV1.SW.SYNOPSYS.COM,.updates.synopsys.com",) * 2),
+        ("1", "*", "",
+         ("*,srv1.sw.synopsys.com,.updates.synopsys.com",) * 2),
+    ],
+)
+def test_vendor_direct_is_opt_in_and_applied_before_sdk_import(flag, upper, lower, expected):
+    # Fresh processes exercise the real config default without reloading shared
+    # modules or leaking proxy changes into other tests. No SDK/network is used.
+    environment = dict(os.environ)
+    for key, value in (("TRACEWEAVE_NPI_VENDOR_DIRECT", flag),
+                       ("NO_PROXY", upper), ("no_proxy", lower)):
+        environment.pop(key, None)
+        if value is not None:
+            environment[key] = value
+    result = subprocess.run(
+        [sys.executable, "-c", """
+import json, os
+before = dict(os.environ)
+from src import verdi_npi_backend as npi
+assert dict(os.environ) == before, "module import must not configure proxies"
+observed = []
+def fake_import():
+    observed.append([os.environ.get('NO_PROXY'), os.environ.get('no_proxy')])
+    return None
+npi._import_pynpi = fake_import
+for _ in range(2):
+    assert npi.VerdiNpiBackend()._ensure_loaded('/unused', 'top') is False
+assert observed[0] == observed[1], "repeated configuration must be idempotent"
+assert {k: v for k, v in os.environ.items() if k not in ('NO_PROXY', 'no_proxy')} == {
+    k: v for k, v in before.items() if k not in ('NO_PROXY', 'no_proxy')}
+print(json.dumps({'enabled': npi.NPI_VENDOR_DIRECT, 'observed': observed[0]}))
+"""],
+        cwd=os.path.dirname(os.path.dirname(__file__)), env=environment,
+        capture_output=True, text=True, timeout=20, check=True,
+    )
+    assert json.loads(result.stdout) == {"enabled": flag == "1", "observed": list(expected)}
 
 
 @pytest.mark.parametrize(
@@ -880,25 +937,26 @@ def test_backend_kind_filter_passed_through(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-_CC20_LOG = "/home/robin/Projects/mcp_practise/uvm_demo_cc20/tb/comp.log"
+_NPI_LOG = None
 
 
-def _verdi_available() -> bool:
-    if not os.environ.get("VERDI_HOME"):
-        return False
-    if not os.path.exists(_CC20_LOG):
-        return False
-    try:
-        from src.verdi_npi_backend import _import_pynpi
-        return _import_pynpi() is not None
-    except Exception:
-        return False
+@pytest.fixture
+def real_verdi_runtime():
+    global _NPI_LOG
+    _NPI_LOG = os.environ.get("TW_NPI_COMPILE_LOG")
+    # Collection and ordinary unit regressions must not import the installed
+    # SDK or checkout a license just because a local case happens to exist.
+    if os.environ.get("TRACEWEAVE_RUN_EDA_INTEGRATION") != "1":
+        pytest.skip("set TRACEWEAVE_RUN_EDA_INTEGRATION=1 for real NPI queries")
+    if not os.environ.get("VERDI_HOME") or not os.path.isfile(_NPI_LOG):
+        pytest.fail("explicit real NPI run requires VERDI_HOME and the generated compile log")
+    from src.verdi_npi_backend import _import_pynpi
+    if _import_pynpi() is None:
+        pytest.fail("explicit real NPI run requires an importable pynpi SDK")
 
 
-requires_verdi = pytest.mark.skipif(
-    not _verdi_available(),
-    reason="VERDI_HOME unset, cc20 case missing, or pynpi unimportable",
-)
+def requires_verdi(test):
+    return pytest.mark.eda_integration(pytest.mark.usefixtures("real_verdi_runtime")(test))
 
 
 @requires_verdi
@@ -910,20 +968,20 @@ def test_real_npi_returns_more_loads_than_static_for_clk():
     from src.verdi_backend import probe_verdi_backend
     from src.compile_log_parser import parse_compile_log
 
-    cr = parse_compile_log(_CC20_LOG, "vcs")
-    status = probe_verdi_backend(cr, _CC20_LOG)
+    cr = parse_compile_log(_NPI_LOG, "vcs")
+    status = probe_verdi_backend(cr, _NPI_LOG)
     assert status["kdb_flow"] == "vcs_two_step"
 
     npi_backend = select_backend(status)
     assert npi_backend.name == "verdi_npi"
     npi_r = npi_backend.find_loads(
-        signal_path="top_tb.clk", compile_log=_CC20_LOG, simulator="vcs",
+        signal_path="top_tb.clk", compile_log=_NPI_LOG, simulator="vcs",
     )
     assert npi_r["completeness"] == "exact"
     npi_paths = {ld["load_path"] for ld in npi_r["loads"]}
 
     static_r = StaticConnectivityBackend().find_loads(
-        signal_path="top_tb.clk", compile_log=_CC20_LOG, simulator="vcs",
+        signal_path="top_tb.clk", compile_log=_NPI_LOG, simulator="vcs",
     )
     static_paths = {ld["load_path"] for ld in static_r["loads"]}
 
@@ -1307,25 +1365,33 @@ def test_driver_cancellation_inside_native_callback_resets_and_propagates(
     backend, _, _ = _make_backend_with_mock_npi(
         monkeypatch, netlist_obj=netlist_obj
     )
-    calls = 0
+    event = threading.Event()
+    original_register = netlist_obj.register_cb
+    callback_calls = 0
 
-    def cancel_on_callback():
-        nonlocal calls
-        calls += 1
-        if calls >= 3:
-            raise OperationCancelled("cancelled in callback")
+    def register_cancelling_callback(func_type, callback, data):
+        def cancelling_callback(handle, state):
+            nonlocal callback_calls
+            callback_calls += 1
+            event.set()
+            return callback(handle, state)
+        return original_register(func_type, cancelling_callback, data)
 
-    monkeypatch.setattr("src.verdi_npi_backend.check_cancelled", cancel_on_callback)
+    monkeypatch.setattr(netlist_obj, "register_cb", register_cancelling_callback)
+    token = push_cancel_event(event)
+    try:
+        with pytest.raises(OperationCancelled):
+            backend.find_driver(
+                signal_path="top_tb.dut.q",
+                wave_path="x.fsdb",
+                compile_log=log,
+                recursive=True,
+                simulator="vcs",
+            )
+    finally:
+        pop_cancel_event(token)
 
-    with pytest.raises(OperationCancelled):
-        backend.find_driver(
-            signal_path="top_tb.dut.q",
-            wave_path="x.fsdb",
-            compile_log=log,
-            recursive=True,
-            simulator="vcs",
-        )
-
+    assert callback_calls == 1
     assert net.fan_in_calls == 1
     assert netlist_obj.reset_calls == 1
     assert netlist_obj._fan_in_callback is None
@@ -1346,16 +1412,23 @@ def test_driver_cancellation_while_waiting_for_callback_lock_propagates(
         monkeypatch,
         netlist_obj=_MockNetlist({"top_tb.dut.q": net}),
     )
-    calls = 0
+    event = threading.Event()
 
-    def cancel_after_first_wait():
-        nonlocal calls
-        calls += 1
-        if calls >= 2:
-            raise OperationCancelled("cancelled while waiting")
+    class BusyLock:
+        attempts = 0
 
-    monkeypatch.setattr("src.verdi_npi_backend.check_cancelled", cancel_after_first_wait)
-    npi_module._NPI_FAN_IN_CALLBACK_LOCK.acquire()
+        def acquire(self, *, timeout):
+            assert 0 < timeout <= 0.05
+            self.attempts += 1
+            event.set()
+            return False
+
+        def release(self):
+            pytest.fail("cancelled waiter must not release a lock it never acquired")
+
+    lock = BusyLock()
+    monkeypatch.setattr(npi_module, "_NPI_FAN_IN_CALLBACK_LOCK", lock)
+    token = push_cancel_event(event)
     try:
         with pytest.raises(OperationCancelled):
             backend.find_driver(
@@ -1366,8 +1439,9 @@ def test_driver_cancellation_while_waiting_for_callback_lock_propagates(
                 simulator="vcs",
             )
     finally:
-        npi_module._NPI_FAN_IN_CALLBACK_LOCK.release()
+        pop_cancel_event(token)
 
+    assert lock.attempts == 1
     assert net.fan_in_calls == 0
 
 
@@ -1516,19 +1590,20 @@ def test_real_npi_driver_resolves_clk_initial_block():
     from src.verdi_backend import probe_verdi_backend
     from src.compile_log_parser import parse_compile_log
 
-    cr = parse_compile_log(_CC20_LOG, "vcs")
-    status = probe_verdi_backend(cr, _CC20_LOG)
+    cr = parse_compile_log(_NPI_LOG, "vcs")
+    status = probe_verdi_backend(cr, _NPI_LOG)
     backend = select_backend(status)
     r = backend.find_driver(
         signal_path="top_tb.clk",
         wave_path="x.fsdb",
-        compile_log=_CC20_LOG,
+        compile_log=_NPI_LOG,
         simulator="vcs",
     )
     assert r["backend"] == "verdi_npi"
     assert r["driver_status"] == "resolved"
     assert r["driver_kind"] == "initial"
-    assert r["source_line"] == 53
+    assert r["source_line"] == 13
+    assert r["source_file"].endswith("native_connections.sv")
 
 
 @requires_verdi
@@ -1537,13 +1612,13 @@ def test_real_npi_driver_invert_recognised_as_register():
     from src.verdi_backend import probe_verdi_backend
     from src.compile_log_parser import parse_compile_log
 
-    cr = parse_compile_log(_CC20_LOG, "vcs")
-    status = probe_verdi_backend(cr, _CC20_LOG)
+    cr = parse_compile_log(_NPI_LOG, "vcs")
+    status = probe_verdi_backend(cr, _NPI_LOG)
     backend = select_backend(status)
     r = backend.find_driver(
         signal_path="top_tb.my_dut.invert",
         wave_path="x.fsdb",
-        compile_log=_CC20_LOG,
+        compile_log=_NPI_LOG,
         simulator="vcs",
     )
     assert r["backend"] == "verdi_npi"
@@ -1557,13 +1632,13 @@ def test_real_npi_driver_recursive_uses_fan_in():
     from src.verdi_backend import probe_verdi_backend
     from src.compile_log_parser import parse_compile_log
 
-    cr = parse_compile_log(_CC20_LOG, "vcs")
-    status = probe_verdi_backend(cr, _CC20_LOG)
+    cr = parse_compile_log(_NPI_LOG, "vcs")
+    status = probe_verdi_backend(cr, _NPI_LOG)
     backend = select_backend(status)
     r = backend.find_driver(
         signal_path="top_tb.my_dut.invert",
         wave_path="x.fsdb",
-        compile_log=_CC20_LOG,
+        compile_log=_NPI_LOG,
         simulator="vcs",
         recursive=True,
         max_depth=4,
@@ -1582,12 +1657,12 @@ def test_real_npi_normalizes_synthesized_paths_for_invert():
     from src.verdi_backend import probe_verdi_backend
     from src.compile_log_parser import parse_compile_log
 
-    cr = parse_compile_log(_CC20_LOG, "vcs")
-    status = probe_verdi_backend(cr, _CC20_LOG)
+    cr = parse_compile_log(_NPI_LOG, "vcs")
+    status = probe_verdi_backend(cr, _NPI_LOG)
     backend = select_backend(status)
     r = backend.find_loads(
         signal_path="top_tb.my_dut.invert",
-        compile_log=_CC20_LOG,
+        compile_log=_NPI_LOG,
         simulator="vcs",
     )
     assert r["completeness"] == "exact"

@@ -26,6 +26,10 @@ PHASE2_EVIDENCE = ROOT / "benchmarks/source_graph_connectivity_phase2_results.js
 PHASE2_EVIDENCE_SHA256 = (
     "1b5f76c3862601bb1163d838744c9c03ec7ed62cd1bc5f663ef7008bd0902599"
 )
+# The measured working tree was 8b40dc2; this is the first commit archiving
+# its benchmark script. Historical receipts must not hash a later maintenance
+# version of that script as though it produced the original measurements.
+PHASE2_SCRIPT_ARCHIVE_HEAD = "102f5a6339b399138c795e2cb917a0ef462b3c8d"
 
 
 def _args(*extra: str):
@@ -219,6 +223,43 @@ def test_ast_route_receipt_detects_phase3a_path_without_x_or_wave_lock_change():
     )
 
 
+def test_branch_digest_preserves_inline_body_through_real_dispatch_delegation():
+    body = "    if name == 'explain_signal_driver':\n        return await route(args)\n"
+    inline = "async def _dispatch(name, args):\n" + body
+    delegated = ("async def _dispatch(name, args):\n    return await _dispatch_inner(name, args)\n"
+                 "async def _dispatch_inner(name, args):\n" + body)
+    assert benchmark._dispatch_branch_digest(inline, "explain_signal_driver") == (
+        benchmark._dispatch_branch_digest(delegated, "explain_signal_driver"))
+
+
+@pytest.mark.parametrize("source", [
+    "async def _dispatch(name, args):\n    return None\n",
+    "async def _dispatch(name, args):\n    return None\n"
+    "async def _dispatch_inner(name, args):\n    if name == 'x':\n        return 1\n",
+    "async def _dispatch(name, args):\n    if name == 'x':\n        return 1\n"
+    "    if name == 'x':\n        return 2\n",
+    "async def _dispatch(name, args):\n    return await _dispatch_inner(name, args)\n"
+    "async def _dispatch_inner(name, args):\n    if name == 'x':\n        return 1\n"
+    "async def _dispatch_inner(name, args):\n    if name == 'x':\n        return 2\n",
+    "async def _dispatch(name, args):\n    return await _dispatch_inner('different', {})\n"
+    "async def _dispatch_inner(name, args):\n    if name == 'x':\n        return 1\n",
+    "async def _dispatch(name, args):\n    async def unused():\n        return await _dispatch_inner(name, args)\n"
+    "    return None\nasync def _dispatch_inner(name, args):\n    if name == 'x':\n        return 1\n",
+    "async def _dispatch(name, args):\n    async def unused():\n        if name == 'x':\n            return 1\n"
+    "    return None\n",
+    "async def _dispatch(name, args):\n    _dispatch_inner(name, args)\n    return None\n"
+    "async def _dispatch_inner(name, args):\n    if name == 'x':\n        return 1\n",
+    "async def _dispatch(name, args):\n    return None\n    return await _dispatch_inner(name, args)\n"
+    "async def _dispatch_inner(name, args):\n    if name == 'x':\n        return 1\n",
+    "async def _dispatch(name, args):\n    return None\n    if name == 'x':\n        return 1\n",
+    "async def _dispatch(name, args):\n    if False:\n        if name == 'x':\n            return 1\n"
+    "    return None\n",
+])
+def test_branch_digest_rejects_missing_unreachable_or_ambiguous_owner(source):
+    with pytest.raises(benchmark.BenchmarkError):
+        benchmark._dispatch_branch_digest(source, "x")
+
+
 @pytest.mark.anyio
 async def test_fake_public_phase2_benchmark_covers_routes_performance_and_failures(
     monkeypatch,
@@ -340,11 +381,14 @@ def test_tracked_phase2_evidence_passes_public_production_gate():
     assert result["schema_version"] == "1.0"
     assert result["benchmark"] == "source_graph_connectivity_phase2"
     assert result["repository"]["head"] == ("8b40dc2b7b597f152fe5d0a152d3afe71c8ff05e")
+    assert result["benchmark_script"]["path"] == "scripts/benchmark_source_graph_phase2.py"
+    historical_script = subprocess.check_output(
+        ["git", "show", f"{PHASE2_SCRIPT_ARCHIVE_HEAD}:scripts/benchmark_source_graph_phase2.py"],
+        cwd=ROOT,
+    )
     assert (
         result["benchmark_script"]["sha256"]
-        == hashlib.sha256(
-            (ROOT / result["benchmark_script"]["path"]).read_bytes()
-        ).hexdigest()
+        == hashlib.sha256(historical_script).hexdigest()
     )
     assert result["before_baselines"]["phase1a"]["sha256"] == (
         benchmark.PHASE1A_EVIDENCE_SHA256

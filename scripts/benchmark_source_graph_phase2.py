@@ -699,7 +699,8 @@ async def _dispatch_timed(operation: str, workload: PublicWorkload):
     args = workload.driver_args() if operation == "driver" else workload.load_args()
     wall_started = time.perf_counter_ns()
     cpu_started = time.process_time_ns()
-    result = await server._dispatch(tool, args)
+    # Replay this gate's legacy routing contract; native-first has a separate benchmark.
+    result = await server._dispatch_inner(tool, args)
     wall_ms = (time.perf_counter_ns() - wall_started) / 1_000_000
     cpu_ms = (time.process_time_ns() - cpu_started) / 1_000_000
     return result, wall_ms, cpu_ms
@@ -1153,32 +1154,70 @@ def _git_show(head: str, path: str) -> str:
 
 def _dispatch_branch_digest(source: str, tool_name: str) -> str:
     tree = ast.parse(source)
-    dispatch = next(
-        (
-            node
-            for node in tree.body
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_dispatch"
-        ),
-        None,
-    )
-    if dispatch is None:
-        raise BenchmarkError("server._dispatch AST unavailable")
-    for node in ast.walk(dispatch):
-        if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
-            continue
-        comparison = node.test
-        if (
-            isinstance(comparison.left, ast.Name)
-            and comparison.left.id == "name"
-            and len(comparison.comparators) == 1
-            and isinstance(comparison.comparators[0], ast.Constant)
-            and comparison.comparators[0].value == tool_name
-        ):
-            normalized = ast.dump(
-                ast.Module(body=node.body, type_ignores=[]),
-                include_attributes=False,
-            )
-            return hashlib.sha256(normalized.encode()).hexdigest()
+    def owner(name):
+        matches = [node for node in tree.body
+                   if isinstance(node, ast.AsyncFunctionDef) and node.name == name]
+        if len(matches) != 1:
+            raise BenchmarkError(f"server.{name} AST unavailable or ambiguous")
+        return matches[0]
+
+    def branches(dispatch):
+        matches = []
+        def own_nodes(node):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                return
+            yield node
+            if isinstance(node, ast.If) and isinstance(node.test, ast.Constant) and isinstance(node.test.value, bool):
+                for child in node.body if node.test.value else node.orelse:
+                    yield from own_nodes(child)
+                return
+            for child in ast.iter_child_nodes(node):
+                yield from own_nodes(child)
+        def owner_body():
+            for statement in dispatch.body:
+                yield from own_nodes(statement)
+                if isinstance(statement, (ast.Return, ast.Raise)):
+                    break
+        for node in owner_body():
+            if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+                continue
+            comparison = node.test
+            if (
+                isinstance(comparison.left, ast.Name)
+                and comparison.left.id == "name"
+                and len(comparison.ops) == 1
+                and isinstance(comparison.ops[0], ast.Eq)
+                and len(comparison.comparators) == 1
+                and isinstance(comparison.comparators[0], ast.Constant)
+                and comparison.comparators[0].value == tool_name
+            ):
+                matches.append(node)
+        return matches
+
+    dispatch = owner("_dispatch")
+    matches = branches(dispatch)
+    # Preserve the historical inline digest. New servers keep the same branch
+    # bodies behind a real wrapper delegation; do not accept an unrelated helper.
+    # The first unconditional return must actually forward these arguments.
+    # Calls in unused nested functions, expressions or dead later returns do
+    # not establish a dispatch delegation.
+    forwarding_return = next((node for node in dispatch.body if isinstance(node, (ast.Return, ast.Raise))), None)
+    value = forwarding_return.value if isinstance(forwarding_return, ast.Return) else None
+    call = value.value if isinstance(value, ast.Await) else None
+    delegates = (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                 and call.func.id == "_dispatch_inner" and not call.keywords
+                 and len(call.args) == 2 and all(isinstance(arg, ast.Name) and arg.id == expected
+                                                for arg, expected in zip(call.args, ("name", "args"))))
+    if not matches and delegates:
+        matches = branches(owner("_dispatch_inner"))
+    if len(matches) > 1:
+        raise BenchmarkError(f"dispatch branch ambiguous: {tool_name}")
+    if matches:
+        normalized = ast.dump(
+            ast.Module(body=matches[0].body, type_ignores=[]),
+            include_attributes=False,
+        )
+        return hashlib.sha256(normalized.encode()).hexdigest()
     raise BenchmarkError(f"dispatch branch unavailable: {tool_name}")
 
 

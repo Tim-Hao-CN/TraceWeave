@@ -1,6 +1,6 @@
 # SV / Verilog 表达式查询
 
-更新：2026-09-23。复用现有 MCP 工具，不新增表达式工具或持久化虚拟信号。
+现有 MCP 波形工具支持 SV / Verilog 表达式查询，不创建持久化虚拟信号。
 普通字符串仍表示实际信号路径；公式必须放在显式 `expr` 对象中。
 
 ## 直接运行客户端示例
@@ -20,8 +20,7 @@
 四个工具的主说明和 `inputSchema.examples` 提供同一组完整参数，来自
 `src/expression_examples.py`。将示例 `wave_path` 替换为上述 VCD 的绝对路径即可调用。
 脚本输出实际参数和检查结果。第四拍 X 是波形中实际的未知下标；该例的
-`coverage_status=complete`，展示覆盖完整不等于值已知。这里验证客户端通路，
-不代表 AI Agent 的自主使用效果。
+`coverage_status=complete`，覆盖完整不等于值已知。
 
 ## 点查询与周期查询
 
@@ -53,6 +52,11 @@ b 改为 4 后得到 5。返回 `expressions` receipt，记录推导类型、真
 没有结束时间时默认读取 16 拍，有结束时间且省略拍数时读取窗口内最多 256 拍。
 读取 `effective_num_cycles` / `capped`：`capped=true` 表示没有返回整个请求范围，
 用最后一行的 `cycle + 1` 作为下一次 `start_cycle` 继续查询。
+
+以上为默认 `cycle_index_origin: "global"` 的全局编号。若只关心局部时间窗，
+可用 `cycle_index_origin: "window"` 配合 `start_time_ps`，在有界窗口内从 0 编号，
+无需读取全部时钟历史。读取 `local_coverage`；遇到时钟未知、记录缺口或预算上限
+时只返回可信前缀。局部编号不能作为全局 `start_cycle` 续查，下一窗口须重新指定时间。
 
 `sample_phase` 默认 `after`，在边沿后 `sample_offset_ps`（默认 1ps）读取。
 需要该沿采纳的输入时，指定 `sample_phase: "before"`，省略偏移或设为 0：
@@ -223,6 +227,15 @@ part-select 宽度、复制次数、streaming slice size 必须是合法常量�
 保留模板、vacuous 和窗口末端不确定性。未知后件会记为 inconclusive；
 不能用 partial coverage 下的 `holds=true` 排除问题。
 
+窗口工具默认仍为每沿检查、沿后 1ps 采样。可显式设置 `sample_phase="before"`，
+此时默认偏移为 0，且只允许零偏移；读取严格物理沿前的值，不包含同时间戳更新。
+这不自动证明与所有 SVA 调度区等价。`sample_offset_ps` 可调整沿后偏移。
+implication 可用 `response_min_cycles` / `response_max_cycles` 指定相对单拍前件端点的
+闭区间，两者相等表示精确延迟；须成对提供，不能与显式 `within_cycles` / `overlap`
+混用。`attempt_start_indices` 选择当前采样序列中最多 4,096 个不同的零起始边沿索引；
+其余边沿仍可作为响应证据，越界索引拒绝执行。省略时维持每沿检查。
+新增范围上界为 1,000,000 拍；结果回传实际范围、采样设置和 `attempts_evaluated`。
+
 协议工具维持原采样相位（事务/TL-UL 为严格边沿前），不把派生数据归给一个虚构驱动。
 违规使用 `violating_expression` / `expression_key` 并列出真实依赖后续动作。
 clock/valid/ready/reset 要求一 bit，`valid_htrans` 要求两 bit。
@@ -242,7 +255,7 @@ clock/valid/ready/reset 要求一 bit，`valid_htrans` 要求两 bit。
 选中数据不同会记 `selected_dependency_changed`，索引差异会记 `index_difference`。
 NPI 缺少确定运算/类型/顺序事实时整条重启到 Slang，不混合后端来源。
 
-初始上限：表达式文本 16,384 字符，256 节点、32 层、结果 4,096 bit；
+资源上限：表达式文本 16,384 字符，256 节点、32 层、结果 4,096 bit；
 类型最多 8 个维度，每个稀疏映射最多 128 个元素，每请求最多 128 个表达式。
 事件读取另受 262,144 事件 / 64 MiB 预算、工具采样和位数预算限制，支持取消。
 每个 receipt 最多保留 128 次观察及有界位数证据；超限会明确标记。
@@ -259,12 +272,12 @@ MCP `isError=false` 判定求值成功。表达式错误保留 `error`，并增�
 以及 `recovery: {action,message}`。`position` 是表达式文本的零起始字符偏移。
 MCP 层直接拒绝不符合 inputSchema 的参数时，请先按该 schema 修正；请求尚未进入求值器。
 
-周期查询的负 `sample_offset_ps` 和定位轴冲突会返回
+周期查询的负 `sample_offset_ps`、定位轴冲突，以及沿前模式的非零偏移会返回
 `error_code="invalid_cycle_arguments"`、`issues` 清单和字符串 `recovery`，
 且 `sampling_executed=false`。一次修正清单中所有问题：起点选择
-`start_cycle` 或 `start_time_ps`，范围选择 `num_cycles` 或 `end_time_ps`。
-沿后采样默认偏移为 1 ps；沿前值用所需沿前时间的点查询读取，不应把沿后值
-当作该沿接受的输入。
+`start_cycle` 或 `start_time_ps`；`end_time_ps` 可与 `num_cycles` 同时使用，后者限制
+窗口内返回的拍数。沿后采样默认偏移为 1 ps；读取该沿接受的输入时使用
+`sample_phase: "before"`，省略 `sample_offset_ps` 或设为 0，排除同一物理时间戳的更新。
 
 | error_code | 客户端下一步 |
 |---|---|

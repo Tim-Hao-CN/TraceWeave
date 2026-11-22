@@ -5,7 +5,7 @@ Auto-build a Verdi KDB from the compile_result of an Xcelium / VCS log.
 For Xcelium flows there is no KDB by default, so the NPI backend cannot
 answer driver/load queries. TraceWeave can run::
 
-    vericom -sv -kdb [+define+...] [+incdir+...] [-ntb_opts uvm] <files> -top T
+    vericom -sv -assert svaext -kdb [+define+...] [+incdir+...] [-ntb_opts uvm] <files> -top T
     elabcom -lib work.lib++ -elab kdb -top T
 
 itself, using the file list and defines parsed from the user's compile
@@ -60,6 +60,9 @@ from .sv_preprocessor import extract_preprocessor_options
 
 _KDB_ELAB_DIRNAME = "kdb.elab++"
 _WORK_LIB_DIRNAME = "work.lib++"
+# -sv alone selects IEEE 1800-2005 in the standalone frontend. Preserve
+# modern assertion syntax (e.g. s_eventually) without changing source macros.
+_VERICOM_FRONTEND_ARGS = ("-sv", "-assert", "svaext", "-kdb")
 
 
 class KdbBuildError(RuntimeError):
@@ -264,6 +267,7 @@ def _extract_build_inputs(
     compile_result: dict[str, Any],
     *,
     top_hint: str | None,
+    source_reader=None,
 ) -> dict[str, Any]:
     records = _compilation_unit_records(compile_result)
     # files.user is a browsing inventory: it also contains class/header and
@@ -339,7 +343,9 @@ def _extract_build_inputs(
     dependencies = list(dict.fromkeys(dependencies))
 
     h = hashlib.sha256()
-    h.update(b"traceweave-kdb-inputs-v2\0")
+    h.update(b"traceweave-kdb-inputs-v3\0")
+    h.update(json.dumps(_VERICOM_FRONTEND_ARGS).encode())
+    h.update(b"\0")
     h.update(json.dumps(ordered_files, ensure_ascii=True).encode())
     h.update(b"\0")
     h.update(top.encode())
@@ -350,14 +356,22 @@ def _extract_build_inputs(
         h.update(b"\0")
         try:
             before = os.stat(f)
-            with open(f, "rb") as stream:
-                while block := stream.read(1024 * 1024):
-                    check_cancelled()
-                    h.update(block)
+            if source_reader is not None:
+                # Independent context discovery supplies a bounded call-local
+                # capture. The normal builder retains its streaming behavior.
+                h.update(source_reader(f))
+            else:
+                with open(f, "rb") as stream:
+                    while block := stream.read(1024 * 1024):
+                        check_cancelled()
+                        h.update(block)
             after = os.stat(f)
             if (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
                 after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
             ):
+                if source_reader is not None:
+                    from .compile_input_capture import CaptureAborted
+                    raise CaptureAborted("input_changed")
                 return {"error": "Compile inputs changed during KDB identity validation; retry with stable inputs."}
         except OSError:
             return {"error": f"KDB compile dependency is unavailable: {f}"}
@@ -463,7 +477,7 @@ def _needs_uvm(compile_command: str, files: list[str]) -> bool:
 
 
 def _vericom_cmd(vericom_bin: str, inputs: dict[str, Any]) -> list[str]:
-    cmd = [vericom_bin, "-sv", "-kdb"]
+    cmd = [vericom_bin, *_VERICOM_FRONTEND_ARGS]
     if inputs["needs_uvm"] and not inputs.get("explicit_uvm_package"):
         cmd += ["-ntb_opts", "uvm"]
     for d in inputs["defines"]:
@@ -542,7 +556,7 @@ def _write_build_script(
     verdi_home: str,
     inputs: dict[str, Any],
 ) -> Path:
-    vericom_args = ["-sv", "-kdb"]
+    vericom_args = list(_VERICOM_FRONTEND_ARGS)
     if inputs["needs_uvm"] and not inputs.get("explicit_uvm_package"):
         vericom_args += ["-ntb_opts", "uvm"]
     for d in inputs["defines"]:

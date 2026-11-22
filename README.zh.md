@@ -22,7 +22,7 @@
   <a href="https://github.com/gokeshenzhen/TraceWeave/stargazers"><img src="https://img.shields.io/github/stars/gokeshenzhen/TraceWeave?style=for-the-badge" alt="Stars"></a>
 </p>
 
-TraceWeave 是面向 RTL / SoC 调试的 MCP 服务器。它把编译记录、仿真日志、VCD/FSDB 波形和 RTL 源码接入 AI 助手，帮助你从“仿真失败了”逐步定位到异常时刻、相关信号和驱动逻辑。
+TraceWeave 是面向 RTL / SoC 调试的 MCP 服务器。它把编译记录、仿真日志、VCD/FSDB/FST 波形和 RTL 源码接入 AI 助手，帮助你从“仿真失败了”逐步定位到异常时刻、相关信号和驱动逻辑。
 
 支持 Claude Code、Codex、Copilot 等 MCP 客户端。你用自然语言描述问题，助手通过工具查证、追踪和验证，返回可以复查的调试证据。
 
@@ -46,46 +46,7 @@ TraceWeave 是面向 RTL / SoC 调试的 MCP 服务器。它把编译记录、�
 
 支持 VCS / Xcelium / Verilator 仿真日志及 VCD / FSDB / FST 波形。已有 formal 导出波形同样可查询；当前支持自动发现 JasperGold 产物。
 
-Linux 上可选启用 FST，支持文件发现、基础读取、固定 bit 选择、表达式、周期采样、协议与事务分析、跨格式比较及 X 历史。摘要列出当前已验收的工具。
-
-信号追踪（驱动、负载与连通路径查询）默认采用 **Verdi NPI → Source Graph → 基础静态分析（Legacy Static）** 三级路由：优先查询已展开的 KDB；NPI 不可用或无法提供可信结果时，尝试免商业 license 的 Source Graph，必要时再按支持范围回退到基础静态分析。
-
-Source Graph 分别统计独立结构驱动和赋值语句，保留限额内的全部分支证据；
-`traversal` 分别报告驱动、赋值检查和证据保留限额。结构驱动重叠不等于波形中
-已经发生值冲突。
-逐位来源明确区分 `found`、`proved_no_driver` 和 `unknown`，并给出原因及
-`driver_set_complete`。预算或未建模写入不能证明无驱动。Source Graph 尚无结论、
-Static 也不支持时，保留 Source Graph 的有限检查证据和完整后端尝试记录。
-驱动链和逐位来源按同一驱动的相同元信息分组，`statement_evidence` 保留全部源码行列；
-旧 `source_line` 对应首条证据。`query_instance_path` 指明查询实例，
-`resolved_instance_path` 保持首个驱动所在实例的兼容含义。VCD 搜索会说明
-`direction=null` 表示元数据不可用。
-
-**驱动输出迁移：** `explain_signal_driver` 现在默认返回
-`traceweave.driver.compact.v1`。单次响应保留全部已保留证据，在响应内的
-typed `evidence_tables` 共享相同语义及有序位置、索引序列。旧脚本可以显式传
-`output_format="full"` 保留原 JSON 形状和缩进，或先解码：
-
-```python
-from src.evidence_output import expand_compact_result
-driver = expand_compact_result(text_content.text)
-print(driver["driver_chain"])
-```
-
-只读取 `response["result"]` 尚未展开引用。表项数、位置出现次数不是 writer 数。
-其他工具默认与 `traceweave.compact.v1` 保持不变。不同证据仍可能很大，不能据此
-保证任意客户端都不转储文件。
-
-层次 handle 仅在服务器进程内有效。驱动查询的显式 `compile_context` 可对丢失的
-handle 尝试一次恢复，受 30 秒、4,096 个源文件和 128 MiB 读取预算约束（已有更严格
-的层次配置优先）。`hierarchy_recovery` 报告复用、重建或阻塞原因。恢复重新校验
-调用方身份；没有历史源码指纹时只建立当前源码上下文，结构扫描仍需单独执行。
-
-面向大型设计的能力与已验证的部分规模：
-
-- **层次与源码按需浏览**：服务端建立并保留层次和文件索引，助手按实例、子树或文件获取局部结果，减少大型 SoC 的上下文开销。已用 **50,500 个逻辑实例**的合成设计验证层次构建与局部查询；初次构建仍需扫描编译记录和源码。
-- **批量握手检查**：`sweep_handshakes` 自动发现 AHB / valid-ready 接口，检查停顿、数据/控制保持和 valid/HTRANS 提前撤销等行为。已有 **78,817 个总信号、2.59 ms 波形时长**的设计记录：发现 49 个候选接口，涉及 262 个时钟/协议信号，约 **4.65 分钟**检查了 35 个接口；另有 14 个跳过，属于部分覆盖。实际耗时和覆盖范围取决于波形、接口类型与资源限制。
-- **GiB 级日志解析**：`parse_sim_log` 已通过 **1 GiB、2,097,152 行**合成日志验证，识别了分布在文件开头、中间和末尾的全部 4 条报错。
+信号追踪按 **Verdi NPI → Source Graph → 基础静态分析** 路由，结合可用工具与查询覆盖范围，从波形追到驱动逻辑。Source Graph 提供免商业 license 的语义源码分析；结果保留源码位置、覆盖缺口和后续调查方向，方便你核实证据，再判断根因。
 
 ## 安装
 
@@ -122,15 +83,16 @@ traceweave-mcp --doctor
 
 如果只需要日志、VCD 和基础静态分析，可安装 `traceweave-mcp`，省略 `[source-graph]`。PyPI 包不包含 FSDB 读取组件；需要 FSDB 时请选择仓库安装。
 
-### 可选 FST 读取
+### 可选 FST 支持
 
-在 MCP 服务使用的 Python 环境安装：`python3.11 -m pip install "traceweave-mcp[fst]"`。仓库安装则使用 `.venv/bin/python -m pip install "pylibfst==0.2.1"`。重新连接服务后，通过 `traceweave-mcp --doctor` 或 `get_sim_paths` 检查依赖状态。已有 VCD/FSDB 用户无需安装此依赖。
+**仅仓库版可用。** 仓库在 PyPI 2.0.2 发布后才加入 FST 读取器和 `fst` 可选依赖。在 Linux 上，从仓库根目录使用服务端的 Python 环境安装依赖并检查状态。
 
-例如：“找到 `/path/to/run` 下的 FST 波形，查看摘要，搜索 `top.data`，读取 10 ns 到 20 ns 的跳变。”基础工具保留 X/Z，并区分缺失记录区间与实际观测值。当前不支持非零时间偏移、real/string 信号、外置层级文件和整文件 gzip 容器。索引、原生内存、结果量或时间超过限制时会明确停止；可缩小查询或使用更小的 dump。详见 [FST 能力与资源限制](docs/architecture.md#fst-basic-reading)。
+```bash
+.venv/bin/python -m pip install "pylibfst==0.2.1"
+.venv/bin/python -m traceweave_mcp --doctor
+```
 
-可继续使用相同工具检查 FST 握手、重建事务、与 VCD/FSDB 信号比较，或在输入恢复后
-回溯先前传播的 X。源码分析仍需提供相应编译上下文；记录缺口和不完整时钟历史只作为
-部分证据，不能据此排除问题。
+重新连接 MCP 服务器后，用 `get_waveform_summary` 打开一个小的 `.fst` 文件。返回的 `fst_backend.version` 是实际加载的读取器版本。详见 [FST 支持范围](docs/architecture.md#fst-basic-reading)。
 
 ## 客户端配置
 
@@ -151,6 +113,12 @@ traceweave-mcp --doctor
 | 仓库安装 | `<仓库绝对路径>/.venv/bin/python` | `["<仓库绝对路径>/server.py"]` |
 | PyPI 安装 | `traceweave-mcp`，或该命令的绝对路径 | `[]` |
 
+若代理拖慢 NPI SDK 初始化，且厂商服务可直连，可在 MCP 服务环境中设置
+`TRACEWEAVE_NPI_VENDOR_DIRECT=1` 后重新连接。默认关闭，启动命令不变；首次导入 SDK 前，
+仅在当前进程的 `NO_PROXY`/`no_proxy` 中追加 `srv1.sw.synopsys.com` 和
+`.updates.synopsys.com`，保留已有条目。不修改代理配置，也不关闭 SDK 通信或重试；
+离线环境不保证受益。LSF 模式需确保执行节点的 worker 环境也获得该开关。
+
 ### 仅执行节点可用的 NPI License
 
 如果 Verdi/NPI license 只能在 LSF 执行节点使用，让 MCP 服务进程获得以下设置，将 `digital` 换成你的队列：
@@ -164,368 +132,157 @@ export TRACEWEAVE_NPI_LSF_QUEUE="digital"
 
 ## 开始调试
 
-连接客户端后，可以直接这样提问，把路径换成你的工程目录：
+连接助手后，替换工程路径，直接描述问题：
 
-> 请用 TraceWeave 分析 `/path/to/verif` 下 `my_case` 的仿真失败。先查看日志、设计结构和接口握手，再追踪可疑信号；结论请附上时间点、信号和源码依据。
+> 用 TraceWeave 调查 `/path/to/verif` 下 `my_case` 的仿真失败。检查日志、设计结构和接口握手，再追踪可疑信号。结论请附时间戳、信号路径和源码位置。
 
-也可以从一个具体问题开始：
+调查先定位当前运行产物，扫描结构风险并解析失败日志。助手根据失败阶段和已知目标选择工具顺序与范围：已知信号或接口可直接定点检查；目标不明确的超时、挂起或比较失败可选择局部或全局握手扫描。未执行 sweep 表示协议行为未检查，不阻塞推荐或其他调查；需要完整层次时仍可显式构建。
 
-> 比较这两份波形中 `tb.dut.result` 的差异，并追踪两侧产生差异的逻辑。
+结构扫描默认开启（`TRACEWEAVE_STRUCTURAL_SCAN_IN_WORKFLOW=1`）。如需在默认流程中跳过，
+在 MCP 服务环境中设置 `TRACEWEAVE_STRUCTURAL_SCAN_IN_WORKFLOW=0`，然后重启或重新连接服务。
+仍可明确要求调用 `scan_structural_risks`；跳过代表未检查。握手扫描和单次扫描模式不受影响。
 
-> 用 deep 模式扫描这份编译日志对应的设计，检查可疑的 tie 值、悬空输入和常量比较条件。
+检查位级多驱和无驱时，向 `scan_structural_risks` 显式传入
+`semantic_categories=["multiple_driver", "undriven_signal"]`，可用
+`semantic_scope="tb.dut.u_block"` 选择关注范围。NPI 和 Slang 均支持：`auto`
+优先使用现成 KDB，否则仅复用兼容源码结果；`deep` 还允许构建 Slang 语义。
+类别列表替换默认选择。结果描述静态驱动来源，以及有消费者的位上已证明为空的驱动清单，
+不判定运行时冲突。零发现须结合覆盖状态和缺口解读，边界见
+[位级驱动检查](docs/architecture.md#bit-level-driver-checks)。
 
-助手的默认调查流程是：
+也可以从具体问题开始：
 
-1. **找到本次运行的产物**：发现编译日志、仿真日志与波形。
-2. **建立设计上下文**：使用同一份编译日志，并行构建层次与扫描结构风险。
-3. **缩小问题范围**：解析失败；对于有波形的失败运行，扫描握手异常。
-4. **追踪并验证**：查看相关信号、驱动和消费者，用时间窗或周期检查验证假设。
-5. **对比修复结果**：比较下一次运行的失败记录和波形变化。
+- **定位差异：**“比较这两份波形中的 `tb.dut.result`，分别追踪造成差异的数据与控制逻辑。”
+- **追查 X：**“`tb.dut.q` 在 36 ns 为 X，但输入已恢复已知值。回看 0～36 ns 的采样和保持历史。”
+- **检查事务：**“检查这个 TL-UL 接口在 10～20 μs 内的停顿、响应延迟和未完成请求。”
+- **扫描源码：**“用 deep 模式检查这份编译日志对应设计中的可疑 tie、悬空输入和常量比较。”
+- **验证假设：**“在每个时钟沿前采样，检查等待 ready 时 payload 是否保持稳定。”
 
-首次连接时，可先要求助手调用 `get_sim_paths`，确认客户端能够执行真实的 MCP 工具调用。完整流程见[调试工作流](docs/workflow.md)。
+还可以计算 [SV 表达式](docs/expressions.md)、按字段查看打包总线，以及比较修复前后的失败。结果会说明覆盖限制：检查不完整时，零发现不能证明设计正确。
 
-仓库安装可运行 `.venv/bin/python scripts/check_waveform_readback.py --work-dir /tmp/traceweave-readback-check`
-做无需 EDA license 的读值自检。它通过 MCP 检查服务端工具列表和实际点／批量读值，
-并输出供独立 AI 客户端会话执行的明确请求。服务端检查不会把客户端可见性或模型采用率
-标记为已证实，详见[读值客户端自检](docs/architecture.md#readback-client-check)。
+首次连接可让助手调用 `get_sim_paths`，确认实际 MCP 调用成功。完整步骤见[调试工作流](docs/workflow.md)，仓库端读取验收见[读值检查](docs/architecture.md#readback-client-check)。
 
-### 定位波形差异与 X/Z 来源
+### 自定义运行日志
 
-两次仿真结果不一致时，TraceWeave 可比较指定信号，找到时间窗口内最早能确认的差异，并沿两侧驱动追踪相关的数据、控制和 RTL 逻辑。
-
-对于 X/Z，既可以查看异常时刻的传播路径，也可以回看历史，检查寄存器是否曾采入未知值，随后一直保持。即使当前输入已经正常，也能继续调查之前发生的异常：
-
-> `tb.dut.q` 在 36 ns 时为 X，但输入已经正常。请回看 0～36 ns 的波形，检查此前的采样与保持情况，并追踪可疑来源。
-
-结果会列出有证据支持的关系和仍需核查的环节。历史记录不足或遇到暂不支持的结构时，会说明停止原因，不把“首次看到异常”直接当成“真实首次产生异常”。
-
-工具参数与详细支持范围见[波形差异分析](docs/architecture.md#divergence-evidence-and-backtrace)和 [X/Z 历史追踪](docs/architecture.md#bounded-x-history)。
-
-### 计算 SV 表达式
-
-现有波形工具支持显式 `{ "expr": "a[b] + c", ... }` 输入，按 SV 优先级、位宽、signed 和四态规则求值，每次观察都会重新采样下标。点、周期、变化窗口、条件、握手、事务、TL-UL 及 RTL 自动回溯共用计算核心，无需新增 MCP 工具。
-
-使用精确 `bindings` 和显式 `types`，或选择 `typing: "wave_bits"`，将实际 dump 向量作为 unsigned 四态数据读取。固定数组使用有界元素映射；计算公式不会替换输出信号的实际记录值。详见[表达式输入、示例与限制](docs/expressions.md)。
-
-### 按字段查看总线，检查 TL-UL 接口
-
-当地址、数据和控制信息打包在同一条总线中时，TraceWeave 可依据与波形匹配的源码类型识别字段位置，让助手按字段查看变化，减少手工查位宽、算偏移的工作。无法自动识别时，也支持提供字段与位段的对应关系。
-
-对于 TL-UL 接口，助手确认字段对应关系和时钟后，可检查指定时间范围内的握手停顿、请求与响应的对应关系、响应延迟，以及尚未完成的请求：
-
-> 检查 `tb.dut` 的 TL-UL 接口在 10～20 μs 内是否有握手停顿或未完成的请求，并列出对应的时间和信号。
-
-结果会说明实际检查的项目和缺失信息。窗口内尚未完成的请求不直接判为死锁，这些检查也不替代完整的 TL-UL 协议验证。
-
-调试对话较长时，可以要求助手使用紧凑证据输出。重复的字段映射只展示一份，实际检查范围、缺失证据、时间边界和下一步仍会保留。这些波形工具默认保持原有输出；驱动工具按上文迁移。示例及客户端接入方式见[紧凑证据输出](docs/architecture.md#compact-evidence-output)。
-
-字段配置与详细支持范围见[总线字段与 TL-UL 使用说明](docs/architecture.md#packed-waveform-selections-and-tl-ul)。
-
-### 自定义运行期报错格式
-
-### Verilator 运行日志
-
-`parse_sim_log(log_path=..., simulator="verilator")` 支持原生 assertion、
-`$error` / `$fatal` / `$stop`，带有界 Python traceback 的 cocotb test failed，
-X-HEEP `example_dma` 数据比较及软件退出值，以及 OpenTitan 软件比较和状态失败。
-编译 warning/error、`ERROR:cocotb:` 外层级别、源码回显、正常 `$finish` 和软件退出 0
-不会计作运行失败。其他自定义 TB 文本需要明确配置 custom patterns。
-
-裸原生时间默认保持 `time_ps=None`。只有独立核实 TB/context 后才传
-`native_time_unit="ps"`（也支持 fs/ns/us/ms/s），它只换算原生/custom/UVM 的裸仿真时间；
-日志显式单位优先。换算使用精确十进制，亚 ps 向上取整到公开整数 ps。
-周期数、UART 行和宿主墙钟不获得波形时间。可选 TraceWeave 验收观察器只给软件退出或
-终止锚点，不代表首个错误 RTL 交易；源码位置是检测点，不能直接作为根因。
-分析和 snapshot/log diff 必须使用同一已核实单位；不同单位设置的快照拒绝比较。
-未知时间仍返回日志上下文，不自动查询 0ps。
-
-Verilator 发现使用有界日志头尾采样，支持延后的 cocotb banner。
-层次和结构分析需要真实 HDL 命令（`verilator --cc/--xml-only ...`）、显式
-`--top-module`、执行 cwd（如 Make entering-directory 行）及可读的有序 `-f`/`-F`
-输入。include、define 和 top 参数覆盖接入既有 Source Graph frontend；C++ 和 `.vlt`
-控制文件不混入 HDL。waiver/trace/优化控制作为支持输入纳入指纹，未建模控制保留明确
-覆盖缺口。缺少 HDL 命令、filelist 或 top 时不猜测；纯 C++ 构建日志不能代替 HDL
-上下文，不自动恢复无关侧车或遍历 vendor 全树。
-
-先 `get_sim_paths`，再对同一 compile log 并行执行 `build_tb_hierarchy` 与
-`scan_structural_risks`，然后解析/分析运行日志。失败有波形时执行 `sweep_handshakes`；
-zero/partial coverage 不能排除 OBI 故障。源码查询使用实际 HDL top 路径；波形中的
-Verilator 合成 `TOP.` 前缀不是 HDL instance，只在确认后续段等于编译 top 后移除。
-Static/Source Graph 仍保留有界覆盖，不引入 Verilator NPI/KDB 后端。
-
-`parse_sim_log` 已内置标准 `UVM_ERROR` / `UVM_FATAL` 和 VCS / Xcelium 断言失败的解析，并提供通用 `ERROR` 匹配。对于项目自定义的 checker、scoreboard 或 `$display` 输出，可以在 [custom_patterns.yaml](custom_patterns.yaml) 中添加 Python 正则表达式，无需修改 Python 代码。日志不必包含 `UVM_ERROR`，甚至不必包含 `ERROR`。
-
-如果日志使用同一个标签，后面的内容每次不同，只匹配标签就够了：
-
-```text
-MY_CHECK_FAIL @ 12.5 ns expected=0x12 actual=0x34
-MY_CHECK_FAIL @ 20 ns timeout waiting for response
-```
-
-将默认的 `patterns: []` 替换为以下内容；如果已有规则，在原来的 `patterns` 列表中追加即可：
-
-```yaml
-patterns:
-  - name: my_checker
-    severity: ERROR
-    regex: '^MY_CHECK_FAIL'
-```
-
-`^` 表示行首；标签之后可以是不同的内容，无需继续写正则。如果标签前面还有时间戳或其他前缀，改用 `regex: 'MY_CHECK_FAIL'` 即可在整行中查找标签。
-- `name` 标识失败分组。`severity` 默认为 `ERROR`，也支持 `FATAL` 和 `WARNING`；匹配到的自定义 warning 也会计入运行期失败统计。`description` 是供维护者阅读的说明。
-- `regex` 逐行匹配，建议用 YAML 单引号保留反斜杠。解析顺序是内置断言和 UVM 格式、自定义规则、通用 `ERROR` 匹配；自定义规则按列表顺序取第一条命中。已识别为编译或展开诊断的记录仍会被过滤。
-
-上面的 `expected=0x12 actual=0x34` 已经能自动识别，用简单的标签规则就够了，无需命名捕获组。如果日志改用自己的字段名：
-
-```text
-MY_CHECK_FAIL @ 12.5 ns want=0x12 have=0x34
-```
-
-`regex: '^MY_CHECK_FAIL'` 仍能识别报错并保留整行消息。如果还希望把 `want` 和 `have` 的值单独提取为期望值和实际值，将上面规则中的 `regex` 替换为：
-
-```yaml
-regex: '^MY_CHECK_FAIL.*want=(?P<expected>\S+)\s+have=(?P<actual>\S+)'
-```
-
-仓库安装默认读取根目录的 `custom_patterns.yaml`。如果希望单独维护项目规则，或使用 PyPI 安装，将上面的 YAML 保存为自己的配置文件，并向 MCP 服务进程传入其绝对路径：
-
-```bash
-export TRACEWEAVE_CUSTOM_PATTERNS_FILE="/absolute/path/to/custom_patterns.yaml"
-```
-
-该设置会替换默认的自定义规则文件，内置格式继续生效。客户端需要继承或显式传入这个变量；更改变量后重启或重新连接服务，再解析日志。只修改已选中的 YAML 内容时，下次调用 `parse_sim_log` 就会重新加载。
+内置解析支持 UVM、VCS/Xcelium 断言，以及已支持的 Verilator/cocotb 失败格式。项目自定义 checker 标签可通过 [custom_patterns.yaml](custom_patterns.yaml) 添加，也可用 `TRACEWEAVE_CUSTOM_PATTERNS_FILE` 指定独立文件。配置示例与 Verilator 时间单位要求见[日志格式说明](docs/architecture.md#runtime-log-formats)。
 
 ## 工具速查
 
-通常只需描述调试目标，由助手选择工具。下表按用途列出全部工具；具体参数由 MCP 工具定义提供。
+通常只需描述调试目标，由助手选择工具。下表列出全部工具；具体参数与支持范围以 MCP 工具定义为准。
 
-<table>
-  <thead>
-    <tr>
-      <th>类别</th>
-      <th>工具名</th>
-      <th>说明</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td rowspan="3">会话与产物</td>
-      <td><code>get_sim_paths</code></td>
-      <td>发现仿真 case、编译日志、运行日志与波形</td>
-    </tr>
-    <tr>
-      <td><code>get_formal_paths</code></td>
-      <td>发现 formal 工程、日志及导出的波形，当前支持 JasperGold</td>
-    </tr>
-    <tr>
-      <td><code>get_diagnostic_snapshot</code></td>
-      <td>查看当前已收集的调试信息与待完成步骤</td>
-    </tr>
-    <tr>
-      <td rowspan="7">层次与源码</td>
-      <td><code>build_tb_hierarchy</code></td>
-      <td>根据编译记录建立 RTL / testbench 层次视图</td>
-    </tr>
-    <tr>
-      <td><code>get_tb_subtree</code></td>
-      <td>查看指定实例的局部层次</td>
-    </tr>
-    <tr>
-      <td><code>find_tb_instance</code></td>
-      <td>按路径或模块名查找实例</td>
-    </tr>
-    <tr>
-      <td><code>lookup_tb_files</code></td>
-      <td>在实际编译文件集中查找源码</td>
-    </tr>
-    <tr>
-      <td><code>get_tb_file_detail</code></td>
-      <td>查看源码文件定义的模块、接口和类</td>
-    </tr>
-    <tr>
-      <td><code>get_tb_class_hierarchy</code></td>
-      <td>查看 UVM / SystemVerilog 类继承关系</td>
-    </tr>
-    <tr>
-      <td><code>dump_tb_section</code></td>
-      <td>获取指定部分的完整层次分析数据</td>
-    </tr>
-    <tr>
-      <td rowspan="6">日志与失败</td>
-      <td><code>parse_sim_log</code></td>
-      <td>将运行失败归类，提取时间与错误摘要</td>
-    </tr>
-    <tr>
-      <td><code>get_error_context</code></td>
-      <td>查看错误附近的原始日志</td>
-    </tr>
-    <tr>
-      <td><code>diff_sim_failure_results</code></td>
-      <td>比较两次运行中新增、持续和已消失的失败</td>
-    </tr>
-    <tr>
-      <td><code>analyze_failures</code></td>
-      <td>汇总某组失败的日志与波形上下文</td>
-    </tr>
-    <tr>
-      <td><code>analyze_failure_event</code></td>
-      <td>从一个失败事件定位相关实例、信号与源码候选</td>
-    </tr>
-    <tr>
-      <td><code>recommend_failure_debug_next_steps</code></td>
-      <td>推荐下一步值得调查的目标与工具调用</td>
-    </tr>
-    <tr>
-      <td>静态结构扫描</td>
-      <td><code>scan_structural_risks</code></td>
-      <td>静态扫描源码中的可疑结构；语义模式可检查 tie、悬空输入与常量比较</td>
-    </tr>
-    <tr>
-      <td rowspan="4">信号追踪</td>
-      <td><code>explain_signal_driver</code></td>
-      <td>追踪信号的驱动来源与相关 RTL</td>
-    </tr>
-    <tr>
-      <td><code>find_signal_loads</code></td>
-      <td>查找信号的消费者与影响范围</td>
-    </tr>
-    <tr>
-      <td><code>trace_signal_path</code></td>
-      <td>查询两个信号之间的结构连通路径</td>
-    </tr>
-    <tr>
-      <td><code>trace_x_source</code></td>
-      <td>追踪 X/Z 的传播路径，检查历史上的寄存器采样与保持</td>
-    </tr>
-    <tr>
-      <td rowspan="6">波形查询</td>
-      <td><code>get_waveform_summary</code></td>
-      <td>查看波形格式、时长、时间刻度和顶层模块</td>
-    </tr>
-    <tr>
-      <td><code>search_signals</code></td>
-      <td>根据名称查找完整信号路径</td>
-    </tr>
-    <tr>
-      <td><code>get_signal_at_time</code></td>
-      <td>读取指定时刻的信号值</td>
-    </tr>
-    <tr>
-      <td><code>get_signal_transitions</code></td>
-      <td>查看时间窗口内的信号跳变</td>
-    </tr>
-    <tr>
-      <td><code>get_signals_around_time</code></td>
-      <td>查看某时刻前后多个信号的变化</td>
-    </tr>
-    <tr>
-      <td><code>get_signals_by_cycle</code></td>
-      <td>按时钟沿逐周期采样多个信号</td>
-    </tr>
-    <tr>
-      <td rowspan="4">差异与时序</td>
-      <td><code>diff_first_divergence</code></td>
-      <td>查找两个信号首次观测到的已知值差异</td>
-    </tr>
-    <tr>
-      <td><code>trace_divergence</code></td>
-      <td>验证波形差异，追踪两侧相关的数据、控制与历史状态</td>
-    </tr>
-    <tr>
-      <td><code>period</code></td>
-      <td>检查信号周期与节拍异常</td>
-    </tr>
-    <tr>
-      <td><code>verify_window</code></td>
-      <td>在波形窗口中验证时序条件，返回具体证据</td>
-    </tr>
-    <tr>
-      <td rowspan="7">协议与事务</td>
-      <td><code>suggest_handshakes</code></td>
-      <td>发现 valid/ready 接口及检查所需的信号组合</td>
-    </tr>
-    <tr>
-      <td><code>suggest_protocol_bundles</code></td>
-      <td>发现 AHB / APB 接口信号组合</td>
-    </tr>
-    <tr>
-      <td><code>sweep_handshakes</code></td>
-      <td>扫描全设计中发现的 valid/ready 与 AHB 接口，汇总异常</td>
-    </tr>
-    <tr>
-      <td><code>inspect_handshake</code></td>
-      <td>检查指定接口的停顿、保持和握手异常</td>
-    </tr>
-    <tr>
-      <td><code>reconstruct_transactions</code></td>
-      <td>重建请求与响应事务，查看延迟、未完成请求和顺序</td>
-    </tr>
-    <tr>
-      <td><code>resolve_packed_fields</code></td>
-      <td>识别打包总线中的字段位置，便于单独查看地址、数据和控制信号</td>
-    </tr>
-    <tr>
-      <td><code>inspect_tlul</code></td>
-      <td>检查 TL-UL 请求与响应，查看握手停顿、响应延迟和未完成请求</td>
-    </tr>
-    <tr>
-      <td rowspan="3">时间游标</td>
-      <td><code>cursor_set</code></td>
-      <td>为关键时刻命名，便于后续查询复用</td>
-    </tr>
-    <tr>
-      <td><code>cursor_list</code></td>
-      <td>列出当前会话的时间游标</td>
-    </tr>
-    <tr>
-      <td><code>cursor_delete</code></td>
-      <td>删除时间游标</td>
-    </tr>
-    <tr>
-      <td>EDA 集成</td>
-      <td><code>build_kdb</code></td>
-      <td>从编译记录构建并缓存 Verdi KDB，供 NPI 查询使用</td>
-    </tr>
-  </tbody>
-</table>
+| 类别 | 工具 | 用途 |
+|---|---|---|
+| 会话与产物 | `get_sim_paths` | 发现编译日志、仿真日志和波形 |
+|  | `get_formal_paths` | 发现 JasperGold 工程与导出波形 |
+|  | `get_diagnostic_snapshot` | 查看已收集的证据与建议步骤 |
+| 设计与源码 | `prepare_design_context` | 准备设计上下文，供后续按需查询 |
+|  | `build_tb_hierarchy` | 显式构建 RTL / testbench 层次视图 |
+|  | `get_tb_subtree` | 浏览指定实例的局部层次 |
+|  | `find_tb_instance` | 按路径或模块名查找实例 |
+|  | `lookup_tb_files` | 在实际编译文件集中查找源码 |
+|  | `get_tb_file_detail` | 查看文件中的模块、接口和类定义 |
+|  | `get_tb_class_hierarchy` | 查看 SystemVerilog / UVM 类继承 |
+|  | `dump_tb_section` | 导出指定层次或源码分析部分 |
+|  | `explain_property` | 解释 SVA 匹配分支、检查义务、时钟、局部状态与指令作用 |
+| 日志与失败 | `parse_sim_log` | 归类运行失败，提取时间和摘要 |
+|  | `get_error_context` | 读取错误附近的原始日志 |
+|  | `diff_sim_failure_results` | 比较两次运行的失败变化 |
+|  | `analyze_failures` | 关联一组失败的日志与波形证据 |
+|  | `analyze_failure_event` | 关联单个失败的实例、信号与源码线索 |
+|  | `recommend_failure_debug_next_steps` | 推荐调查目标与后续工具调用 |
+| 结构与追踪 | `scan_structural_risks` | 执行文本规则，通过 NPI / Slang 检查端口及可选的位级驱动 |
+|  | `explain_signal_driver` | 追踪信号驱动及源码位置 |
+|  | `find_signal_loads` | 查找消费者与负载 |
+|  | `trace_signal_path` | 查询信号间的结构连通路径 |
+|  | `trace_x_source` | 追踪 X/Z 传播与历史采样 |
+| 波形读取 | `get_waveform_summary` | 查看时长、信号数和时间刻度 |
+|  | `search_signals` | 搜索完整信号路径 |
+|  | `get_signal_at_time` | 读取指定时刻的值或表达式 |
+|  | `get_signal_transitions` | 读取窗口内的跳变 |
+|  | `get_signals_around_time` | 查看关键时刻前后的多信号变化 |
+|  | `get_signals_by_cycle` | 按时钟沿逐拍采样信号或表达式 |
+| 差异与时序 | `diff_first_divergence` | 定位首个可确认的已知值差异 |
+|  | `trace_divergence` | 追踪两侧差异的数据、控制与历史状态 |
+|  | `period` | 检查周期与节拍异常 |
+|  | `verify_window` | 在波形窗口中验证时序条件 |
+| 协议与事务 | `suggest_handshakes` | 发现 valid/ready 信号组合 |
+|  | `suggest_protocol_bundles` | 发现 AHB / APB 信号组合 |
+|  | `sweep_handshakes` | 扫描发现的 AHB / valid-ready 接口异常 |
+|  | `inspect_handshake` | 检查指定接口的停顿与保持行为 |
+|  | `reconstruct_transactions` | 重建请求/响应，统计延迟与未完成请求 |
+|  | `resolve_packed_fields` | 解析打包字段并核对波形坐标 |
+|  | `inspect_tlul` | 检查 TL-UL 握手与请求/响应 |
+| 时间游标 | `cursor_set` | 为关键时刻命名 |
+|  | `cursor_list` | 列出当前会话游标 |
+|  | `cursor_delete` | 删除时间游标 |
+| EDA 集成 | `build_kdb` | 构建并缓存 Verdi KDB |
+
+### 原生优先查询
+
+`explain_property` 支持独立文本、保留输入顺序和 ID 的批量输入，以及显式共享声明单元。
+源码目标可附 `compile_log` 或 `design_handle`，通过 `target`、`instance_path`
+或 `line` 选择一个定义或指令。它只解释源码语义，不启动仿真、证明或 LLM。
+逐项读取完整性与具体缺口；未关联运行的文本模式为 unknown，可用精确的
+`run_anchor` 关联已有 simulation/formal 发现结果。示例、可选前端依赖与资源限制见
+[断言语义解释](docs/architecture.md#property-explanations)。
+
+复核日志中的断言失败时，先请求 `explain_property(include_check_plan=true)`，
+将 `results[].check_plan.handle` 传给 `verify_window` 的 `property_plan`，并指定
+`mode="property"`、VCD/FSDB/FST 的 `wave_path` 以及 `log_path` 或规范化的 `failure_event`。
+提供日志时，工具选择目标断言实例的首次失败，自动推导时钟、尝试起点与历史窗口，
+读取沿前值并返回关联源码节点的数值与端点证据。结合 `status`、覆盖范围和缺口解释结果；
+`not_reproduced` 只针对本次失败复核，不代表全局通过。文本计划可通过 `property_scope`
+或精确的 `property_bindings` 绑定波形信号。
+
+`get_sim_paths` 后照常执行 `scan_structural_risks`，继续日志与波形调查。
+连接、层级/文件/类、X 追踪、packed 和失败关联工具可直接接收 `compile_log`：
+健康 NPI 仅校验有界元数据与现成 KDB，不提前捕获或校验完整源码。
+无日志时可提供 `kdb_path` + `top_hint`；编译文件归属与源码回退仍需日志。
+纯 KDB 的失败分析/推荐还须显式提供 `simulator`，用于解析日志。
+
+```python
+find_tb_instance(compile_log="/project/compile.log", path="tb.dut")
+explain_signal_driver(kdb_path="/project/simv.daidir/kdb.elab++",
+                      top_hint="tb", signal_path="tb.dut.q", wave_path="/project/run.fsdb")
+```
+
+普通原生不可用会在同一请求内自动准备源码。查看 `native_route`：元数据、KDB、
+源码身份分别记录，KDB 与源码的版本关联始终为 `unverified`。回退返回真实
+`source_design_handle` 供显式复用；已观察源码变化时严格报错，须显式重新准备并
+携带新 handle。`backend_preference="source"` 跳过 KDB 发现；`retry_npi=true`
+重试同一 KDB 代次已记忆的加载失败，单工具能力不足不会禁用其他原生工具。
+解析、原生查询、回退与最终校验共享 `timeout_sec`（有限且不超过 300 秒）。
+
+`prepare_design_context` 保留完整源码身份与恢复用途，旧 handle 和历史 action
+契约不变。文件结果用 `ownership_basis="compile_metadata"` 与
+`source_status="not_captured"` 区分编译记录和已捕获源码。名称/路径过滤与三种
+编译记录导出无需 KDB 或语义 provider。缓存 KDB 发现仍精确 hash 源码，成本单列；
+不会自动构建 KDB。结构扫描和可选握手调查分别保留 coverage；未执行或零覆盖均不能判为干净。
 
 ## 常见问题
 
 **没有商业 license 也能用吗？**
 
-日志分析、VCD 查询、静态结构扫描和 Source Graph 不需要商业 license。**直接查询已有波形中的信号值或跳变，不需要 NPI license**：VCD 使用内置解析器；FSDB 使用本地 Verdi FSDB Reader，其使用仍须遵守上文所述协议。Verdi NPI 信号追踪和 KDB 构建需要相应的 EDA 环境与 license。
+日志分析、VCD、可选 FST、结构扫描的文本规则及 Slang / Source Graph 无需商业 license。结构扫描的 `auto` / `deep` 会优先尝试已有 KDB 的 NPI 检查，可能在本地或配置的 LSF 节点申请 license；`fast` 仅做文本检查。FSDB 使用站点提供的 Verdi FSDB Reader，须遵守相应协议；NPI 和 KDB 构建需要对应 EDA 环境与 license。
 
-**路径变量是否支持自恢复**
+**结构扫描需要仿真结果吗？**
 
-支持。在没有 source 过案例环境变量 setup 文件的终端上使用 CLI agent，或直接将其他终端已跑出的日志和波形交给 agent 分析时，TraceWeave 可从 VCS 编译日志和 filelist 中自动恢复能唯一确定的编译输入路径变量，用于层次分析、KDB 构建和 Source Graph 查询。
+不需要。提供编译/展开日志即可。文本检查读取可访问的源码；默认 `auto` 还会优先使用已有或缓存 KDB 做 NPI 输入端口检查，缺失类别只复用兼容的源码语义结果。`deep` 另外允许有界的 Slang 构建。扫描不会自动建 KDB；编译记录没有唯一顶层时可传 `top_hint`。
 
-自恢复范围限于编译输入路径变量，对应源码与 include 文件需可访问。自恢复能力依赖的运行环境仍需预先提供：KDB 构建所需的 `VERDI_HOME`、工具安装及许可证配置，以及 Source Graph 所需的 Python / `pyslang` 依赖。
+查看 `semantic.category_coverage` 和 `result_groups`，区分 NPI 端口事实与源码事实的范围和身份。默认的比较检查仍需源码证据；未知表达式、空实际连接的默认值语义、预算截断均保留缺口。零事实和缓存命中不证明完整，发现项也可能是正常 tie-off。详见[扫描模式与限制](docs/architecture.md#structural-scan-invocation)。
 
-**信号追踪结果的准确性如何判断？**
-
-NPI 基于与当前设计匹配的已展开 KDB；Source Graph 从源码构建语义连接图。在编译上下文完整、目标语义受支持，且查询满足**覆盖完整、解析精确、未截断**时，返回结果可作为**当前查询范围内的精确结构连接事实**，用于驱动、负载和连通路径分析。
-
-**没有仿真结果，也能做静态结构扫描吗？**
-
-可以。`scan_structural_risks` 对源码做静态分析，无需运行仿真，也不需要仿真运行日志或 VCD / FSDB 波形。当前接口需要提供编译/展开日志（`compile_log`），并保证对应的源码和 include 文件可访问，因此可以在编译/展开之后、仿真运行之前使用。
-
-**静态结构扫描的 auto / deep 怎么选？**
-
-默认 `auto` 执行源码文本规则扫描，并复用已有的适用语义结果；需要新做常量连接、未连接输入等语义检查时，告诉助手使用 `deep`。这是每次调用的 `analysis_mode` 参数，无需修改客户端配置。扫描发现的是待核查线索，正常 tie-off 或协议常量也可能被列出。
-
-**扫描没有发现，就说明设计没有问题吗？**
-
-结论取决于实际覆盖范围。缺少信号、超出资源预算或不支持的结构都会限制分析；零覆盖或部分覆盖时，零发现不代表设计无问题。工具会返回覆盖与截断信息，供助手判断是否需要缩小范围继续检查。
+大设计可按 `semantic.suggested_next_action` 续扫，或把返回的
+`semantic.continuation` 作为 `semantic_continuation`，保持日志、顶层、范围和类别一致。
+计数累计，事实列表仅包含本页；token 闲置十分钟过期，服务重启或身份变化后失效。
+已有明确目标时，直接指定其精确 `semantic_scope` 做局部检查。
 
 **能分析 formal 波形吗？**
 
-可以查询已导出的 VCD / FSDB，并自动发现 JasperGold 产物。Property 结果、反例类型和可达性语义仍需由 formal 工具或用户提供。
-
-独立导出的波形无需已识别的 formal 工程。发现波形但没有工程条目时，`get_formal_paths` 会提示现有点查询和批量读值入口；波形、信号和时刻由调用方选择。
+可以复用现有读取工具查询导出波形，并自动发现 JasperGold 产物。Property 结果和可达性语义仍需由 formal 工具或验证上下文提供。
 
 **设计数据在哪里处理？**
 
-文件解析与 EDA 查询在本地或配置的 LSF 执行节点完成；返回的调试证据会进入所用 AI 客户端的上下文。TraceWeave 的使用遥测默认关闭，启用后仅写入本地文件。
+文件解析与 EDA 查询在本地或配置的 LSF 节点执行；返回的证据进入所用 AI 客户端的上下文。使用遥测默认关闭，启用后仅写入本地文件。
 
 ## 文档与反馈
 
@@ -534,10 +291,56 @@ NPI 基于与当前设计匹配的已展开 KDB；Source Graph 从源码构建�
 | 标准调试步骤与工具配合 | [调试工作流](docs/workflow.md) |
 | 如何用证据验证根因 | [调试准则](docs/debug-discipline.md) |
 | 架构、后端能力与资源边界 | [架构文档](docs/architecture.md) |
+| 表达式输入与调用示例 | [SV 表达式](docs/expressions.md) |
 | 完整环境配置与高级选项 | [配置参考](docs/architecture.md#client-configuration-reference) |
 | 报告问题或提出建议 | [GitHub Issues](https://github.com/gokeshenzhen/TraceWeave/issues) |
 
-参与开发前请阅读 [AGENTS.md](AGENTS.md)。在准备好测试依赖的环境中，可于仓库根目录运行 `python3.11 -m pytest`。
+参与开发前请阅读 [AGENTS.md](AGENTS.md)。仓库回归需要 `test`、`source-graph`、
+`fst` Python extras 和 `g++`。新开发环境可使用
+`python3.11 -m pip install -e ".[test,source-graph,fst]"` 安装声明的依赖。
+测试入口不会安装依赖，也不修改 shell、MCP、许可证或调度配置。
+
+| 仓库根目录命令 | 必需覆盖范围 |
+|---|---|
+| `python3.11 -m pytest` | 基础单元/mock、VCD/日志、开源 Slang/FST 功能 |
+| `python3.11 scripts/run_tests.py --profile portable` | 同一基础范围，另保存 JSON/JUnit 和日志 |
+| `python3.11 scripts/run_tests.py --profile eda` | 功能回归：基础＋真实 FSDB/VCS/NPI，不含五项规模测试 |
+| `python3.11 scripts/run_tests.py --profile stress` | 原有五项千万步波形测试 |
+| `python3.11 scripts/run_tests.py --profile all` | 全量回归：基础＋EDA 功能＋五项原规模测试 |
+
+裸 pytest 即使发现商业 SDK，也只选择基础范围，不启用商业许可测试。
+eda/all 要求 `PATH` 上已有 VCS、`VERDI_HOME` 下有 FSDB Reader/Writer、NPI SDK，
+编译链接环境及许可可用。stress 使用 Verdi reader、writer 和 `vcd2fsdb`，
+不要求 VCS、NPI、Slang 或 FST。输入由公开小例在测试拥有的目录中自动生成，
+无需作者私有工程、波形或预编译 KDB。所有 profile 均不提交真实 LSF 作业；
+standalone worker 测试仅表示本地覆盖。
+
+`--check` 只检查软件和工具是否存在，不 checkout license；`--list` 只收集选择计划，
+不生成输入。选中的依赖缺失、准备失败、断言失败、意外 skip 或必需测试未执行时，
+入口均非零退出；模块收集阶段的 skip 也会报告。计划排除和少量逐项声明的平台限制
+与通过数分开。`--` 后可附加 pytest 参数，例如 `-- tests/test_log_parser.py -q`，
+报告将标为部分选择，不能据此宣称整个 profile 通过。
+
+使用 `--cache-dir /绝对路径/test-cache` 复用生成输入。缓存按源码/工具指纹、产物
+hash 和 ABI 校验；失败或取消不发布完整 manifest。非空缓存目录必须带有 TraceWeave
+所有权标记。现有仓库 wrapper 和外部输入不会被覆盖。保留的只读波形覆盖变量为
+`TW_POINT_READ_FSDB`、`TW_LAZY_LARGE_FSDB`、`TW_SESSION_RECLAIM_FSDB` 和三个
+`TW_P2B_*_FSDB`；缺文件或不匹配所选 fixture 的 oracle 时失败，不改用其他文件。
+
+五项 stress 共享四信号波形，真实包含 10,000,001 条数据记录、5,000,000 个时钟
+上升沿和物理 flush session。生成时写入约 500 MB 临时 VCD，转换及校验成功后删除
+VCD，缓存保留 FSDB。报告记录实际磁盘大小、session 布局、事件数、耗时和 RSS。
+此 profile 不执行独立的 100M benchmark。
+
+`--output /绝对路径/new-results` 保存 `report.json`、`pytest.json`、JUnit、原始
+pytest 日志、测试临时文件及 fixture manifest/构建日志快照。结果目录必须尚不存在。
+未指定时会打印临时证据和 fixture 目录并保留供复核；完成后仅清理自己拥有的目录。
+
+外部 UART/OpenTitan 验收另用 `--external-representative /路径/manifest.json`
+显式选择。按 [representative.json](tests/fixtures/six_tool_hierarchy/representative.json)
+填写项目 revision、top/scope、定义/实例位置及 compile log、定义文件、实例文件的
+SHA-256。该专项要求保留真实阻断诊断和 partial 覆盖；默认回归改用自包含的健康及
+不完整层级。默认 all 或本地 worker 通过均不代表外部工程或真实调度器通过。
 
 TraceWeave 使用 [MIT License](LICENSE)。
 

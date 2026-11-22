@@ -9,7 +9,10 @@ log_parser.py
 from __future__ import annotations
 
 import hashlib
+import os
+import stat
 import re
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +30,8 @@ from config import (
     UVM_PARSE_LEVELS,
 )
 from .problem_hints import compute_problem_hints_from_events, event_has_x_or_z
+from .cancellation import check_cancelled
+from . import operation_metrics
 
 
 _VCS_ASSERT_RE = re.compile(
@@ -317,6 +322,59 @@ class ParsedError:
     continuation_text: str | None = None
 
 
+@dataclass(frozen=True)
+class FailureEventsObservation:
+    """Private, request-local handoff; never a persistent log cache."""
+
+    identity: tuple | None
+    events: list[dict[str, Any]]
+
+
+def observe_failure_events(log_path, simulator, native_time_unit=None, *, previous=None):
+    check_cancelled()
+    def identity():
+        def version(info):
+            return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        files = []
+        try:
+            for path in (log_path, CUSTOM_PATTERNS_FILE):
+                canonical = os.path.realpath(path)
+                try:
+                    info = os.stat(path)
+                except FileNotFoundError:
+                    files.append((canonical, None))
+                else:
+                    if not stat.S_ISREG(info.st_mode):
+                        return None
+                    digest = hashlib.sha256()
+                    with open(path, "rb") as stream:
+                        if version(os.fstat(stream.fileno())) != version(info):
+                            return None
+                        remaining = info.st_size
+                        while remaining:
+                            check_cancelled()
+                            chunk = stream.read(min(remaining, 1024 * 1024))
+                            if not chunk:
+                                return None
+                            digest.update(chunk)
+                            remaining -= len(chunk)
+                        if stream.read(1):
+                            return None
+                    if (version(os.stat(path)) != version(info)
+                            or os.path.realpath(path) != canonical):
+                        return None
+                    files.append((canonical, version(info), digest.hexdigest()))
+        except OSError:
+            return None
+        return simulator.lower(), native_time_unit, tuple(files)
+
+    before = identity()
+    if previous is not None and before is not None and previous.identity == before:
+        return previous
+    events = SimLogParser(log_path, simulator, native_time_unit).parse_failure_events()
+    return FailureEventsObservation(before if before == identity() else None, events)
+
+
 class SimLogParser:
     def __init__(self, log_path: str, simulator: str, native_time_unit: str | None = None):
         self.log_path = log_path
@@ -334,6 +392,10 @@ class SimLogParser:
         return _build_summary(self.parse_failure_events(), self.log_path, self.simulator, max_groups)
 
     def parse_failure_events(self) -> list[dict[str, Any]]:
+        with operation_metrics.input_parse("log"):
+            return self._parse_failure_events()
+
+    def _parse_failure_events(self) -> list[dict[str, Any]]:
         path = Path(self.log_path)
         if not path.exists():
             raise FileNotFoundError(f"Log file does not exist: {self.log_path}")
@@ -344,8 +406,12 @@ class SimLogParser:
             file_size = 0
         multiline_enabled = file_size <= MAX_LOG_FILE_SIZE_FOR_MULTILINE
 
+        read_started = time.perf_counter()
         with path.open("r", errors="replace") as handle:
             all_lines = handle.readlines()
+        operation_metrics.record_input_read(
+            "log", (time.perf_counter() - read_started) * 1000.0, file_size,
+        )
 
         self._bare_time_unit = _infer_bare_time_unit(all_lines, self.simulator)
 
@@ -1081,13 +1147,11 @@ _PROTOCOL_SYMPTOM_SOURCES = frozenset({"scoreboard"})
 _PROTOCOL_SYMPTOM_MECHANISMS = frozenset({"mismatch", "protocol", "deadlock", "timeout"})
 
 _PROTOCOL_SYMPTOM_HINT = (
-    "scoreboard/compare-style failures are frequently a SYMPTOM of a lower-level "
-    "bus-protocol problem, not the root cause. Before reading RTL line-by-line or "
-    "inspecting the waveform by hand, run sweep_handshakes once: it checks the "
-    "protocol health of every bus interface (AHB + AXI/valid-ready) in a single "
-    "call and returns a per-interface stall/deadlock/payload-hold fact table. "
-    "Drill into one interface with suggest_protocol_bundles/suggest_handshakes + "
-    "inspect_handshake only if you need to."
+    "scoreboard/compare-style failures can be symptoms of a bus-protocol problem. "
+    "For an unknown interface, consider sweep_handshakes over an evidence-backed "
+    "scope/window; for a known interface, use inspect_handshake directly. "
+    "Read actual coverage and keep producer, consumer and expected-model "
+    "hypotheses open until waveform evidence distinguishes them."
 )
 
 

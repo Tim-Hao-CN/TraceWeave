@@ -10,6 +10,7 @@ import shlex
 from copy import deepcopy
 from pathlib import Path
 
+from .compile_input_capture import open_compile_text, read_compile_text, resolve_compile_path, observe_compile_metadata_path
 from .filelist_tokenizer import tokenize_filelist
 from .hdl_suffixes import (
     FRONTEND_HDL_SUFFIXES,
@@ -105,7 +106,7 @@ def _normalize_path(path: str, parent: str | None = None) -> str:
     path = os.path.expandvars(path)
     if parent and not os.path.isabs(path):
         path = os.path.join(parent, path)
-    return os.path.normpath(os.path.realpath(path))
+    return os.path.normpath(resolve_compile_path(path))
 
 
 def _normalize_reported_path(path: str, parent: str | None = None) -> str:
@@ -265,7 +266,7 @@ def parse_vcs_compile_log(log_path: str) -> dict:
     stack: list[str] = []
     in_top_section = False
 
-    with open(log_path, "r", errors="replace") as stream:
+    with open_compile_text(log_path) as stream:
         lines_seen = 0
         for line in stream:
             lines_seen += 1
@@ -417,7 +418,7 @@ def _read_vcs_invocation_lines(log_path: str) -> list[str]:
     """Return only the VCS invocation evidence, never the whole log."""
 
     wrapper: list[str] = []
-    with open(log_path, "r", errors="replace") as stream:
+    with open_compile_text(log_path) as stream:
         iterator = iter(stream)
         for line_number, line in enumerate(iterator, 1):
             if line_number % _LOG_CANCEL_CHECK_STRIDE == 0:
@@ -735,6 +736,7 @@ def _expand_vcs_filelist(
     if depth > _VCS_FILELIST_MAX_DEPTH:
         warnings.append(f"VCS filelist depth limit exceeded: {filelist_path}")
         return
+    observe_compile_metadata_path(filelist_path)
     if not os.path.isfile(filelist_path):
         if _ENV_REF_RE.search(raw_path):
             warnings.append(
@@ -746,7 +748,7 @@ def _expand_vcs_filelist(
         return
 
     try:
-        text = Path(filelist_path).read_text(errors="replace")
+        text = read_compile_text(filelist_path)
     except OSError as exc:
         warnings.append(f"VCS filelist unreadable: {filelist_path}: {exc}")
         return
@@ -874,7 +876,7 @@ def parse_xcelium_compile_log(log_path: str) -> dict:
             file_info.setdefault(path, {"type": "unknown"})
             expanded_source_paths.append(path)
 
-    with open(log_path, "r", errors="replace") as stream:
+    with open_compile_text(log_path) as stream:
         lines_seen = 0
         for line in stream:
             lines_seen += 1
@@ -967,7 +969,7 @@ def _read_xcelium_invocation_lines(log_path: str) -> list[str]:
     wrapper: list[str] = []
     invocation: list[str] = []
     collecting = False
-    with open(log_path, "r", errors="replace") as stream:
+    with open_compile_text(log_path) as stream:
         for line_number, line in enumerate(stream, 1):
             if line_number % _LOG_CANCEL_CHECK_STRIDE == 0:
                 _check_cancelled()

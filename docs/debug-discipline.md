@@ -27,6 +27,12 @@ general form you can hand to any agent on any module.
 >   real waveform values and log lines — not on what the code "looks like" it
 >   should do. Use the available inspection tools to fetch evidence rather than
 >   reasoning from source alone.
+> - When connectivity tools report unsupported, shallow or incomplete coverage,
+>   continue reading the verified compiled source with client file tools. Trace
+>   assignments and port bindings, cite file:line, and label inferred hops as
+>   source inference. Keep uncertain parameter/generate bindings explicit. A
+>   tool capability gap does not prove disconnection or require abandoning the
+>   investigation; confirm runtime and root-cause claims with waveform/log facts.
 > - Do not modify any file, do not re-run the simulation, do not access the
 >   network.
 > - Do not let a file name, a historical backup, a README/HANDOFF note, or a
@@ -106,9 +112,12 @@ Key reminders that the tools encode for you:
 Rule 4 always means "verify the side you did *not* already suspect." What the two
 sides *are* depends on the module:
 
-- **Protocol / bus:** initiator/producer (drives `valid`/HTRANS/payload) vs.
-  responder/consumer (drives `ready`/HREADY). See the role table in
-  `docs/workflow.md`.
+- **Protocol / bus:** the channel producer (drives `valid`/payload) vs. the
+  channel consumer (drives `ready`). On AXI AW/AR/W the producer is the master;
+  on R/B it is the slave. On AHB, the master drives HTRANS/address control and
+  the responder side supplies HREADY. Determine the role per channel before
+  interpreting `attribution`; a producer hold violation does not implicate the
+  ready driver. See `docs/workflow.md`.
 - **Datapath / algorithm:** input stimulus (is the operand/control word correct
   at the input boundary?) vs. the compute logic (does the block transform a known
   input wrong?) vs. the reference/expected model (is the *expectation* wrong?).

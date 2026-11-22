@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from pathlib import Path
-import subprocess
 import sys
 
 import pytest
@@ -23,7 +22,6 @@ from tests.test_source_graph_runtime import _request
 
 
 ROOT = Path(__file__).resolve().parents[1]
-FRONTEND_PYTHON = ROOT / ".venv/bin/python"
 
 
 def _context_request(label: str = "session"):
@@ -58,6 +56,7 @@ def _fake_worker(
     delay_seconds: float = 0.0,
     reported_rss_peak_kib: int | None = None,
     valid_acknowledgement: bool = True,
+    transient_rss_bytes: int = 0,
 ) -> Path:
     script = tmp_path / "fake_session_worker.py"
     script.write_text(
@@ -65,6 +64,7 @@ def _fake_worker(
 import argparse
 import base64
 import json
+import mmap
 import os
 from pathlib import Path
 import sys
@@ -89,6 +89,24 @@ for line in sys.stdin:
     envelope = json.loads(request_path.read_text())
     request = SourceGraphArtifactBuildRequest.from_dict(envelope['request'])
     time.sleep({delay_seconds!r})
+    reported_peak = {reported_rss_peak_kib!r}
+    if {transient_rss_bytes!r}:
+        from src.source_graph_worker import _read_rss_kib
+        def rss_snapshot(phase):
+            current, peak = _read_rss_kib()
+            return {{'phase': phase, 'pid': os.getpid(), 'current_kib': current, 'peak_kib': peak,
+                    'status': Path('/proc/self/status').read_text(),
+                    'stat': Path('/proc/self/stat').read_text()}}
+        observations = [rss_snapshot('before')]
+        # Closing the anonymous mapping returns its pages to the kernel.
+        flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
+        with mmap.mmap(-1, {transient_rss_bytes!r}, flags=flags) as memory:
+            for offset in range(0, len(memory), mmap.PAGESIZE):
+                memory[offset] = 1
+            observations.append(rss_snapshot('allocated'))
+        observations.append(rss_snapshot('released'))
+        reported_peak = observations[-1]['peak_kib']
+        Path({str(tmp_path / 'native_transient_rss.json')!r}).write_text(json.dumps(observations))
     ir = build_hand_ir()
     payload = {{
         'protocol_version': SOURCE_GRAPH_WORKER_PROTOCOL_VERSION,
@@ -102,7 +120,7 @@ for line in sys.stdin:
         'metrics': {{
             'wall_time_ms': 1.0,
             'ir_bytes': len(ir.to_json_bytes()),
-            'rss_peak_kib': {reported_rss_peak_kib!r},
+            'rss_peak_kib': reported_peak,
         }},
         'fallback_used': False,
     }}
@@ -130,7 +148,7 @@ for unused_line in sys.stdin:
     return script
 
 
-def _runner(tmp_path: Path, script: Path, *, ttl: float = 1.0):
+def _runner(tmp_path: Path, script: Path, *, ttl: float = 1.0, max_rss_kib: int = 64 * 1024):
     staging = tmp_path / "staging"
     staging.mkdir()
     return PersistentSourceGraphProcessRunner(
@@ -139,7 +157,7 @@ def _runner(tmp_path: Path, script: Path, *, ttl: float = 1.0):
         working_directory=ROOT,
         staging_directory=staging,
         idle_ttl_seconds=ttl,
-        max_rss_kib=64 * 1024,
+        max_rss_kib=max_rss_kib,
     ), staging
 
 
@@ -341,6 +359,38 @@ async def test_persistent_runner_rejects_reported_transient_rss_peak(tmp_path):
     assert runner.active is False
 
 
+@pytest.mark.anyio
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux address-space RSS observations")
+async def test_real_released_peak_still_triggers_reported_session_limit(tmp_path, monkeypatch):
+    import json
+
+    # Deliberately blind the sampler to this short transient. The real worker
+    # high-water receipt must independently enforce the same session limit.
+    async def missed_transient(*args):
+        await asyncio.Event().wait()
+    monkeypatch.setattr("src.source_graph_session_runtime._wait_for_rss_limit", missed_transient)
+    limit = 128 * 1024
+    runner, _ = _runner(tmp_path, _fake_worker(tmp_path, transient_rss_bytes=192 * 1024 * 1024),
+                        max_rss_kib=limit)
+    try:
+        result = await runner.run(_context_request(), timeout_seconds=10, cancel_event=asyncio.Event())
+        (tmp_path / "native_transient_result.json").write_text(json.dumps({
+            "status": result.status.value, "blocker": result.blocker.code if result.blocker else None,
+            "peak_kib": result.metrics.rss_peak_kib, "active": runner.active, "limit_kib": limit,
+            "sampling_control": "disabled_to_check_reported_peak_guard"}))
+        observations = json.loads((tmp_path / "native_transient_rss.json").read_text())
+        before, allocated, released = observations
+        # Linux RSS readings are approximate. Check the budget crossings.
+        assert before["current_kib"] < limit < allocated["current_kib"]
+        assert released["current_kib"] < limit < released["peak_kib"]
+        assert result.status is PrepareStatus.BUILD_FAILED
+        assert result.blocker.code == "semantic_session_rss_limit"
+        assert result.metrics.rss_peak_kib == released["peak_kib"]
+        assert not runner.active
+    finally:
+        await runner.close()
+
+
 class _FallbackRunner:
     def __init__(self):
         self.calls = 0
@@ -377,44 +427,22 @@ async def test_request_without_semantic_context_keeps_one_shot_route(tmp_path):
     assert runner.active is False
 
 
-def _pinned_frontend_available() -> bool:
-    if not FRONTEND_PYTHON.is_file():
-        return False
-    completed = subprocess.run(
-        [
-            str(FRONTEND_PYTHON),
-            "-c",
-            (
-                "import importlib.metadata; "
-                "print(importlib.metadata.version('pyslang'))"
-            ),
-        ],
-        cwd=ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    return completed.returncode == 0 and completed.stdout.strip() == "11.0.0"
-
-
 @pytest.mark.anyio
-async def test_real_persistent_worker_matches_session_aware_one_shot(tmp_path):
-    if not _pinned_frontend_available():
-        pytest.skip("pinned Source Graph frontend is unavailable")
+async def test_real_persistent_worker_matches_session_aware_one_shot(tmp_path, source_graph_python):
     request = _slang_context_request()
     staging = tmp_path / "persistent"
     one_shot_staging = tmp_path / "one_shot"
     staging.mkdir()
     one_shot_staging.mkdir()
     runner = PersistentSourceGraphProcessRunner(
-        python_executable=FRONTEND_PYTHON,
+        python_executable=source_graph_python,
         working_directory=ROOT,
         staging_directory=staging,
         idle_ttl_seconds=2.0,
         max_rss_kib=768 * 1024,
     )
     one_shot = IsolatedSourceGraphProcessRunner(
-        python_executable=FRONTEND_PYTHON,
+        python_executable=source_graph_python,
         working_directory=ROOT,
         staging_directory=one_shot_staging,
     )

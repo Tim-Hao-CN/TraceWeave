@@ -40,6 +40,55 @@ def test_dynamic_lsf_request_and_result_validation():
     assert _validate_operation_result(request, malformed) is None
 
 
+@pytest.mark.parametrize('case', [
+    'initial', 'empty', 'unknown', 'runtime', 'undecoded', 'missing_file',
+    'missing_line', 'degraded', 'nested',
+])
+def test_initial_only_root_requires_complete_native_source_inventory(case):
+    """An unmodeled initial writer is evidence, never an evaluated producer."""
+    def net(name, generated=False):
+        return SimpleNamespace(size=lambda: 1, left=lambda: 0, right=lambda: 0,
+            full_name=lambda: name, is_signed=lambda: False, is_literal=lambda: False,
+            is_generated=lambda: generated, type=lambda: 'npiNlWire', load_list=lambda: [])
+    root, child = net('t.q'), net('t.generated', True)
+    native = SimpleNamespace(get_net=lambda name: {'t.q': root, 't.generated': child}.get(name))
+    initial = SimpleNamespace(full_name=lambda: 't:17:Init.Q')
+    extra = SimpleNamespace(full_name=lambda: 't:18:Reg.Q')
+    handles = [] if case == 'empty' else [initial, extra] if case in {'runtime', 'undecoded'} else [initial]
+    root.driver_list = child.driver_list = lambda: handles
+    if case == 'nested':
+        root.type = lambda: 'npiNlConcatNet'
+        root.actual_name_list = lambda: ['t.generated']
+    def formatted(pin):
+        if pin is extra and case == 'undecoded':
+            return None
+        kind = 'always_ff' if pin is extra else 'unknown' if case == 'unknown' else 'initial'
+        return dict(driver_kind=kind, _npi_raw=pin.full_name(),
+            source_file=None if case == 'missing_file' else '/design.sv',
+            source_line=None if case == 'missing_line' else 17)
+    # Unknown/runtime handles have no usable native link; ordinary gaps remain.
+    for pin in handles:
+        pin.scope_inst = lambda: None
+        pin.type = lambda: 'npiNlPin'
+        pin.connected_pin = lambda: None
+    backend = SimpleNamespace(_npi_modules=(None, native), _resolve_net=lambda *_: root,
+        _format_driver=formatted, _loadcheck_head=lambda *_: None,
+        kdb_load_quality='degraded' if case == 'degraded' else 'clean')
+    step = query_step(backend, 't.q')
+    validate_step(json.loads(json.dumps(step)))
+    assert not step['complete'] and not step['branches']
+    assert not step['traversal']['search_exhaustive']
+    if case == 'initial':
+        assert step['boundary'] == 'unsupported'
+        assert step['gaps'] == ['dynamic_evidence_unavailable']
+        assert step['sources'] == [dict(kind='initial', cell='t:17:Init.Q',
+            location='/design.sv:17', declaration='t.q')]
+        assert step['cross_check'] is None
+    else:
+        assert step['sources'] == []
+        assert step['boundary'] == 'combinational'
+
+
 @pytest.mark.parametrize('cell_type', ['npiNlFlipFlopCell', 'npiNlEqCompCell'])
 def test_candidate_mode_preserves_legacy_native_step(cell_type):
     """An async data fault cannot affect an ordinary history query."""
@@ -139,40 +188,12 @@ def real_kdbs(tmp_path_factory):
     assert shutil.which("vcs"), (
         "VCS is required for the explicitly requested live regression"
     )
-    root = tmp_path_factory.mktemp("npi_dynamic")
+    from scripts.test_fixtures import current_cache
     fixture = Path(__file__).parent / "fixtures/divergence/drivers.sv"
     outputs = []
     for index in (0, 1):
-        case = root / str(index)
-        case.mkdir()
-        src = case / "drivers.sv"
-        src.write_text(
-            fixture.read_text().replace("8'h00", "8'h11" if index else "8'h00")
-        )
-        command = [
-            "vcs",
-            "-full64",
-            "-sverilog",
-            "-timescale=1ns/1ps",
-            "-debug_access+all",
-            "-kdb",
-            str(src),
-            "-top",
-            "tw_div_probe",
-            "-o",
-            "simv",
-            "-l",
-            "compile.log",
-        ]
-        run = subprocess.run(
-            command,
-            cwd=case,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=90,
-        )
-        assert run.returncode == 0, run.stdout[-3000:]
+        source = fixture.read_text().replace("8'h00", "8'h11" if index else "8'h00")
+        case = current_cache().vcs_design('dynamic-'+str(index), {'drivers.sv': source}, 'tw_div_probe')
         outputs.append(case / "simv.daidir/kdb.elab++")
     return outputs
 

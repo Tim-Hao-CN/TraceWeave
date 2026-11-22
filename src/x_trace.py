@@ -44,6 +44,7 @@ async def trace_x_source(
     value_lookup: ValueLookup | None = None,
     upstream_lookup: UpstreamLookup | None = None,
     upstream_scope_guard: ScopeGuard | None = None,
+    propagate_value_errors: tuple[type[Exception], ...] = (),
 ) -> dict[str, Any]:
     """Trace X/Z propagation using injected wave and connectivity lookups.
 
@@ -95,7 +96,11 @@ async def trace_x_source(
                     time_ps,
                 )
             )
-        except OperationCancelled:
+        except (OperationCancelled, TimeoutError):
+            raise
+        except propagate_value_errors:
+            # The composition layer may mark an identity/ownership failure as
+            # fatal; it must not become a missing-signal observation.
             raise
         except Exception:
             chain.append(
@@ -119,6 +124,9 @@ async def trace_x_source(
         node = _build_chain_node(current_signal, depth, value_result, driver)
         chain.append(node)
 
+        if driver.get("unsupported_reason") == "source_graph_input_boundary":
+            node["trace_stop_reason"] = "source_graph_input_boundary"
+            continue
         driver_status = driver.get("driver_status")
         if driver_status != "resolved":
             traversal = driver.get("traversal")
@@ -336,7 +344,7 @@ def inspect_upstream_values(
             continue
         try:
             upstream_value = parser.get_value_at_time(full_path, time_ps)
-        except OperationCancelled:
+        except (OperationCancelled, TimeoutError):
             raise
         except Exception:
             upstream_value = None
@@ -366,7 +374,7 @@ def _resolve_signal_full_path(
         try:
             parser.get_value_at_time(candidate, 0)
             return candidate
-        except OperationCancelled:
+        except (OperationCancelled, TimeoutError):
             raise
         except Exception:
             pass
@@ -375,7 +383,7 @@ def _resolve_signal_full_path(
         return None  # A clipped fuzzy search cannot establish a unique declaration.
     try:
         results = parser.search_signals(signal_name, max_results=10)
-    except OperationCancelled:
+    except (OperationCancelled, TimeoutError):
         raise
     except Exception:
         return None
