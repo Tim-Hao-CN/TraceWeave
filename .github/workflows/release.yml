@@ -35,7 +35,7 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[test,source-graph]"
+          python -m pip install -e ".[test,source-graph,fst]"
 
       - name: Run test suite
         run: >-
@@ -85,6 +85,7 @@ jobs:
           import json
           import os
           from pathlib import Path
+          import re
           import tomllib
 
           root = Path.cwd()
@@ -94,6 +95,8 @@ jobs:
           exec((root / "traceweave_mcp" / "__init__.py").read_text(encoding="utf-8"), version_scope)
 
           version = project["version"]
+          # The Registry ranks full SemVer server versions ahead of shortened ones.
+          registry_version = f"{version}.0" if re.fullmatch(r"[0-9]+\.[0-9]+", version) else version
           expected_tag = f"v{version}"
           actual_tag = os.environ["TRACEWEAVE_RELEASE_TAG"]
           package = registry["packages"][0]
@@ -103,7 +106,7 @@ jobs:
           assert project["name"] == "traceweave-mcp"
           assert version_scope["__version__"] == version
           assert registry["name"] == "io.github.gokeshenzhen/traceweave"
-          assert registry["version"] == version
+          assert registry["version"] == registry_version
           assert package["registryType"] == "pypi"
           assert package["identifier"] == project["name"]
           assert package["version"] == version
@@ -298,9 +301,18 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           python -m venv "$RUNNER_TEMP/traceweave-public"
           "$RUNNER_TEMP/traceweave-public/bin/python" -m pip install --upgrade pip
-          "$RUNNER_TEMP/traceweave-public/bin/python" -m pip install \
-            --no-cache-dir --index-url https://pypi.org/simple --retries 12 \
-            "traceweave-mcp==$VERSION"
+          # The Simple API used by pip can lag behind the release JSON.
+          for attempt in {1..12}; do
+            if "$RUNNER_TEMP/traceweave-public/bin/python" -m pip install \
+              --no-cache-dir --index-url https://pypi.org/simple --retries 12 \
+              "traceweave-mcp==$VERSION"; then
+              break
+            fi
+            if [[ "$attempt" == 12 ]]; then
+              exit 1
+            fi
+            sleep 10
+          done
           cd "$RUNNER_TEMP"
           timeout 30 "$RUNNER_TEMP/traceweave-public/bin/python" \
             "$GITHUB_WORKSPACE/tests/installed_stdio_smoke.py"
@@ -375,10 +387,11 @@ jobs:
           python - <<'PY'
           import json
           from pathlib import Path
-          import tomllib
 
           root = Path.cwd()
-          version = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          registry = json.loads((root / "server.json").read_text(encoding="utf-8"))
+          version = registry["version"]
+          package_version = registry["packages"][0]["version"]
           expected_name = "io.github.gokeshenzhen/traceweave"
           expected_package = "traceweave-mcp"
           expected_repository = "https://github.com/gokeshenzhen/TraceWeave"
@@ -392,7 +405,7 @@ jobs:
           assert any(
               package["registryType"] == "pypi"
               and package["identifier"] == expected_package
-              and package["version"] == version
+              and package["version"] == package_version
               and package["transport"]["type"] == "stdio"
               for package in packages
           )
