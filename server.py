@@ -18,6 +18,7 @@ import hashlib
 import inspect
 import json
 import re
+import shlex
 import sys
 import os
 import threading
@@ -58,6 +59,7 @@ from config import (
     MAX_WAVE_WINDOW_CYCLES,
     SIGNAL_SEARCH_MAX_KEYWORDS,
     STRUCTURAL_SCAN_IN_WORKFLOW,
+    VERDI_RC_EXPORT,
     TRANSITIONS_MAX_RETURNED,
     DEFAULT_MAX_GROUPS,
     DEFAULT_WAVE_WINDOW_PS,
@@ -1663,35 +1665,19 @@ Simulation waveform debug workflow:
      partial coverage never establish a clean analysis.
 
 2. """ + _STRUCTURAL_SCAN_WORKFLOW_INSTRUCTION + """
-   Pass the selected compile_log to connectivity, hierarchy/source, trace and failure tools:
-   native_first queries healthy NPI without capturing or validating full source.
+   Pass the selected compile_log to connectivity, hierarchy/source, trace and failure tools.
+   For native queries using only a KDB, supply kdb_path and top_hint.
+   Healthy NPI needs no full source capture.
    Ordinary native unavailability automatically prepares source in that request;
    native_route returns the real source_design_handle. Source association stays
    unverified. Explicit prepare_design_context remains available for deliberate
    source analysis, strict source identity and recovery; changed/expired source
    handles require explicit preparation. Scan coverage remains independent.
-   - build_tb_hierarchy remains an explicit compatibility/full-tree option.
-     If a structural scan is also requested, run both in parallel on the same log.
-     Use the selected primary compile_log and simulator from step 1. In a split
-     VCS flow, pass complementary logs only through supplementary_compile_logs.
-     Returns a slim payload (project, stats, tree_skeleton truncated to depth 2,
-     interfaces, ambiguous_basenames, hierarchy_handle). The full file list,
-     full component_tree, class hierarchy, and raw compile_result are NOT in
-     the response — fetch them on demand via the handle tools listed in
-     handle_tools. Pass the returned hierarchy_handle to every handle tool.
-     * If ambiguous_basenames is non-empty, the compile_log contains multiple
-       files sharing a basename (e.g. xxx_v1.v vs xxx_v2.v). Before reading
-       any of them, call lookup_tb_files(basename=...) to confirm which
-       path was actually compiled in this session.
-     * Before reading an RTL/TB source file, call get_tb_file_detail(path=...)
-       (or lookup_tb_files with a filter) to verify the path is in the
-       compile set. Do NOT find/grep to scan directories for source files.
-     * Use get_tb_subtree(root="top.x.y", depth=N) to drill into the
-       hierarchy instead of asking for the whole tree.
-     * Use find_tb_instance(path=... or module=...) to jump directly to a
-       failing instance.
-     * dump_tb_section is a heavy escape hatch — prefer the targeted tools
-       above.
+   - Inspect a particular instance with find_tb_instance or get_tb_subtree
+     using the same compile_log. Query dumped signals directly by waveform path.
+   - Use build_tb_hierarchy only for an explicitly requested full RTL/TB view
+     or legacy hierarchy handle. If also scanning the same compile log, run
+     both in parallel. Use its hierarchy_handle to browse that full view.
    - scan_structural_risks: detects static structural risks (slice_overlap, multi_drive, etc.).
      Follow the workflow policy above when deciding whether to scan. For a requested
      scan, use the same compile_log and simulator; do not wait for parse_sim_log results.
@@ -1743,11 +1729,9 @@ Simulation waveform debug workflow:
 
 6. Call search_signals to confirm full hierarchical signal paths when needed.
    - Derive keywords from on-demand hierarchy/source results, error messages, recommend_failure_debug_next_steps, or RTL source.
-   - When reading RTL source, verify the path is in the compile set first —
-     call get_tb_file_detail(path=...) or lookup_tb_files(...) with the
-      design_handle returned in step 2 (or an explicit legacy hierarchy_handle).
-      The compile_log is the single
-     source of truth for which file version was actually compiled.
+   - Before reading RTL source, verify its compiled path with
+     lookup_tb_files(compile_log=..., basename=...). For duplicate basenames,
+     match the exact path reported for this compilation.
 
 7. Call analyze_failures with log_path, wave_path, simulator, and confirmed signal_paths.
    - Follow analysis_guide in the result.
@@ -1767,9 +1751,9 @@ Simulation waveform debug workflow:
 
    If connectivity ends with unsupported, shallow_only, an unresolved boundary,
    or incomplete coverage, continue with the client's source-file reading tools.
-   First verify compiled file ownership with lookup_tb_files/get_tb_file_detail
-   using the same design_handle; metadata-only lookup remains useful when semantic
-   details are unavailable. Read the actual assignments, port bindings, parameters,
+   Verify compiled file ownership with lookup_tb_files using the same compile_log.
+   If continuing a prepared source query, reuse its design_handle for file lookup
+   or get_tb_file_detail. Read the actual assignments, port bindings, parameters,
    generate conditions and bit ranges, then trace candidate connections manually.
    Cite file:line for each inferred hop and label it as source inference, separately
    from TraceWeave backend facts. Use waveform/log evidence to check runtime values,
@@ -6846,6 +6830,7 @@ async def list_tools():
         Tool(
             name="build_tb_hierarchy",
             description=(
+                "Use for an explicitly requested full RTL/TB view or legacy hierarchy handle. "
                 "Stream one compile/elaborate log plus optional complementary phase logs, scan source files, and cache the full testbench hierarchy server-side without retaining raw source bodies. "
                 "For split VCS flows, prefer the source-compile log as compile_log and pass VHDL/source/elaboration companions in build order; later connectivity tools continue using that primary path. "
                 "Returns a SLIM payload: project, stats, tree_skeleton (depth 2), interfaces, ambiguous_basenames, "
@@ -7305,9 +7290,9 @@ async def list_tools():
                         "description": "hard cap on emitted nodes",
                     },
                     "count_mode": {"type": "string", "enum": ["bounded", "exact"], "default": "bounded",
-                                   "description": "design_handle only; exact counting may traverse undisplayed descendants."},
+                                   "description": "Native-first and prepared queries may traverse undisplayed descendants for an exact count."},
                     "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 300, "default": 30,
-                                    "description": "design_handle only; includes context validation, binding and query."},
+                                    "description": "Time budget for native-first and prepared queries, including validation and binding."},
                 },
                 "oneOf": [{"required": ["handle"]}, {"required": ["design_handle"]}],
             },
@@ -7342,9 +7327,9 @@ async def list_tools():
                     },
                     "limit": {"type": "integer", "default": 50},
                     "count_mode": {"type": "string", "enum": ["bounded", "exact"], "default": "bounded",
-                                   "description": "design_handle only; exact counting may inspect all matching compile members."},
+                                   "description": "Native-first and prepared queries may inspect all candidate files for an exact count."},
                     "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 300, "default": 30,
-                                    "description": "design_handle only; includes context validation, binding and query."},
+                                    "description": "Time budget for native-first and prepared queries, including validation and binding."},
                 },
                 "oneOf": [{"required": ["handle"]}, {"required": ["design_handle"]}],
             },
@@ -7369,9 +7354,9 @@ async def list_tools():
                     },
                     "limit": {"type": "integer", "default": 100},
                     "count_mode": {"type": "string", "enum": ["bounded", "exact"], "default": "bounded",
-                                   "description": "design_handle only; output limit is separate from work limits."},
+                                   "description": "Native-first and prepared queries track output and search limits separately."},
                     "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 300, "default": 30,
-                                    "description": "design_handle only; includes context validation, binding and query."},
+                                    "description": "Time budget for native-first and prepared queries, including validation and binding."},
                 },
                 "oneOf": [{"required": ["handle"]}, {"required": ["design_handle"]}],
             },
@@ -7388,7 +7373,7 @@ async def list_tools():
                     "design_handle": {"type": "string", "minLength": 1},
                     "path": {"type": "string", "minLength": 1},
                     "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 300, "default": 30,
-                                    "description": "design_handle only; includes context validation, binding and query."},
+                                    "description": "Time budget for native-first and prepared queries, including validation and binding."},
                 },
                 "required": ["path"],
                 "oneOf": [{"required": ["handle"]}, {"required": ["design_handle"]}],
@@ -7407,9 +7392,9 @@ async def list_tools():
                     "root_class": {"type": "string"},
                     "depth": {"type": "integer", "default": -1},
                     "max_nodes": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 5000,
-                                  "description": "design_handle only; output limit is separate from inventory work."},
+                                  "description": "Caps displayed nodes in native-first and prepared queries. Inventory work has its own limit."},
                     "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 300, "default": 30,
-                                    "description": "design_handle only; includes context validation, binding and query."},
+                                    "description": "Time budget for native-first and prepared queries, including validation and binding."},
                 },
                 "oneOf": [{"required": ["handle"]}, {"required": ["design_handle"]}],
             },
@@ -7437,9 +7422,9 @@ async def list_tools():
                         ],
                     },
                     "max_items": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 5000,
-                                  "description": "design_handle only; hard output cap, not a guarantee of complete export."},
+                                  "description": "Caps returned items in native-first and prepared queries. Check export_complete for completeness."},
                     "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 300, "default": 30,
-                                    "description": "design_handle only; includes context validation, binding and export."},
+                                    "description": "Time budget for native-first and prepared exports, including validation and binding."},
                 },
                 "required": ["section"],
                 "oneOf": [{"required": ["handle"]}, {"required": ["design_handle"]}],
@@ -7552,9 +7537,9 @@ async def list_tools():
                 "Use real signal paths as roots; supported RTL expressions are extracted internally. "
                 "Verify a waveform difference and backtrace its active data/control dependencies "
                 "on both sides within explicit time/work limits. Uses the normal trusted NPI, "
-                "Source Graph, Static route. Each side independently accepts a design_handle "
-                "from prepare_design_context, or its exact legacy compile context with a current "
-                "build_tb_hierarchy result. A design_handle may omit compile_log and cannot be "
+                "Source Graph, Static route. Pass each side's compile_log or kdb_path with top_hint "
+                "directly. A side may also use a prepared design_handle or its exact legacy "
+                "hierarchy identity. A design_handle may omit compile_log and cannot be "
                 "combined with legacy identity tokens. Explicit signal/scope mappings are required "
                 "across different designs. Reports evidence, candidates and honest frontiers; "
                 "does not claim a unique root cause or rerun simulation. Clock mode requires "
@@ -8296,8 +8281,11 @@ async def list_tools():
                 tool.inputSchema["oneOf"].append(native_selector)
             elif "anyOf" in tool.inputSchema:
                 tool.inputSchema["anyOf"].append(native_selector)
-            tool.description = (
-                "compile_log or kdb_path+top_hint: NPI, then automatic source fallback. " + tool.description)
+            if tool.name in {"lookup_tb_files", "get_tb_file_detail"}:
+                route_hint = "Pass compile_log directly to verify file ownership. "
+            else:
+                route_hint = "compile_log or kdb_path+top_hint: NPI, then automatic source fallback. "
+            tool.description = route_hint + tool.description
     for tool in _tools:
         properties = tool.inputSchema["properties"]
         if tool.name == 'verify_window':
@@ -12257,12 +12245,45 @@ def _prepare_stdio_transport():
     return protocol_stream
 
 
+def _client_initialization_options():
+    options = app.create_initialization_options()
+    exporter = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "export_verdi_rc.py")
+    if not VERDI_RC_EXPORT:
+        options.instructions += "\n\nTRACEWEAVE_VERDI_RC_EXPORT=0 disables Verdi RC export. Skip this report attachment."
+    elif os.path.isfile(exporter):
+        options.instructions += f"""
+
+When writing the final debug report, export one Verdi signal RC per independent issue
+with confirmed signals and a time in the selected FSDB. Group repeated occurrences.
+To write under debug/, run the following command from the agent's current working directory.
+{shlex.join([sys.executable, exporter])}
+Send one JSON object on stdin with issue (short name), fsdb (absolute path), groups
+(function names to signal lists), error_time and/or first_deviation.
+Mark each signal or slice whose observed value, transition or comparison supports the
+final analysis with {{"path":"tb.actual","role":"evidence"}}. Include evidence that
+ruled out a competing explanation. This applies even when there is no code edit.
+When the report describes code edits, include every edit site in changes. Each key
+names the file, line and what changed. Its rows default to role "modified". For port
+rewiring include the port and both old and new slices. For a changed case value,
+mark the observed selector as "evidence" and the assigned signal as "modified".
+Use role "context" for orientation-only rows in a change group. A slice is
+{{"path":"tb.u.bus[1:32]","slice":[6,9]}} in declared order. If an edit has no
+mapped waveform signal, keep its entry with an empty list and explain the gap.
+Use integer ps or unit strings. Prefer exact fs for a proved first deviation.
+Omit unknown times. Include the returned absolute rc_path and fsdb in the report.
+Explain the highlight colors there. Evidence is cyan and modified signals are yellow.
+Yellow takes priority for a signal or slice used in both roles.
+If the local command returns status=disabled, skip the attachment.
+DV opens that FSDB first and restores the RC. If export fails, report the reason."""
+    return options
+
+
 async def main():
     protocol_stdout = _prepare_stdio_transport()
     try:
         async with stdio_server(stdout=protocol_stdout) as (read_stream, write_stream):
             await app.run(
-                read_stream, write_stream, app.create_initialization_options()
+                read_stream, write_stream, _client_initialization_options()
             )
     finally:
         await protocol_stdout.aclose()

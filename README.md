@@ -26,7 +26,7 @@ TraceWeave is an MCP server for RTL / SoC debugging. It connects compile records
 
 Use it with Claude Code, Codex, Copilot, or another MCP client. Describe the problem in natural language; the assistant uses tools to investigate, trace, and verify, with evidence you can review.
 
-[Use Cases](#use-cases) · [Installation](#installation) · [Client Setup](#client-setup) · [Start Debugging](#start-debugging) · [Tool Quick Reference](#tool-quick-reference) · [FAQ](#faq) · [Documentation and Feedback](#documentation-and-feedback)
+[Use Cases](#use-cases) · [Installation](#installation) · [Client Setup](#client-setup) · [Tool Quick Reference](#tool-quick-reference) · [FAQ](#faq) · [Documentation and Feedback](#documentation-and-feedback)
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/gokeshenzhen/TraceWeave/main/assets/onepage-en.png" alt="TraceWeave debugging workflow from logs and waveforms to source tracing" width="900">
@@ -139,46 +139,6 @@ export TRACEWEAVE_NPI_LSF_QUEUE="digital"
 
 The client must inherit or explicitly pass these variables. Project files, the TraceWeave installation, and cache directories must be visible at the same absolute paths on submission and compute nodes. See the [LSF configuration reference](https://github.com/gokeshenzhen/TraceWeave/blob/main/docs/architecture.md#lsf-only-npi-licenses) for bash / tcsh examples, client environment forwarding, and verification steps.
 
-## Start Debugging
-
-Connect your assistant and ask, replacing the path with your project directory:
-
-> Use TraceWeave to investigate the simulation failure in `my_case` under `/path/to/verif`. Check logs, design structure, and interface handshakes, then trace suspicious signals. Include timestamps, signal paths, and source references.
-
-The investigation discovers current run artifacts, scans structural risks and parses failures. The assistant chooses tool order and scope from the failure phase and known target: inspect known signals/interfaces directly, or consider a scoped/global handshake sweep for opaque timeout or compare symptoms. An unperformed sweep leaves protocol behavior unchecked and does not block recommendations. A full hierarchy build remains available when explicitly needed.
-
-Structural scanning is enabled by default (`TRACEWEAVE_STRUCTURAL_SCAN_IN_WORKFLOW=1`).
-To skip it in the default workflow, set `TRACEWEAVE_STRUCTURAL_SCAN_IN_WORKFLOW=0`
-in the MCP server environment and restart or reconnect the server. Explicit
-`scan_structural_risks` requests remain available; skipped checks remain unchecked.
-Handshake scanning and per-call scan modes are unchanged.
-
-For bit-level multiple-driver and undriven-signal checks, explicitly pass
-`semantic_categories=["multiple_driver", "undriven_signal"]` to
-`scan_structural_risks`, optionally with `semantic_scope="tb.dut.u_block"`.
-Both NPI and Slang support these categories: `auto` prioritizes an existing KDB
-and otherwise reuses compatible source results; `deep` also permits a Slang build.
-The category list replaces the defaults. Facts report static writers and proved
-empty inventories for consumed bits; runtime contention is not checked. Read
-coverage and gaps before interpreting zero findings. See the
-[driver checks reference](https://github.com/gokeshenzhen/TraceWeave/blob/main/docs/architecture.md#bit-level-driver-checks) for limits.
-
-Try a more focused question:
-
-- **Find a mismatch:** “Compare `tb.dut.result` in these two waveforms and trace the logic producing the difference on each side.”
-- **Trace an X:** “`tb.dut.q` is X at 36 ns, but its input is now known. Check earlier sampling and hold behavior from 0 to 36 ns.”
-- **Inspect transactions:** “Check this TL-UL interface from 10 to 20 μs for stalls, response latency, and outstanding requests.”
-- **Check source structure:** “Use deep mode to scan this compile log's design for suspicious ties, open inputs, and constant comparisons.”
-- **Verify a hypothesis:** “Sample these signals before each clock edge and check whether the payload stays stable while waiting for ready.”
-
-You can also evaluate [SV expressions](https://github.com/gokeshenzhen/TraceWeave/blob/main/docs/expressions.md), inspect packed bus fields, and compare failures after a fix. Coverage limits remain visible: zero findings from an incomplete check do not establish that the design is correct.
-
-For a connection check, ask the assistant to call `get_sim_paths`. See the [debug workflow](https://github.com/gokeshenzhen/TraceWeave/blob/main/docs/workflow.md) for the full procedure and the [readback check](https://github.com/gokeshenzhen/TraceWeave/blob/main/docs/architecture.md#readback-client-check) for a repository smoke check.
-
-### Custom runtime logs
-
-Built-in parsing covers UVM, VCS/Xcelium assertions, and supported Verilator/cocotb failures. Add project-specific checker labels through [custom_patterns.yaml](https://github.com/gokeshenzhen/TraceWeave/blob/main/custom_patterns.yaml), or set `TRACEWEAVE_CUSTOM_PATTERNS_FILE` to your own file. See [log formats and configuration](https://github.com/gokeshenzhen/TraceWeave/blob/main/docs/architecture.md#runtime-log-formats) for examples and Verilator time-unit requirements.
-
 ## Tool Quick Reference
 
 Describe your debugging goal and let the assistant choose the tools. All tools are listed below; consult their MCP definitions for parameters and supported scope.
@@ -230,57 +190,6 @@ Describe your debugging goal and let the assistant choose the tools. All tools a
 |  | `cursor_delete` | Delete a time cursor |
 | EDA integration | `build_kdb` | Build and cache a Verdi KDB |
 
-### Native-first design queries
-
-`explain_property` also accepts standalone text or an ordered batch with explicit
-shared declaration units. It explains source semantics without running simulation,
-formal proof or an LLM. Supply `compile_log` or `design_handle` for compiled source
-targets; select one declaration/directive with `target`, `instance_path` or `line`.
-Read each item's completeness and gaps. Unassociated text has an unknown run mode;
-an exact `run_anchor` links an existing simulation/formal discovery. See
-[property explanations](https://github.com/gokeshenzhen/TraceWeave/blob/main/docs/architecture.md#property-explanations) for examples,
-the optional frontend requirement and limits.
-
-For a logged assertion, request `include_check_plan=true` and pass its
-`results[].check_plan.handle` to `verify_window` with `mode="property"`, the
-VCD/FSDB/FST `wave_path`, and a normalized `failure_event` or `log_path`. With a log, the tool
-selects the first failure of the exact directive instance. It derives the clock,
-attempts and history window, reads pre-edge values, and returns source-linked
-evidence. Check `status`, coverage and gaps; `not_reproduced` applies only to that
-failure check. Text inputs can use `property_scope` or exact `property_bindings`.
-
-After `get_sim_paths`, run `scan_structural_risks` as usual, then continue log
-and waveform investigation. Connectivity, hierarchy/file/class queries, X traces,
-packed layouts and failure correlation accept `compile_log` directly. They try
-healthy NPI using bounded metadata and an existing KDB, without full source
-capture or source validation. With no log, provide `kdb_path` and `top_hint`;
-compile file ownership and source fallback still require a log. KDB-only failure
-analysis/recommendation also requires an explicit `simulator` for log parsing.
-
-```python
-find_tb_instance(compile_log="/project/compile.log", path="tb.dut")
-explain_signal_driver(kdb_path="/project/simv.daidir/kdb.elab++",
-                      top_hint="tb", signal_path="tb.dut.q", wave_path="/project/run.fsdb")
-```
-
-Ordinary native unavailability prepares source within the same request. Inspect
-`native_route`: metadata, KDB and source identities are separate; the KDB/source
-association stays `unverified`. Fallback returns a real `source_design_handle`
-for explicit reuse. A changed source observation fails strictly; explicitly
-prepare a new context and pass its new handle. `backend_preference="source"`
-skips KDB discovery. `retry_npi=true` retries a remembered load failure for the
-same KDB generation; per-tool capability gaps never disable other native tools.
-All phases share `timeout_sec` (finite, at most 300 seconds).
-
-`prepare_design_context` remains the explicit full source identity/recovery API.
-Legacy handles and historical actions keep their original contracts. File
-results distinguish `ownership_basis="compile_metadata"`/`source_status="not_captured"`
-from captured source ownership. Metadata name/path filters and the three compile
-record exports need neither KDB nor a semantic provider. Cached KDB discovery
-still performs its exact source hash and reports that cost separately. No KDB
-is automatically built. Structural and optional handshake coverage remain
-independent; unperformed checks and zero coverage never establish a clean result.
-
 ## FAQ
 
 **Can I use it without a commercial license?**
@@ -316,68 +225,8 @@ File parsing and EDA queries run locally or on configured LSF nodes. Returned ev
 | Architecture, backend capabilities, and resource limits | [Architecture](https://github.com/gokeshenzhen/TraceWeave/blob/main/docs/architecture.md) |
 | Expression inputs and worked examples | [SV expressions](https://github.com/gokeshenzhen/TraceWeave/blob/main/docs/expressions.md) |
 | Complete environment configuration and advanced settings | [Configuration reference](https://github.com/gokeshenzhen/TraceWeave/blob/main/docs/architecture.md#client-configuration-reference) |
+| Contributing to TraceWeave | [Contributor guidelines](https://github.com/gokeshenzhen/TraceWeave/blob/main/AGENTS.md) · [Regression tests](https://github.com/gokeshenzhen/TraceWeave/blob/main/docs/architecture.md#repository-regression-tests) |
 | Reporting a problem or suggesting a feature | [GitHub Issues](https://github.com/gokeshenzhen/TraceWeave/issues) |
-
-Before contributing, read [AGENTS.md](https://github.com/gokeshenzhen/TraceWeave/blob/main/AGENTS.md). Repository regression profiles
-require the `test`, `source-graph` and `fst` Python extras, plus a C++ compiler
-(`g++`). For a new development environment, install the declared extras with
-`python3.11 -m pip install -e ".[test,source-graph,fst]"`. The test runner never
-installs dependencies or changes shell, MCP, license or scheduler configuration.
-
-| Command from the repository root | Required coverage |
-|---|---|
-| `python3.11 -m pytest` | Portable unit/mock, VCD/log and open source frontend/FST tests |
-| `python3.11 scripts/run_tests.py --profile portable` | The same portable coverage, with JSON/JUnit and logs |
-| `python3.11 scripts/run_tests.py --profile eda` | Portable plus real FSDB, VCS and NPI functionality; excludes five scale tests |
-| `python3.11 scripts/run_tests.py --profile stress` | The five original 10M waveform tests |
-| `python3.11 scripts/run_tests.py --profile all` | Full self-contained regression: portable + EDA + all five scale tests |
-
-Plain pytest selects portable coverage even on a machine with commercial SDKs;
-it does not enable licensed tests. EDA/all require configured VCS on `PATH`,
-`VERDI_HOME` with FSDB Reader/Writer and NPI SDKs, a working compiler/linker and
-available licenses. Stress uses the reader, writer and `vcd2fsdb` from Verdi; it
-does not require VCS, NPI, Slang or FST. Tests generate only synthetic designs in
-owned directories; private project paths and prebuilt author KDBs are unnecessary.
-No profile submits live LSF jobs. Standalone worker tests are local coverage.
-
-`--check` checks software/tool presence without license checkout. `--list` collects
-a selection plan without building fixtures. Selected missing dependencies,
-preparation failures, assertion failures, unexpected skips and unexecuted required
-tests return nonzero. Module-level collection skips are also reported. Planned
-exclusions and a few explicitly listed platform limitations remain separate from
-passes. Arguments after `--` select a partial run, for example
-`-- tests/test_log_parser.py -q`; its report does not qualify the complete profile.
-
-Use `--cache-dir /absolute/path/to/test-cache` to reuse generated inputs. Each
-entry validates source/tool fingerprints, artifact hashes and ABI before reuse;
-failed or cancelled builds never publish a complete manifest. A nonempty cache
-must carry the TraceWeave ownership marker. Existing repository wrappers and
-external input files are preserved. Supported waveform path overrides
-(`TW_POINT_READ_FSDB`, `TW_LAZY_LARGE_FSDB`, `TW_SESSION_RECLAIM_FSDB` and the three
-`TW_P2B_*_FSDB` paths) are read-only and must satisfy the selected fixture oracle.
-Missing or mismatched overrides fail rather than selecting another input.
-
-The shared 10M fixture contains four signals, 10,000,001 data records and
-5,000,000 clock rising edges, with real flush sessions. Generation writes about
-500 MB of temporary VCD and removes it after successful conversion/validation;
-the cache retains the FSDB. Reports include actual disk size, session layout,
-record counts, timings and RSS measurements. This profile does not run the
-separate 100M benchmark suite.
-
-`--output /absolute/path/to/new-results` retains `report.json`, `pytest.json`,
-JUnit, raw pytest output, test temporary files and fixture manifest/build-log
-snapshots. The output directory must be new. Without these options, the runner
-prints its temporary evidence and fixture paths; it preserves them for inspection.
-Remove only your own result/cache directories when finished.
-
-External UART/OpenTitan acceptance is separately opt-in with
-`--external-representative /path/to/manifest.json`. Copy the format in
-[representative.json](https://github.com/gokeshenzhen/TraceWeave/blob/main/tests/fixtures/six_tool_hierarchy/representative.json), supply
-an explicit project revision, top/scope/source locations and SHA-256 identities
-for the compile log, definition and instance-site files. This specialized check
-expects preserved blocking diagnostics/partial coverage; default profiles instead
-exercise self-contained complete and incomplete hierarchies. Neither a default
-all pass nor a local worker pass claims external-project or live-scheduler coverage.
 
 TraceWeave is available under the [MIT License](https://github.com/gokeshenzhen/TraceWeave/blob/main/LICENSE).
 

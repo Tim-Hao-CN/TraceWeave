@@ -1928,7 +1928,11 @@ client's tool access separately through its configured TraceWeave connection.
 
 ## Handle-based Hierarchy Access
 
-`build_tb_hierarchy` generates a full hierarchy result server-side (project
+An explicit request for the full RTL/TB view uses `build_tb_hierarchy`.
+Scoped instance queries take `compile_log` directly. A `lookup_tb_files` query
+by filename or path reads compile metadata and needs no hierarchy handle.
+
+The full-tree tool generates a hierarchy result server-side (project
 metadata, grouped file list, complete `component_tree`, `class_hierarchy`,
 raw `compile_result`, compact per-file scan results, and a private immutable
 content snapshot) but returns only a **slim payload** to the LLM: project,
@@ -2236,9 +2240,9 @@ new preparation. Result caches and workflow/scan state remain intact.
 
 `build_tb_hierarchy.handle_lifetime="process"` is explicit. Driver results and
 prerequisite blockers carry an optional `hierarchy_recovery` receipt with status,
-budgets, coalescing, handle and validated context. `structural_scan_performed`
-remains false: recovering hierarchy does not satisfy the independent parallel
-structural-scan workflow. Ordinary matching no-handle hierarchy reuse is retained.
+budgets, coalescing, handle and validated context. Recovery leaves
+`structural_scan_performed=false`. Structural scanning has its own workflow
+setting and coverage. Ordinary matching no-handle hierarchy reuse is retained.
 
 Driver requests can bind a Verilator `TOP.<compiled_top>` dump root to the
 current design root through `wave_design_binding`. The binding requires exactly
@@ -2685,9 +2689,11 @@ wave/compile validation still discards changed evidence. No cross-request
 observation or transaction repository is created. Numeric cache metrics expose
 hits, misses, evictions, bypasses and peaks without names/paths/values.
 
-`src/divergence_context.py` freezes each side's exact hierarchy, ordered logs,
-source snapshot and top. Ready driver relays carry those identities into the
-normal public route instead of changing the mutable current session.
+`src/divergence_design_context.py` binds each trace side independently from its
+compile log or its KDB and top. A side may also supply a prepared design handle.
+For a side with legacy identity tokens, `src/divergence_context.py` verifies
+the exact hierarchy, ordered logs, source snapshot and top. Ready driver relays
+carry the identity of the side they describe.
 
 `src/dynamic_evidence.py` defines a bounded typed expression contract.
 `src/npi_dynamic.py` obtains cell/port, mux polarity and edge facts from NPI and
@@ -4070,3 +4076,58 @@ definitions cannot reuse old rules. Every request still runs full instance
 validation with the SDK's error selection. Only repeated schema self-validation
 is avoided; request arguments/results, design identities, KDB/source guards and
 native sessions are not cached here. SDK output handling remains unchanged.
+
+## Repository regression tests
+
+Run the tests from the repository root with Python 3.11+ and `g++`. For the
+`portable`, `eda` and `all` profiles, install the development dependencies with
+`python3.11 -m pip install -e ".[test,source-graph,fst]"`.
+
+| Command | Coverage |
+|---|---|
+| `python3.11 -m pytest` | Portable unit, mock, VCD, log, Slang and FST tests |
+| `python3.11 scripts/run_tests.py --profile portable` | The same tests with JSON and JUnit reports and logs |
+| `python3.11 scripts/run_tests.py --profile eda` | Portable coverage plus functional tests with FSDB, VCS and NPI |
+| `python3.11 scripts/run_tests.py --profile stress` | Five large-waveform tests |
+| `python3.11 scripts/run_tests.py --profile all` | Portable, EDA functional and stress tests |
+
+Plain pytest selects portable coverage even on hosts with commercial SDKs.
+The `eda` and `all` profiles require VCS on `PATH`, the FSDB Reader/Writer and
+NPI SDK under `VERDI_HOME`, a working compiler and linker, and the corresponding
+licenses. The `stress` profile uses the `test` extra and Verdi's FSDB
+Reader/Writer and `vcd2fsdb`. The runner generates inputs in test-owned
+directories. All profiles run locally, including standalone LSF worker tests.
+
+`--check` checks prerequisites without checking out a license. `--list` shows
+which tests the profile selects without generating inputs. Missing dependencies,
+fixture preparation failures, failed assertions, unexpected skips and required
+tests that did not run produce a nonzero exit code. The report records
+collection-time skips, planned exclusions and allowed platform limitations
+separately from passes. Pytest arguments after `--` mark the run as a partial
+selection.
+
+`--cache-dir` reuses generated inputs after validating source and tool
+fingerprints, artifact hashes and ABI. A nonempty cache requires the TraceWeave
+ownership marker. The runner publishes a complete manifest only after a
+successful build. It preserves the repository wrapper and treats waveform
+overrides (`TW_POINT_READ_FSDB`, `TW_LAZY_LARGE_FSDB`, `TW_SESSION_RECLAIM_FSDB`
+and the three `TW_P2B_*_FSDB` paths) as read-only inputs. Missing or mismatched
+overrides fail fixture validation.
+
+The five stress tests share a four-signal FSDB with 10,000,001 data records,
+5,000,000 rising clock edges and physical flush sessions. Allow about 500 MB
+for the temporary VCD, which the generator removes after conversion and
+validation. The cache retains the FSDB. Reports include file sizes, session
+layout, event counts, timings and RSS. The 100M benchmark runs separately.
+
+`--output` takes a new directory for `report.json`, `pytest.json`, JUnit XML,
+the pytest log, test temporary files, and fixture manifests and build logs.
+With default paths, the runner prints the temporary evidence and fixture
+directories for later inspection.
+
+External UART/OpenTitan acceptance uses `--external-representative` with a
+manifest giving the project revision, top, scope, definition and instance-site
+locations, and SHA-256 hashes of the compile log and both source files. This
+check expects blocking diagnostics and partial hierarchy coverage. Default
+profiles cover self-contained complete and incomplete hierarchies.
+[Manifest format](../tests/fixtures/six_tool_hierarchy/representative.json)
